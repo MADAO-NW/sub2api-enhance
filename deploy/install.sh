@@ -50,6 +50,9 @@ prepare_release() {
     extract_member "$UPDATE_STAGE/$archive" release.json "$UPDATE_STAGE/release.json"
     extract_member "$UPDATE_STAGE/$archive" deploy/.env.example "$UPDATE_STAGE/env.example"
     extract_member "$UPDATE_STAGE/$archive" deploy/sub2api-enhance.service "$UPDATE_STAGE/sub2api-enhance.service"
+    if [[ $(tar -tzf "$UPDATE_STAGE/$archive" | awk '$0 == "deploy/configure-sub2api-menus.sh" {n++} END {print n+0}') == 1 ]]; then
+        extract_member "$UPDATE_STAGE/$archive" deploy/configure-sub2api-menus.sh "$UPDATE_STAGE/configure-sub2api-menus.sh"
+    fi
     jq -e --arg version "${version#v}" '.build_type == "release" and .version == $version and (.schema_digest | test("^[0-9a-f]{64}$"))' "$UPDATE_STAGE/release.json" >/dev/null
     chmod 0755 "$UPDATE_STAGE/sub2api-enhance"
     [[ $("$UPDATE_STAGE/sub2api-enhance" --version) == "${version#v}" ]] || { echo '二进制版本与标签不一致' >&2; return 1; }
@@ -148,6 +151,9 @@ main() {
     chown "$SERVICE_NAME:$SERVICE_NAME" "$UPDATE_STAGE/sub2api-enhance"
     chmod 0755 "$UPDATE_STAGE/sub2api-enhance"
     mv -f "$UPDATE_STAGE/sub2api-enhance" "$INSTALL_DIR/sub2api-enhance"
+    if [[ -f $UPDATE_STAGE/configure-sub2api-menus.sh ]]; then
+        install -m 0755 -o root -g root "$UPDATE_STAGE/configure-sub2api-menus.sh" "$INSTALL_DIR/configure-sub2api-menus.sh"
+    fi
     if [[ $command == install ]]; then
         install -m 0640 -o root -g "$SERVICE_NAME" "$UPDATE_STAGE/env.example" "$CONFIG_DIR/sub2api-enhance.env"
         install -m 0644 "$UPDATE_STAGE/sub2api-enhance.service" "/etc/systemd/system/$SERVICE_NAME.service"

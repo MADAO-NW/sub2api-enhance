@@ -12,6 +12,7 @@ frontend:
 
 test-install:
 	bash -n deploy/install.sh
+	bash -n deploy/configure-sub2api-menus.sh
 	bash -n deploy/build-release-info.sh
 	bash deploy/tests/install-test.sh
 

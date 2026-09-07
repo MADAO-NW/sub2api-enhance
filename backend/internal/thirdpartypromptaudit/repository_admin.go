@@ -187,7 +187,7 @@ func (r *Repository) ListEvents(ctx context.Context, filter Filter, page, pageSi
 		return nil, err
 	}
 	where, args := filterSQL(filter, true, true)
-	from := ` FROM sub2api_enhance.third_party_prompt_audit_events e JOIN sub2api_enhance.third_party_prompt_audit_jobs j ON j.id=e.job_id JOIN sub2api_enhance.third_party_prompt_audit_outcomes o ON o.id=e.latest_outcome_id JOIN sub2api_enhance.third_party_prompt_audit_jobs decision_job ON decision_job.id=o.job_id `
+	from := ` FROM sub2api_enhance.third_party_prompt_audit_events e JOIN sub2api_enhance.third_party_prompt_audit_jobs j ON j.id=e.job_id` + jobInputJoins + `JOIN sub2api_enhance.third_party_prompt_audit_outcomes o ON o.id=e.latest_outcome_id JOIN sub2api_enhance.third_party_prompt_audit_jobs decision_job ON decision_job.id=o.job_id `
 	result := &Page[Event]{Items: []Event{}, Page: page, PageSize: pageSize}
 	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*)`+from+`WHERE `+where, args...).Scan(&result.Total); err != nil {
 		return nil, err

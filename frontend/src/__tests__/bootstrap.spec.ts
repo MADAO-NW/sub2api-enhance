@@ -12,6 +12,7 @@ describe('embedded administrator bootstrap',()=>{
   await flushPromises()
   expect(location.search).not.toContain('token')
   expect(api.post).toHaveBeenCalledWith('/auth/bootstrap',{token:'unit-test-token'})
+  expect(api.get).not.toHaveBeenCalled()
   expect(document.documentElement.classList.contains('dark')).toBe(true)
   expect(JSON.stringify(localStorage)).not.toContain('unit-test-token')
   expect(JSON.stringify(sessionStorage)).not.toContain('unit-test-token')

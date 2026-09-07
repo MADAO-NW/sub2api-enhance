@@ -93,6 +93,12 @@ sudo bash /tmp/sub2api-enhance-install.sh rollback
 /enhance/third-party-prompt-audit
 ```
 
+安装或升级会把 Release 包中的菜单脚本放到 `/opt/sub2api-enhance/`。脚本从增强服务环境文件读取固定原版内部地址、公网 Origin 和管理员 API Key，幂等保留其他自定义菜单，并维护“第三方提示词审计”“用户额度跟随”两个管理员菜单及其 SVG 图标：
+
+```bash
+sudo bash /opt/sub2api-enhance/configure-sub2api-menus.sh /etc/sub2api-enhance/sub2api-enhance.env
+```
+
 原版会附带 token、theme、lang 等参数。增强页面立即清理 URL token，以 POST 交换短时 HttpOnly 会话；后续每次管理 API 调用重新向原版验证访问者身份。非本机页面要求 HTTPS。同域页面属于可信后台集成，不能作为权限隔离沙箱。
 
 页面提供概览、事件、任务、原文采集及配置。配置保留草稿、修订冲突、凭据 keep/replace/clear、单节点试审、阈值和多节点聚合。

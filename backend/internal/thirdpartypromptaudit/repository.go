@@ -35,8 +35,11 @@ j.config_revision,j.snapshot_status,j.input_hash,j.target_hash,j.evaluation_hash
 j.claim_generation,j.lease_until,j.next_attempt_at,j.reuse_metrics,j.failure_stage,j.last_error_code,j.last_error_message,
 j.gateway_result,j.gateway_completed_at,j.gateway_duration_ms,j.started_at,j.finished_at,j.created_at,j.updated_at`
 
+// jobInputJoins 为任务投影补齐原始任务与唯一采集记录。
+const jobInputJoins = ` LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs original ON original.id=j.source_job_id LEFT JOIN sub2api_enhance.captures capture ON capture.id=COALESCE(j.capture_id,original.capture_id) `
+
 // jobSource 使复核任务直接读取正式任务的唯一输入，避免复制全文和形成引用链。
-const jobSource = ` FROM sub2api_enhance.third_party_prompt_audit_jobs j LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs original ON original.id=j.source_job_id LEFT JOIN sub2api_enhance.captures capture ON capture.id=COALESCE(j.capture_id,original.capture_id) `
+const jobSource = ` FROM sub2api_enhance.third_party_prompt_audit_jobs j` + jobInputJoins
 
 func jobProjection(full bool) string {
 	if full {

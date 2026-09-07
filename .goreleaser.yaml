@@ -34,6 +34,7 @@ archives:
         dst: .
         strip_parent: true
       - deploy/install.sh
+      - deploy/configure-sub2api-menus.sh
       - deploy/sub2api-enhance.service
       - deploy/.env.example
       - deploy/nginx.conf.example
