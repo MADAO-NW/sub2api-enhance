@@ -1,0 +1,61 @@
+# 合并到现有 http 块：以下均为本机部署示例，不是已核实的生产地址。
+map $http_upgrade $enhance_connection_upgrade {
+    default upgrade;
+    '' close;
+}
+# 增强路径日志只保留 $uri，避免 token 查询参数进入访问日志。
+log_format enhance_safe '$remote_addr $request_method $uri $status';
+upstream sub2api_official { server 127.0.0.1:18080; }
+upstream sub2api_enhance { server 127.0.0.1:18081; }
+
+# 以下 server 也可将 location 规则合并到已有 HTTPS server。
+# 必须替换域名和证书文件；本例作为 http 块中的配置片段使用。
+server {
+    listen 443 ssl;
+    server_name gateway.example.com;
+    ssl_certificate /path/to/tls/fullchain.pem;
+    ssl_certificate_key /path/to/tls/privkey.pem;
+
+location ^~ /enhance/ {
+    access_log /var/log/nginx/enhance.access.log enhance_safe;
+    proxy_pass http://sub2api_enhance;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header Forwarded "";
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Enhance-Capture "";
+    # 节点试审也可能持续数分钟，必须与实际节点总预算一致。
+    proxy_read_timeout 600s;
+    add_header Referrer-Policy no-referrer always;
+}
+
+# 以 main 0.2.1 路由盘点为基线，实际切流前核对所有生产别名。
+location ~ ^/(v1/|v1beta/|responses(/|$)|backend-api/codex/|chat/completions$|embeddings$|alpha/search$|messages/|images/|videos(/|$)|tts$|stt$|custom-voices(/|$)|realtime$|web_search$|x_search$|antigravity/) {
+    proxy_pass http://sub2api_enhance;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $enhance_connection_upgrade;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header Forwarded "";
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Enhance-Capture "";
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_next_upstream off;
+    # 这里是示例超时，须覆盖所有节点顺序预算、排队时间及 SSE/WS 长连接要求。
+    proxy_read_timeout 600s;
+    proxy_send_timeout 600s;
+}
+
+# 原后台和原版管理 API 保持直达官方服务。
+location / {
+    proxy_pass http://sub2api_official;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+}

@@ -1,0 +1,10 @@
+sub2api++ / sub2api-enhance
+
+This project includes code adapted from the sub2api project. The adapted and
+derivative portions remain subject to GNU LGPL version 3, reproduced in the
+root LICENSE file.
+
+The MIT license selected when this repository was created is preserved in
+LICENSE-MIT. It applies only to original material whose copyright holder makes
+that material available under those terms; it does not replace notices or
+licenses attached to third-party or derivative material.

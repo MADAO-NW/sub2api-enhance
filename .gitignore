@@ -1,0 +1,45 @@
+# 本地索引、依赖与构建产物
+.codegraph/
+frontend/node_modules/
+frontend/dist/
+backend/bin/
+backend/internal/web/dist/
+coverage/
+*.log
+.DS_Store
+
+# 本地方案、运行配置与凭据
+my_local_doc/
+审计风险报告.md
+.env
+.env.*
+!.env.example
+config.local.*
+
+# 发布包、工具缓存和测试结果只在本地或 CI 保存
+/dist/
+**/node_modules/
+**/.vite/
+**/.cache/
+**/coverage/
+*.test
+*.out
+*.tsbuildinfo
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.backup
+.update-state.json
+.update.lock
+.sub2api-enhance-update-*/
+.enhance-write-*
+*.pem
+*.key
+*.p12
+*.pfx
+.idea/
+.vscode/

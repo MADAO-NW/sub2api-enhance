@@ -1,0 +1,50 @@
+version: 2
+project_name: sub2api-enhance
+before:
+  hooks:
+    - bash deploy/build-release-info.sh {{ .Version }} {{ .Commit }} {{ .Date }}
+builds:
+  - id: sub2api-enhance
+    dir: backend
+    main: ./cmd/server
+    binary: sub2api-enhance
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.Version={{ .Version }}
+      - -X main.Commit={{ .Commit }}
+      - -X main.Date={{ .Date }}
+      - -X main.BuildType=release
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    files:
+      - LICENSE
+      - LICENSE-MIT
+      - NOTICE
+      - README.md
+      - src: dist/release.json
+        dst: .
+        strip_parent: true
+      - deploy/install.sh
+      - deploy/sub2api-enhance.service
+      - deploy/.env.example
+      - deploy/nginx.conf.example
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+changelog:
+  use: git
+release:
+  github:
+    owner: MADAO-NW
+    name: sub2api-enhance
+  draft: false
+  prerelease: false

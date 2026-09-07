@@ -1,0 +1,27 @@
+[Unit]
+Description=Sub2API independent enhancement service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=sub2api-enhance
+Group=sub2api-enhance
+WorkingDirectory=/opt/sub2api-enhance
+EnvironmentFile=/etc/sub2api-enhance/sub2api-enhance.env
+ExecStart=/opt/sub2api-enhance/sub2api-enhance
+Restart=always
+RestartSec=3
+TimeoutStopSec=40
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sub2api-enhance
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/sub2api-enhance
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
