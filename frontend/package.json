@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit && vite build",
+    "build": "vue-tsc --noEmit && vite build && node scripts/verify-csp-build.mjs",
     "lint:check": "eslint src --ext .vue,.ts",
     "typecheck": "vue-tsc --noEmit",
     "test:run": "vitest run"
