@@ -18,6 +18,7 @@ config.local.*
 
 # 发布包、工具缓存和测试结果只在本地或 CI 保存
 /dist/
+/.release-artifacts/
 **/node_modules/
 **/.vite/
 **/.cache/

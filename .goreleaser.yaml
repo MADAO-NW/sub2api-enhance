@@ -30,7 +30,7 @@ archives:
       - LICENSE-MIT
       - NOTICE
       - README.md
-      - src: dist/release.json
+      - src: .release-artifacts/release.json
         dst: .
         strip_parent: true
       - deploy/install.sh

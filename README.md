@@ -67,7 +67,7 @@ sudo bash /tmp/sub2api-enhance-install.sh rollback
 
 `.github/workflows/ci.yml` 在 main 和 PR 上执行本地同类检查；`release.yml` 在推送 `v主版本.次版本.修订号` 稳定标签时运行校验、测试、前端构建及 GoReleaser。版本、提交与时间在构建时注入，不由程序运行时读 Git；本地普通构建显示 dev/source。
 
-发布产物包括 Linux amd64/arm64 压缩包和 `checksums.txt`。每个包内包含 `sub2api-enhance`、根目录 `release.json`、许可证、README 及部署模板，下载与更新必须校验 SHA256。版本元数据与二进制均来自标签指向的同一源码。归档路径按 [GoReleaser 文件打包规则](https://www.goreleaser.com/customization/package/archives/)配置。
+发布产物包括 Linux amd64/arm64 压缩包和 `checksums.txt`。每个包内包含 `sub2api-enhance`、根目录 `release.json`、许可证、README 及部署模板，下载与更新必须校验 SHA256。版本元数据与二进制均来自标签指向的同一源码；元数据在 GoReleaser 的独立临时输入目录生成，不占用其 `dist` 输出目录。归档路径按 [GoReleaser 文件打包规则](https://www.goreleaser.com/customization/package/archives/)配置。
 
 仓库 Actions 使用自动提供的 `GITHUB_TOKEN` 发布 Release；无需把私人 Token 写进代码或 workflow。发布不会自动向源码分支写回版本文件，也不会构建 Docker 镜像或修改线上服务。
 
