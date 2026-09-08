@@ -56,5 +56,5 @@ func (h *Handler) Restart(c *gin.Context) {
 }
 
 func (h *Handler) Health(c *gin.Context) {
-	c.JSON(200, gin.H{"status": "ok", "service": "sub2api++", "version": h.service.info.Version})
+	c.JSON(200, gin.H{"status": "ok", "service": "sub2api++", "version": h.service.info.Version, "started_at": h.service.startedAt})
 }

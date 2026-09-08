@@ -2,7 +2,7 @@ import {flushPromises} from '@vue/test-utils'
 import {describe,it,expect,vi} from 'vitest'
 import type {App} from 'vue'
 const api=vi.hoisted(()=>({post:vi.fn().mockResolvedValue({data:{}}),get:vi.fn().mockResolvedValue({data:{}})}))
-vi.mock('@/api/client',()=>({apiClient:api}))
+vi.mock('@/api/client',()=>({apiClient:api,setBootstrapToken:vi.fn(),reloadMenu:vi.fn()}))
 vi.mock('@/views/admin/ThirdPartyPromptAuditView.vue',()=>({default:{template:'<div>Audit page</div>'}}))
 describe('embedded administrator bootstrap',()=>{
  it('removes token before initial router navigation and keeps it out of persistent storage',async()=>{

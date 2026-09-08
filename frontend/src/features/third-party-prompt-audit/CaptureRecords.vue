@@ -8,6 +8,7 @@ import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import CaptureBody from './CaptureBody.vue'
 import { useAuditLabels } from './labels'
+import { formatTime } from './viewModel'
 
 const items = ref<AuditCapture[]>([])
 const total = ref(0)
@@ -84,10 +85,10 @@ onMounted(load)
     <p v-if="error" class="text-red-600">{{ error }}</p>
     <div class="overflow-auto">
       <table class="table">
-        <thead><tr><th>ID</th><th>{{ label('protocol') }}</th><th>{{ label('captureBytes') }}</th><th>{{ label('captureIntegrity') }}</th><th>{{ label('captureEligibility') }}</th><th>{{ label('captureProcessing') }}</th><th>{{ label('forwardingStock') }}</th><th>{{ label('operation') }}</th></tr></thead>
+        <thead><tr><th>ID</th><th>{{ label('created') }}</th><th>{{ label('protocol') }}</th><th>{{ label('captureBytes') }}</th><th>{{ label('captureIntegrity') }}</th><th>{{ label('captureEligibility') }}</th><th>{{ label('captureProcessing') }}</th><th>{{ label('forwardingStock') }}</th><th>{{ label('operation') }}</th></tr></thead>
         <tbody>
           <tr v-for="item in items" :key="item.id">
-            <td>{{ item.id }}</td><td>{{ item.protocol }}</td><td>{{ item.body_bytes }}</td><td>{{ label(item.snapshot_status) }}</td><td>{{ label(item.eligibility_status) }}</td><td>{{ label(item.processing_status) }}</td><td>{{ label(item.forwarding_status) }}</td>
+            <td>{{ item.id }}</td><td class="whitespace-nowrap">{{ formatTime(item.created_at) }}</td><td>{{ item.protocol }}</td><td>{{ item.body_bytes }}</td><td>{{ label(item.snapshot_status) }}</td><td>{{ label(item.eligibility_status) }}</td><td>{{ label(item.processing_status) }}</td><td>{{ label(item.forwarding_status) }}</td>
             <td><button class="btn btn-secondary btn-sm whitespace-nowrap" @click="detail(item.id)">{{ label('viewCapture') }}</button></td>
           </tr>
         </tbody>

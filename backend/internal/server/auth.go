@@ -87,7 +87,7 @@ func (a *Auth) Require(c *gin.Context) {
 	value, ok := a.sessions[id]
 	a.mu.Unlock()
 	if !ok || !value.expires.After(time.Now()) || value.ip != c.ClientIP() || value.ua != c.Request.UserAgent() {
-		c.AbortWithStatusJSON(401, gin.H{"message": "增强会话已失效，请重新打开原版菜单"})
+		c.AbortWithStatusJSON(401, gin.H{"code": "enhance_session_expired", "message": "增强连接已过期，正在尝试重新连接"})
 		return
 	}
 	user, _, err := a.client.VerifyAdmin(c.Request.Context(), value.token, value.ip, value.ua)

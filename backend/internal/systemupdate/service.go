@@ -30,6 +30,7 @@ type State struct {
 	UpdatedAt     time.Time  `json:"updated_at"`
 }
 type Status struct {
+	StartedAt       time.Time `json:"started_at"`
 	Current         BuildInfo `json:"current"`
 	Repository      string    `json:"repository"`
 	Supported       bool      `json:"supported"`
@@ -46,6 +47,7 @@ type Check struct {
 	Cached         bool    `json:"cached"`
 }
 type Service struct {
+	startedAt  time.Time
 	info       BuildInfo
 	executable string
 	managed    bool
@@ -65,7 +67,7 @@ func New(info BuildInfo, executable, token string, managed bool, restart func())
 	if err != nil {
 		return nil, err
 	}
-	s := &Service{info: info, executable: path, github: newGitHubClient(token), managed: managed, supported: info.BuildType == "release" && runtime.GOOS == "linux" && filepath.Base(path) == "sub2api-enhance", restart: restart, state: State{Phase: "idle"}}
+	s := &Service{startedAt: time.Now().UTC(), info: info, executable: path, github: newGitHubClient(token), managed: managed, supported: info.BuildType == "release" && runtime.GOOS == "linux" && filepath.Base(path) == "sub2api-enhance", restart: restart, state: State{Phase: "idle"}}
 	raw, err := os.ReadFile(filepath.Join(filepath.Dir(path), ".update-state.json"))
 	if err == nil {
 		if err := json.Unmarshal(raw, &s.state); err != nil {
@@ -100,7 +102,7 @@ func (s *Service) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	supported := s.supported
-	return Status{Current: s.info, Repository: Repository, Supported: supported, Managed: s.managed, RestartRequired: s.state.Phase == "ready" && s.state.TargetVersion != s.info.Version, CanRollback: supported && s.state.Backup != nil && s.state.Backup.SchemaDigest == s.info.SchemaDigest, State: s.state}
+	return Status{StartedAt: s.startedAt, Current: s.info, Repository: Repository, Supported: supported, Managed: s.managed, RestartRequired: s.state.Phase == "ready" && s.state.TargetVersion != s.info.Version, CanRollback: supported && s.state.Backup != nil && s.state.Backup.SchemaDigest == s.info.SchemaDigest, State: s.state}
 }
 func (s *Service) Check(ctx context.Context, force bool) (Check, error) {
 	s.mu.Lock()

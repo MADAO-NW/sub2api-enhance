@@ -71,6 +71,7 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	a.POST("/captures/:id/reprocess", handler.ReprocessCapture)
 	a.POST("/users/:id/enable-and-reset", handler.EnableAndReset)
 	r.GET("/health", updates.Health)
+	r.GET("/enhance/api/v1/health", updates.Health)
 	static := http.StripPrefix("/enhance/", http.FileServer(http.FS(assets)))
 	r.NoRoute(func(c *gin.Context) {
 		path := c.Request.URL.Path
