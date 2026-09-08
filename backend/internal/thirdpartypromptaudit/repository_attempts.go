@@ -157,12 +157,16 @@ func (r *Repository) queryOutcome(ctx context.Context, query string, args ...any
 }
 
 func (r *Repository) ListAttempts(ctx context.Context, jobID int64) ([]ModelAttempt, error) {
+	return r.listAttempts(ctx, `job_id=$1
+ OR id IN (SELECT s.source_attempt_id FROM sub2api_enhance.third_party_prompt_audit_outcomes o JOIN sub2api_enhance.third_party_prompt_audit_outcome_segments link ON link.outcome_id=o.id JOIN sub2api_enhance.third_party_prompt_audit_segment_results s ON s.id=link.segment_result_id WHERE o.job_id=$1)
+ OR id IN (SELECT (m->>'joint_attempt_id')::bigint FROM sub2api_enhance.third_party_prompt_audit_outcomes o CROSS JOIN LATERAL json_array_elements(o.model_results::json) m WHERE o.job_id=$1)`, jobID)
+}
+
+// listAttempts 统一解码正式任务及节点测试的持久化调用证据。
+func (r *Repository) listAttempts(ctx context.Context, where string, id int64) ([]ModelAttempt, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT id,job_id,call_kind,evaluation_round,model_id,model_snapshot,stage,segment_order,repair_of_attempt_id,
  request_metadata,status,http_status,raw_response,confidence,reason,input_tokens,output_tokens,latency_ms,error_code,error_message,created_at,dispatch_started_at,finished_at
- FROM sub2api_enhance.third_party_prompt_audit_model_attempts WHERE job_id=$1
- OR id IN (SELECT s.source_attempt_id FROM sub2api_enhance.third_party_prompt_audit_outcomes o JOIN sub2api_enhance.third_party_prompt_audit_outcome_segments link ON link.outcome_id=o.id JOIN sub2api_enhance.third_party_prompt_audit_segment_results s ON s.id=link.segment_result_id WHERE o.job_id=$1)
- OR id IN (SELECT (m->>'joint_attempt_id')::bigint FROM sub2api_enhance.third_party_prompt_audit_outcomes o CROSS JOIN LATERAL json_array_elements(o.model_results::json) m WHERE o.job_id=$1)
- ORDER BY id`, jobID)
+ FROM sub2api_enhance.third_party_prompt_audit_model_attempts WHERE `+where+` ORDER BY id`, id)
 	if err != nil {
 		return nil, err
 	}

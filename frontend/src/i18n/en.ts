@@ -1,5 +1,15 @@
 export default {
   "thirdPartyPromptAudit": {
+    "probeDetails": "View call details",
+    "repairOf": "Repair of initial call",
+    "linkedJob": "Linked job",
+    "viewJob": "View job",
+    "captureCannotRecover": "Original input is incomplete or unrecoverable.",
+    "captureProcessingWait": "Processing or waiting for automatic retry. Refresh to check progress.",
+    "selectRecoveryUser": "Select associated user",
+    "selectRecoveryKey": "Select the user’s API key record",
+    "captureRecoveryHint": "Create an audit job from saved input without resending the request or retroactive enforcement.",
+
     "captureHint": "Captured bytes and audit snapshots are separate; forwarding does not prove billing success.",
     "captureBytes": "Bytes",
     "captureIntegrity": "Integrity",

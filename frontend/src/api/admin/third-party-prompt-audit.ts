@@ -106,9 +106,10 @@ export interface AuditJob {
 }
 export interface AuditEvent { id: number; job_id: number; original_outcome_id: number | null; latest_outcome_id: number; job?: AuditJob; latest?: Outcome; original?: Outcome; reaudit_status?: string; created_at: string; updated_at: string }
 export interface AuditCapture {
+  job_id?: number | null
   id: number; capture_key: string; transport: string; protocol: string; body_format: string; raw_body?: string; body_bytes: number; body_sha256: string
   snapshot_status: string; eligibility_status: string; processing_status: string; forwarding_status: string; created_at: string; last_error_message: string
-  identity?: unknown; metadata?: unknown; forwarding_observations?: unknown
+  identity?: { user_id: number }; metadata?: Record<string, string>; forwarding_observations?: unknown
 }
 export interface AuditUser {
   id: number; username: string; email: string; role: string; status: string; disable_violation_count: number; disable_reset_at: string | null; action_pending: boolean
@@ -161,6 +162,8 @@ export const thirdPartyPromptAuditAPI = {
     // 节点总预算由后端控制，避免浏览器毫秒计时范围截断管理员设置的大值。
     return (await apiClient.post<ProbeResult>(`${base}/models/probe`, value, { timeout: 0 })).data
   },
+  async probeDetails(id: number) { return (await apiClient.get<ModelAttempt[]>(`${base}/models/probes/${id}`)).data },
+  async userKeys(id: number) { return (await apiClient.get<{ id: number; name: string }[]>(`${base}/users/${id}/api-keys`)).data },
   async runtime() { return (await apiClient.get<AuditRuntime>(`${base}/runtime`)).data },
   async stats(params: StatsQuery) { return (await apiClient.get<AuditStats>(`${base}/stats`, { params })).data },
   async jobs(filter: AuditFilter, page = 1, pageSize = 20) { return (await apiClient.get<AuditPage<AuditJob>>(`${base}/jobs`, { params: { ...filter, ids: filter.ids?.join(','), page, page_size: pageSize } })).data },

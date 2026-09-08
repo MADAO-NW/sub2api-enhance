@@ -37,7 +37,20 @@ func (h *AdminHandler) GetCapture(c *gin.Context) {
 		respondError(c, err)
 		return
 	}
-	response.Success(c, result)
+	var jobID int64
+	err = h.repo.db.QueryRowContext(c.Request.Context(), `SELECT id FROM sub2api_enhance.third_party_prompt_audit_jobs WHERE capture_id=$1`, id).Scan(&jobID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		respondError(c, err)
+		return
+	}
+	var linked *int64
+	if err == nil {
+		linked = &jobID
+	}
+	response.Success(c, struct {
+		*Capture
+		JobID *int64 `json:"job_id"`
+	}{result, linked})
 }
 func (h *AdminHandler) DownloadCapture(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -72,6 +85,14 @@ func (h *AdminHandler) ReprocessCapture(c *gin.Context) {
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		respondError(c, err)
+		return
+	}
+	if capture.SnapshotStatus != "complete" {
+		response.BadRequest(c, "原文不完整或不可恢复，无法重新提取")
+		return
+	}
+	if capture.ProcessingStatus == "processing" || ((capture.ProcessingStatus == "queued" || capture.ProcessingStatus == "retry") && capture.Metadata["mode"] == "async" && capture.Eligibility == "passed") {
+		response.BadRequest(c, "采集正在处理或等待自动重试，请刷新后查看")
 		return
 	}
 	var input struct {

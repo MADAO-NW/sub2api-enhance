@@ -1,6 +1,7 @@
 <script setup lang="ts">
+import BaseDialog from '@/components/common/BaseDialog.vue'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { thirdPartyPromptAuditAPI as api, type AuditConfig, type AuditModel, type AuditUser, type Contract, type KeyUpdate, type ProbeResult, type SavedConfig } from '@/api/admin/third-party-prompt-audit'
+import { thirdPartyPromptAuditAPI as api, type AuditConfig, type AuditModel, type AuditUser, type ModelAttempt, type Contract, type KeyUpdate, type ProbeResult, type SavedConfig } from '@/api/admin/third-party-prompt-audit'
 import { getAll } from '@/api/admin/groups'
 import type { AdminGroup } from '@/types'
 import { useAppStore } from '@/stores/app'
@@ -18,6 +19,11 @@ const users = ref<AuditUser[]>([])
 const keys = reactive<Record<string, KeyUpdate>>({})
 const modelOptions = reactive<Record<string, string[]>>({})
 const probes = reactive<Record<string, ProbeResult>>({})
+const attemptDetails = ref<ModelAttempt[] | null>(null)
+async function showProbeDetails(id: number) {
+  try { attemptDetails.value = await api.probeDetails(id) }
+  catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+}
 const probing = ref<string[]>([])
 const listingModels = ref<string[]>([])
 const resetting = ref(false)
@@ -257,6 +263,7 @@ onMounted(load)
               <span>{{ formatTime(probes[model.id]!.tested_at) }} · {{ probes[model.id]!.latency_ms }} ms · #{{ probes[model.id]!.attempt_id }}</span>
               <p v-if="probes[model.id]?.result">{{ label('score') }} {{ probes[model.id]!.result!.confidence }} · {{ probes[model.id]!.result!.reason }}</p>
               <p v-if="probes[model.id]?.error" class="text-red-600 dark:text-red-400">{{ probes[model.id]!.error!.message }} · {{ probes[model.id]!.error!.code }}</p>
+            <button type="button" class="mt-2 block text-primary-600 underline" @click="showProbeDetails(probes[model.id]!.attempt_id)">{{ label('probeDetails') }}</button>
             </div>
           </div>
           <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('probeHint') }}</p>
@@ -299,5 +306,14 @@ onMounted(load)
         <div class="flex gap-2"><button type="button" class="btn btn-secondary" :disabled="saving || !dirty" @click="restore">{{ label('reset') }}</button><button type="submit" class="btn btn-primary" :disabled="saving || !dirty" data-test="save-config">{{ label(saving ? 'loading' : 'save') }}</button></div>
       </div>
     </form>
+    <BaseDialog :show="attemptDetails !== null" :title="label('probeDetails')" :close-on-click-outside="true" @close="attemptDetails = null">
+      <div v-for="attempt in attemptDetails" :key="attempt.id" class="mb-5 space-y-2">
+        <h3 class="font-semibold">#{{ attempt.id }} · {{ label(attempt.stage) }} · HTTP {{ attempt.http_status ?? '—' }}</h3>
+        <p>{{ formatTime(attempt.created_at) }} · {{ attempt.latency_ms }} ms · {{ label(attempt.status) }}</p>
+        <p v-if="attempt.repair_of_attempt_id">{{ label('repairOf') }} #{{ attempt.repair_of_attempt_id }}</p>
+        <p v-if="attempt.error_code" class="text-red-600">{{ attempt.error_code }} · {{ attempt.error_message }}</p>
+        <pre class="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-3 text-sm dark:bg-dark-950">{{ attempt.raw_response ?? label('inputNotAvailable') }}</pre>
+      </div>
+    </BaseDialog>
   </div>
 </template>

@@ -1,5 +1,15 @@
 export default {
   "thirdPartyPromptAudit": {
+    "probeDetails": "查看调用详情",
+    "repairOf": "格式修正对应首次调用",
+    "linkedJob": "已关联任务",
+    "viewJob": "查看任务",
+    "captureCannotRecover": "原文不完整或不可恢复，无法重新提取。",
+    "captureProcessingWait": "正在处理或等待自动重试，请刷新后查看。",
+    "selectRecoveryUser": "选择关联用户",
+    "selectRecoveryKey": "选择该用户的 API Key 记录",
+    "captureRecoveryHint": "使用已保存原文创建审核任务，不重新发送业务请求，不追溯处罚。",
+
     "captureHint": "原文字节与审核快照分别保存；转发完成不代表计费成功。",
     "captureBytes": "字节",
     "captureIntegrity": "完整性",
@@ -10,7 +20,7 @@ export default {
     "operation": "操作",
     "viewCapture": "查看原文",
     "manualKeyHint": "身份未知时填写 API Key ID",
-    "reprocessCapture": "恢复提取",
+    "reprocessCapture": "重新提取并创建审核任务",
     "captureResumed": "已提交恢复；未重发业务请求",
 
     "captureStock": "原文采集存量",

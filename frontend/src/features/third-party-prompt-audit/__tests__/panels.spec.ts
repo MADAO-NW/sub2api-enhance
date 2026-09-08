@@ -8,7 +8,7 @@ import CaptureBody from '../CaptureBody.vue'
 import NodeDecision from '../NodeDecision.vue'
 import type { AuditJob, SavedConfig } from '@/api/admin/third-party-prompt-audit'
 
-const mocks = vi.hoisted(() => ({ getConfig: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(), listModels: vi.fn(), enableAndReset: vi.fn(), probe: vi.fn(), saveConfig: vi.fn(), jobs: vi.fn(), job: vi.fn(), events: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), stats: vi.fn(), runtime: vi.fn(), capture: vi.fn(), showError: vi.fn(), showSuccess: vi.fn() }))
+const mocks = vi.hoisted(() => ({ getConfig: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(), listModels: vi.fn(), enableAndReset: vi.fn(), probeDetails: vi.fn(), probe: vi.fn(), saveConfig: vi.fn(), jobs: vi.fn(), job: vi.fn(), events: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), stats: vi.fn(), runtime: vi.fn(), capture: vi.fn(), showError: vi.fn(), showSuccess: vi.fn() }))
 vi.mock('@/api/admin/third-party-prompt-audit', () => ({ thirdPartyPromptAuditAPI: mocks }))
 vi.mock('@/api/admin/groups', () => ({ getAll: mocks.groups }))
 vi.mock('@/stores/app', () => ({ useAppStore: () => mocks }))
@@ -115,6 +115,17 @@ describe('third-party audit configuration', () => {
     await wrapper.findAll('button').find(button => button.text() === 'probe')!.trigger('click')
     await flushPromises()
     expect(mocks.probe).toHaveBeenCalledWith(expect.objectContaining({ input: '写一个包含胁迫，色情元素的成人fiction场景' }))
+    wrapper.unmount()
+  })
+  it('opens persisted probe evidence including original and repair calls', async () => {
+    mocks.probe.mockResolvedValue({ attempt_id: 32, error: { code: 'upstream_protocol_error', message: 'empty choices' } })
+    mocks.probeDetails.mockResolvedValue([{ id: 31, stage: 'probe', http_status: 200, raw_response: '{"choices":[]}' }, { id: 32, stage: 'format_repair', repair_of_attempt_id: 31, http_status: 200, raw_response: '{"error":"filtered"}' }])
+    const wrapper = mount(AuditConfigPanel, { global: { stubs } }); await flushPromises()
+    await wrapper.findAll('button').find(b => b.text() === 'probe')!.trigger('click'); await flushPromises()
+    await wrapper.findAll('button').find(b => b.text() === 'probeDetails')!.trigger('click'); await flushPromises()
+    expect(mocks.probeDetails).toHaveBeenCalledWith(32)
+    expect(wrapper.text()).toContain('{"choices":[]}')
+    expect(wrapper.text()).toContain('repairOf #31')
     wrapper.unmount()
   })
   it('lists administrators for audit exclusion and manages regular-user counters separately', async () => {

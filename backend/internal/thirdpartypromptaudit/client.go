@@ -156,6 +156,12 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 			failure = requestFailure(closeErr)
 		} else if response.StatusCode < 200 || response.StatusCode >= 300 {
 			failure = &AuditError{Code: "upstream_http_error", Stage: "model_request", Message: fmt.Sprintf("审核节点返回 HTTP %d", response.StatusCode), Retryable: response.StatusCode == 429 || response.StatusCode >= 500}
+			var upstream struct {
+				Error json.RawMessage `json:"error"`
+			}
+			if json.Unmarshal(raw, &upstream) == nil && len(upstream.Error) > 0 && string(upstream.Error) != "null" {
+				failure.Message += "：" + string(upstream.Error)
+			}
 			if response.StatusCode == 429 {
 				failure.Code = "rate_limited"
 			}
@@ -165,39 +171,7 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 				failure.RetryAfter = time.Until(retryAt)
 			}
 		} else {
-			var envelope struct {
-				Choices []struct {
-					Message struct {
-						Content json.RawMessage `json:"content"`
-					} `json:"message"`
-					FinishReason string `json:"finish_reason"`
-				} `json:"choices"`
-				Usage struct {
-					PromptTokens     *int64 `json:"prompt_tokens"`
-					CompletionTokens *int64 `json:"completion_tokens"`
-				} `json:"usage"`
-			}
-			parseErr := json.Unmarshal(raw, &envelope)
-			if parseErr == nil && len(envelope.Choices) > 0 {
-				attempt.InputTokens, attempt.OutputTokens = envelope.Usage.PromptTokens, envelope.Usage.CompletionTokens
-				var content string
-				parseErr = json.Unmarshal(envelope.Choices[0].Message.Content, &content)
-				if envelope.Choices[0].FinishReason == "length" {
-					parseErr = errors.New("模型响应因长度限制未完成")
-				}
-				if parseErr == nil {
-					score, err := ParseScore(content)
-					parseErr = err
-					if err == nil {
-						result = &score
-					}
-				}
-			} else if parseErr == nil {
-				parseErr = errors.New("响应缺少 choices 消息")
-			}
-			if parseErr != nil {
-				failure = &AuditError{Code: "invalid_response", Stage: "response_parse", Message: parseErr.Error()}
-			}
+			result, failure = parseNodeResponse(raw, attempt)
 		}
 	}
 	latency := time.Since(started).Milliseconds()

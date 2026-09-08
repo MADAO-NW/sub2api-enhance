@@ -52,6 +52,8 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	a.GET("/contract", handler.GetContract)
 	a.POST("/models/list", handler.ListModels)
 	a.POST("/models/probe", handler.ProbeModel)
+	a.GET("/models/probes/:id", handler.ProbeDetails)
+	a.GET("/users/:id/api-keys", handler.UserKeys)
 	a.GET("/users", handler.ListAuditUsers)
 	a.GET("/runtime", handler.GetRuntime)
 	a.GET("/stats", handler.GetStats)

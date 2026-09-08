@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { apiClient } from '@/api/client'
-import { thirdPartyPromptAuditAPI as api, type AuditCapture } from '@/api/admin/third-party-prompt-audit'
+import { thirdPartyPromptAuditAPI as api, type AuditCapture, type AuditUser } from '@/api/admin/third-party-prompt-audit'
+import AuditDetail from './AuditDetail.vue'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
@@ -15,6 +16,23 @@ const selected = ref<AuditCapture | null>(null)
 const error = ref('')
 const app = useAppStore()
 const label = useAuditLabels()
+const users = ref<AuditUser[]>([])
+const userID = ref<number | null>(null)
+const keyOptions = ref<{ id: number; name: string }[]>([])
+const keyLoading = ref(false)
+const recovering = ref(false)
+const jobID = ref<number | null>(null)
+const recoveryBlocked = computed(() => !selected.value || selected.value.snapshot_status !== 'complete')
+const processing = computed(() => !!selected.value && (selected.value.processing_status === 'processing' || (['queued', 'retry'].includes(selected.value.processing_status) && selected.value.metadata?.mode === 'async' && selected.value.eligibility_status === 'passed')))
+watch(userID, async id => {
+  manualKeyID.value = undefined
+  keyOptions.value = []
+  if (!id) { keyLoading.value = false; return }
+  keyLoading.value = true
+  try { const options = await api.userKeys(id); if (userID.value === id) keyOptions.value = options }
+  catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { if (userID.value === id) keyLoading.value = false }
+})
 const manualKeyID = ref<number | undefined>()
 const base = '/admin/third-party-prompt-audit/captures'
 
@@ -30,11 +48,17 @@ async function load() {
 }
 
 async function detail(id: number) {
-  try { selected.value = await api.capture(id) }
+  try {
+    selected.value = await api.capture(id)
+    userID.value = null; manualKeyID.value = undefined; keyOptions.value = []
+    if (!selected.value.job_id && !selected.value.identity?.user_id && !recoveryBlocked.value && !processing.value) users.value = await api.users()
+  }
   catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
 }
 
 async function reprocess(id: number) {
+  if (recovering.value) return
+  recovering.value = true
   try {
     await apiClient.post(`${base}/${id}/reprocess`, { api_key_id: manualKeyID.value })
     await detail(id)
@@ -42,7 +66,7 @@ async function reprocess(id: number) {
     app.showSuccess(label('captureResumed'))
   } catch (err) {
     app.showError(extractApiErrorMessage(err, label('error')))
-  }
+  } finally { recovering.value = false }
 }
 
 onMounted(load)
@@ -73,11 +97,22 @@ onMounted(load)
     <BaseDialog :show="!!selected" :title="label('captureDetail')" :close-on-click-outside="true" @close="selected = null">
       <template v-if="selected">
         <CaptureBody :capture="selected" />
-        <div class="mt-5 flex flex-wrap gap-3">
-          <input v-model.number="manualKeyID" class="input max-w-xs" type="number" min="1" :placeholder="label('manualKeyHint')">
-          <button class="btn btn-secondary" @click="reprocess(selected.id)">{{ label('reprocessCapture') }}</button>
+        <div class="mt-5 space-y-3">
+          <div v-if="selected.job_id"><span>{{ label('linkedJob') }} #{{ selected.job_id }}</span> <button class="btn btn-secondary" @click="jobID = selected.job_id!">{{ label('viewJob') }}</button></div>
+          <p v-else-if="recoveryBlocked">{{ label('captureCannotRecover') }}</p>
+          <p v-else-if="processing">{{ label('captureProcessingWait') }}</p>
+          <template v-else>
+            <div v-if="!selected.identity?.user_id" class="flex flex-wrap gap-3">
+              <select v-model="userID" class="input"><option :value="null">{{ label('selectRecoveryUser') }}</option><option v-for="user in users" :key="user.id" :value="user.id">{{ user.username }} (#{{ user.id }}) · {{ user.email }}</option></select>
+              <select v-model="manualKeyID" class="input" :disabled="!userID || keyLoading"><option :value="undefined">{{ label('selectRecoveryKey') }}</option><option v-for="key in keyOptions" :key="key.id" :value="key.id">{{ key.name }} (#{{ key.id }})</option></select>
+            </div>
+            <p class="text-sm text-gray-500">{{ label('captureRecoveryHint') }}</p>
+            <button class="btn btn-secondary" :disabled="recovering || (!selected.identity?.user_id && !manualKeyID)" @click="reprocess(selected.id)">{{ label(recovering ? 'loading' : 'reprocessCapture') }}</button>
+          </template>
+          <button class="text-primary-600 underline" :disabled="recovering" @click="detail(selected.id)">{{ label('refresh') }}</button>
         </div>
       </template>
     </BaseDialog>
+    <AuditDetail :id="jobID" source="jobs" @close="jobID = null" />
   </section>
 </template>
