@@ -25,6 +25,21 @@ const configLockKey int64 = 579147893221901941
 // DefaultNodeTimeoutMS 为新增节点提供默认总审核预算，已有节点必须显式提交超时。
 const DefaultNodeTimeoutMS = 300000
 
+// defaultReviewThreshold 是新配置默认触发联合审核和待复核的风险分数。
+const defaultReviewThreshold = 0.5
+
+// defaultBlockThreshold 是新配置默认判定违规的风险分数。
+const defaultBlockThreshold = 0.8
+
+// defaultWarningWindow 是违规提醒默认统计的最近正式审核数量。
+const defaultWarningWindow = 10
+
+// defaultWarningLimit 是默认统计窗口内触发提醒的违规数量。
+const defaultWarningLimit = 3
+
+// defaultDisableLimit 是默认触发用户自动停用的累计违规数量。
+const defaultDisableLimit = 5
+
 type ModelConfig struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
@@ -123,6 +138,13 @@ type PublicConfig struct {
 	ModelDefaults struct {
 		TimeoutMS int `json:"timeout_ms"`
 	} `json:"model_defaults"`
+	RuleDefaults struct {
+		ReviewThreshold float64 `json:"review_threshold"`
+		BlockThreshold  float64 `json:"block_threshold"`
+		WarningWindow   int     `json:"warning_window"`
+		WarningLimit    int     `json:"warning_limit"`
+		DisableLimit    int64   `json:"disable_limit"`
+	} `json:"rule_defaults"`
 	AppliedRevision int64  `json:"applied_revision"`
 	InstanceID      string `json:"instance_id"`
 	Config
@@ -147,23 +169,21 @@ type ConfigUpdate struct {
 }
 
 type activeConfig struct {
-	Stored             storedConfig
-	Keys               map[string]string
-	RiskControlEnabled bool
+	Stored storedConfig
+	Keys   map[string]string
 }
 
 type ConfigManager struct {
-	publicOrigin               string
-	reloadMu                   sync.Mutex
-	expectedRiskControlEnabled bool
-	db                         *sql.DB
-	encryptor                  appconfig.SecretEncryptor
-	encryptionKeyConfigured    bool
-	mu                         sync.RWMutex
-	active                     *activeConfig
-	expectedMode               string
-	expectedRevision           int64
-	loadError                  error
+	publicOrigin            string
+	reloadMu                sync.Mutex
+	db                      *sql.DB
+	encryptor               appconfig.SecretEncryptor
+	encryptionKeyConfigured bool
+	mu                      sync.RWMutex
+	active                  *activeConfig
+	expectedMode            string
+	expectedRevision        int64
+	loadError               error
 }
 
 func NewConfigManager(db *sql.DB, encryptor appconfig.SecretEncryptor, cfg *appconfig.Config) *ConfigManager {
@@ -176,9 +196,13 @@ func NewConfigManager(db *sql.DB, encryptor appconfig.SecretEncryptor, cfg *appc
 }
 
 func DefaultConfig() Config {
+	reviewThreshold, blockThreshold := defaultReviewThreshold, defaultBlockThreshold
 	return Config{Mode: "off", AuditScope: "full_request", Platforms: []string{}, AllGroups: true,
 		GroupIDs: []int64{}, AuditPrompt: DefaultPolicy, Models: []ModelConfig{},
-		Aggregation: "any_block", WorkerCount: 4, StorePassEvents: true}
+		ReviewThreshold: &reviewThreshold, BlockThreshold: &blockThreshold,
+		Aggregation: "any_block", WorkerCount: 4, StorePassEvents: true,
+		Warning: WarningConfig{Window: defaultWarningWindow, Limit: defaultWarningLimit},
+		Disable: DisableConfig{Limit: defaultDisableLimit}}
 }
 
 func validateConfig(config Config, activating bool) error {
@@ -270,7 +294,7 @@ func (m *ConfigManager) Reload(ctx context.Context) (loadErr error) {
 			m.mu.Unlock()
 		}
 	}()
-	rows, err := m.db.QueryContext(ctx, `SELECT key,value FROM sub2api_enhance.settings WHERE key=$1 UNION ALL SELECT key,value FROM public.settings WHERE key=$2`, SettingKey, "risk_control_enabled")
+	rows, err := m.db.QueryContext(ctx, `SELECT key,value FROM sub2api_enhance.settings WHERE key=$1`, SettingKey)
 	if err != nil {
 		m.mu.Lock()
 		m.loadError = err
@@ -300,7 +324,6 @@ func (m *ConfigManager) Reload(ctx context.Context) (loadErr error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.expectedRiskControlEnabled = values["risk_control_enabled"] == "true"
 	m.expectedMode = stored.Mode
 	m.expectedRevision = stored.Revision
 	if err == nil {
@@ -327,7 +350,7 @@ func (m *ConfigManager) Reload(ctx context.Context) (loadErr error) {
 	if err != nil {
 		return err
 	}
-	m.active = &activeConfig{Stored: stored, Keys: keys, RiskControlEnabled: values["risk_control_enabled"] == "true"}
+	m.active = &activeConfig{Stored: stored, Keys: keys}
 	return nil
 }
 
@@ -355,9 +378,6 @@ func (m *ConfigManager) Active() (ConfigSnapshot, error) {
 func (m *ConfigManager) EffectiveMode() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if !m.expectedRiskControlEnabled {
-		return "off"
-	}
 	if m.loadError != nil {
 		if m.expectedMode == "blocking" || m.expectedMode == "async" {
 			return m.expectedMode
@@ -402,6 +422,11 @@ func publicConfig(stored storedConfig) PublicConfig {
 		WarningRuleRevision: stored.WarningRuleRevision, HasAPIKeys: keys,
 		UpdatedAt: stored.UpdatedAt, UpdatedBy: stored.UpdatedBy}
 	result.ModelDefaults.TimeoutMS = DefaultNodeTimeoutMS
+	result.RuleDefaults.ReviewThreshold = defaultReviewThreshold
+	result.RuleDefaults.BlockThreshold = defaultBlockThreshold
+	result.RuleDefaults.WarningWindow = defaultWarningWindow
+	result.RuleDefaults.WarningLimit = defaultWarningLimit
+	result.RuleDefaults.DisableLimit = defaultDisableLimit
 	return result
 }
 
@@ -448,10 +473,6 @@ func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID in
 		}
 		updates[key.ModelID] = key
 	}
-	oldModels := make(map[string]ModelConfig)
-	for _, model := range current.Models {
-		oldModels[model.ID] = model
-	}
 	for _, model := range next.Models {
 		update, exists := updates[model.ID]
 		if !exists {
@@ -462,10 +483,6 @@ func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID in
 		case "keep":
 			if update.APIKey != "" {
 				return PublicConfig{}, infraerrors.BadRequest("third_party_audit_invalid_key", "保持凭据时不能提交新密钥")
-			}
-			old := oldModels[model.ID]
-			if current.EncryptedKeys[model.ID] != "" && (old.BaseURL != model.BaseURL || old.Model != model.Model) {
-				return PublicConfig{}, infraerrors.BadRequest("third_party_audit_key_binding_changed", "变更节点地址或模型时，请明确替换或清除该节点凭据")
 			}
 			next.EncryptedKeys[model.ID] = current.EncryptedKeys[model.ID]
 		case "replace":

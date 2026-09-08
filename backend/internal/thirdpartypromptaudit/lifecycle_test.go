@@ -26,7 +26,7 @@ func TestPublicSavedConfigSurvivesDecryptionFailure(t *testing.T) {
 	raw, err := json.Marshal(stored)
 	require.NoError(t, err)
 	mock.ExpectQuery("SELECT value FROM sub2api_enhance.settings").WithArgs(SettingKey).WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(string(raw)))
-	mock.ExpectQuery("SELECT key,value FROM sub2api_enhance.settings").WithArgs(SettingKey, "risk_control_enabled").WillReturnRows(sqlmock.NewRows([]string{"key", "value"}).AddRow(SettingKey, string(raw)).AddRow("risk_control_enabled", "true"))
+	mock.ExpectQuery("SELECT key,value FROM sub2api_enhance.settings").WithArgs(SettingKey).WillReturnRows(sqlmock.NewRows([]string{"key", "value"}).AddRow(SettingKey, string(raw)))
 	manager := &ConfigManager{db: db}
 	saved, err := manager.ReadSaved(context.Background())
 	require.NoError(t, err)
@@ -42,18 +42,18 @@ func TestPublicSavedConfigSurvivesDecryptionFailure(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestReloadFailureKeepsActualCapacityButObservesGlobalOff(t *testing.T) {
+func TestReloadFailureKeepsActualCapacityAndConfiguredMode(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
-	manager := &ConfigManager{db: db, active: &activeConfig{Stored: storedConfig{Config: testConfig(), Revision: 5}, RiskControlEnabled: true}}
+	manager := &ConfigManager{db: db, active: &activeConfig{Stored: storedConfig{Config: testConfig(), Revision: 5}}}
 	broken := storedConfig{Config: testConfig(), Revision: 6}
 	broken.WorkerCount = 0
 	raw, err := json.Marshal(broken)
 	require.NoError(t, err)
-	mock.ExpectQuery("SELECT key,value FROM sub2api_enhance.settings").WillReturnRows(sqlmock.NewRows([]string{"key", "value"}).AddRow(SettingKey, string(raw)).AddRow("risk_control_enabled", "false"))
+	mock.ExpectQuery("SELECT key,value FROM sub2api_enhance.settings").WithArgs(SettingKey).WillReturnRows(sqlmock.NewRows([]string{"key", "value"}).AddRow(SettingKey, string(raw)))
 	require.Error(t, manager.Reload(context.Background()))
-	require.Equal(t, "off", manager.EffectiveMode())
+	require.Equal(t, "async", manager.EffectiveMode())
 	require.Equal(t, 4, manager.WorkerCapacity())
 	require.Equal(t, int64(5), manager.active.Stored.Revision)
 	require.Equal(t, int64(6), manager.expectedRevision)
@@ -76,6 +76,31 @@ func TestReloadSerializesReadAndPublish(t *testing.T) {
 	}
 	wg.Wait()
 	require.Equal(t, int64(2), manager.active.Stored.Revision)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestSaveKeepsStoredCredentialWhenNodeIdentityChangesAndKeyIsBlank(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	current := storedConfig{Config: testConfig(), Revision: 1, EncryptedKeys: map[string]string{"test-node": "encrypted-value"}}
+	raw, err := json.Marshal(current)
+	require.NoError(t, err)
+	next := current.Config
+	next.Models[0].BaseURL = "https://new.example.invalid"
+	next.Models[0].Model = "new-model"
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(configLockKey).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT value FROM sub2api_enhance.settings").WithArgs(SettingKey).WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(string(raw)))
+	mock.ExpectExec("INSERT INTO sub2api_enhance.settings").WithArgs(SettingKey, sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectQuery("SELECT key,value FROM sub2api_enhance.settings").WithArgs(SettingKey).WillReturnRows(sqlmock.NewRows([]string{"key", "value"}).AddRow(SettingKey, string(raw)))
+	manager := &ConfigManager{db: db}
+	saved, err := manager.Save(context.Background(), ConfigUpdate{ExpectedRevision: 1, Config: next, Keys: []KeyUpdate{{ModelID: "test-node", Action: "keep"}}}, 9)
+	require.NoError(t, err)
+	require.True(t, saved.HasAPIKeys["test-node"])
+	require.Equal(t, "https://new.example.invalid", saved.Models[0].BaseURL)
+	require.Equal(t, "new-model", saved.Models[0].Model)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

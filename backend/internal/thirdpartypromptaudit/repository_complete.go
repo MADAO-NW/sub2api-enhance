@@ -46,11 +46,6 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 			return nil, err
 		}
 	}
-	var globalGate string
-	err = tx.QueryRowContext(ctx, `SELECT value FROM public.settings WHERE key='risk_control_enabled'`).Scan(&globalGate)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
 	if err := validateConfig(current.Config, current.Mode != "off"); err != nil {
 		return nil, err
 	}
@@ -96,7 +91,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 	if err != nil {
 		return nil, err
 	}
-	cloned.EnforcementEligible = job.IngressStage != "manual_capture_reprocess" && eligible && job.RunKind == "request" && (job.ExecutionMode == "async" || foreground) && current.Mode != "off" && globalGate == "true"
+	cloned.EnforcementEligible = job.IngressStage != "manual_capture_reprocess" && eligible && job.RunKind == "request" && (job.ExecutionMode == "async" || foreground) && current.Mode != "off"
 	outcome := &Outcome{JobID: job.ID, UserID: job.UserID, Evaluation: *cloned}
 	models, err := json.Marshal(cloned.Models)
 	if err != nil {

@@ -1,24 +1,26 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import BaseDialog from '@/components/common/BaseDialog.vue'
-import { thirdPartyPromptAuditAPI as api, type AuditEvent, type JobDetail } from '@/api/admin/third-party-prompt-audit'
+import { thirdPartyPromptAuditAPI as api, type AuditCapture, type AuditEvent, type JobDetail } from '@/api/admin/third-party-prompt-audit'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { formatMS, formatTime } from './viewModel'
 import { useAuditLabels } from './labels'
 import NodeDecision from './NodeDecision.vue'
+import CaptureBody from './CaptureBody.vue'
 
-const props = defineProps<{ id: number | null; source: 'events' | 'jobs' }>()
-const emit = defineEmits<{ (event: 'close'): void; (event: 'changed'): void }>()
+const props = withDefaults(defineProps<{ id: number | null; source: 'events' | 'jobs'; refreshKey?: number }>(), { refreshKey: 0 })
+const emit = defineEmits<{ (event: 'close'): void; (event: 'changed'): void; (event: 'reaudit-created', ids: number[]): void }>()
 const label = useAuditLabels(), app = useAppStore()
 const detail = ref<JobDetail | null>(null), event = ref<AuditEvent | null>(null)
 const loading = ref(false), pending = ref(false), error = ref('')
+const capture = ref<AuditCapture | null>(null), captureLoading = ref(false)
 let generation = 0
 const job = computed(() => detail.value?.job)
 const pretty = (value: unknown) => JSON.stringify(value, null, 2)
 async function load() {
   const current = ++generation
-  if (!props.id) { detail.value = null; event.value = null; return }
+  if (!props.id) { detail.value = null; event.value = null; capture.value = null; return }
   loading.value = true
   error.value = ''
   detail.value = null
@@ -34,6 +36,7 @@ async function load() {
   } catch (err) { if (current === generation) error.value = extractApiErrorMessage(err, label('error')) }
   finally { if (current === generation) loading.value = false }
 }
+function close() { capture.value = null; emit('close') }
 async function copy(value: unknown) {
   try { await navigator.clipboard.writeText(typeof value === 'string' ? value : pretty(value)); app.showSuccess(label('copied')) }
   catch { app.showError(label('error')) }
@@ -49,16 +52,39 @@ async function restore(kind: 'result' | 'action', id: number) {
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { pending.value = false }
 }
-async function enableAndReset(){if(!job.value)return;pending.value=true;try{const result=await api.enableAndReset(job.value.user_id);app.showSuccess(`${label('actionSubmitted')} #${result.action_id}`);await load()}catch(e){app.showError(extractApiErrorMessage(e,label('error')))}finally{pending.value=false}}
-watch(() => [props.id, props.source], load, { immediate: true })
+async function showCapture() {
+  if (!job.value?.capture_id) return
+  captureLoading.value = true
+  try { capture.value = await api.capture(job.value.capture_id) }
+  catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { captureLoading.value = false }
+}
+async function reaudit() {
+  if (!props.id) return
+  pending.value = true
+  try {
+    const result = await api.reaudit({ source: props.source, filter: { ids: [props.id] } })
+    const ids = result.items.flatMap(item => item.job_id && ['created', 'already_running'].includes(item.status) ? [item.job_id] : [])
+    if (ids.length) {
+      const created = result.items.filter(item => item.status === 'created').length
+      app.showSuccess(created ? `${label('createdJobs')}: ${created}` : label('already_running'))
+      emit('reaudit-created', ids)
+      emit('changed')
+      await load()
+    } else {
+      app.showError(result.items[0]?.reason || label('noReauditAvailable'))
+    }
+  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { pending.value = false }
+}
+watch(() => [props.id, props.source, props.refreshKey], load, { immediate: true })
 </script>
 
 <template>
-  <BaseDialog :show="id !== null" :title="`${label('detail')} #${id ?? ''}`" width="full" @close="emit('close')">
+  <BaseDialog :show="id !== null" :title="`${label('detail')} #${id ?? ''}`" width="full" :close-on-click-outside="true" @close="close">
     <p v-if="loading" role="status">{{ label('loading') }}</p><p v-if="error" role="alert" class="text-red-600 dark:text-red-400">{{ error }}</p>
     <div v-if="detail && job" class="space-y-6">
-      <div class="flex flex-wrap gap-3"><a v-if="job.capture_id" class="btn btn-secondary" :href="`/enhance/api/v1/admin/third-party-prompt-audit/captures/${job.capture_id}/raw`">{{label('downloadCapture')}}</a><button class="btn btn-secondary" :disabled="pending" @click="enableAndReset">{{label('enableAndReset')}}</button></div>
-      <p class="text-sm text-gray-500">{{label('remoteActionHint')}}</p>
+      <div class="flex flex-wrap gap-3"><button v-if="job.capture_id" class="btn btn-secondary" :disabled="captureLoading" @click="showCapture">{{ label(captureLoading ? 'loading' : 'viewCapture') }}</button><button class="btn btn-secondary" :disabled="pending" @click="reaudit">{{ label(pending ? 'loading' : 'reaudit') }}</button></div>
       <section class="space-y-3">
         <div class="flex flex-wrap gap-3"><strong>Job #{{ job.id }}</strong><span>{{ label(job.run_kind) }} · {{ label(job.status) }}</span><span>{{ label(job.execution_mode) }}</span><span>{{ label(job.gateway_result) }}</span></div>
         <p class="break-words text-sm">{{ job.identity.username }} · {{ job.identity.user_email }} · {{ job.identity.api_key_name }} · {{ job.identity.group_name }}</p>
@@ -101,5 +127,6 @@ watch(() => [props.id, props.source], load, { immediate: true })
       <details class="border-t border-gray-200 pt-5 dark:border-dark-700"><summary class="cursor-pointer font-semibold">{{ label('policySnapshot') }}</summary><p class="mt-2 text-sm text-gray-500">{{ label('snapshotHint') }}</p><pre class="mt-3 overflow-auto whitespace-pre-wrap break-words text-xs">{{ pretty(job.config_snapshot) }}</pre></details>
       <section v-if="detail.reaudits.length" class="space-y-2"><h3 class="font-semibold">{{ label('reaudit') }}</h3><p v-for="child in detail.reaudits" :key="child.id" class="text-sm">#{{ child.id }} · {{ label(child.status) }} · {{ formatTime(child.created_at) }} · {{ child.last_error_message }}</p></section>
     </div>
+    <BaseDialog :show="!!capture" :title="label('captureDetail')" :close-on-click-outside="true" @close="capture = null"><CaptureBody v-if="capture" :capture="capture" /></BaseDialog>
   </BaseDialog>
 </template>

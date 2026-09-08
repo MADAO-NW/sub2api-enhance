@@ -3,10 +3,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import AuditConfigPanel from '../AuditConfigPanel.vue'
 import AuditRecords from '../AuditRecords.vue'
 import AuditDetail from '../AuditDetail.vue'
+import AuditOverview from '../AuditOverview.vue'
+import CaptureBody from '../CaptureBody.vue'
 import NodeDecision from '../NodeDecision.vue'
 import type { AuditJob, SavedConfig } from '@/api/admin/third-party-prompt-audit'
 
-const mocks = vi.hoisted(() => ({ getConfig: vi.fn(), getContract: vi.fn(), groups: vi.fn(), probe: vi.fn(), saveConfig: vi.fn(), jobs: vi.fn(), job: vi.fn(), events: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), showError: vi.fn(), showSuccess: vi.fn() }))
+const mocks = vi.hoisted(() => ({ getConfig: vi.fn(), getContract: vi.fn(), groups: vi.fn(), probe: vi.fn(), saveConfig: vi.fn(), jobs: vi.fn(), job: vi.fn(), events: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), stats: vi.fn(), runtime: vi.fn(), capture: vi.fn(), showError: vi.fn(), showSuccess: vi.fn() }))
 vi.mock('@/api/admin/third-party-prompt-audit', () => ({ thirdPartyPromptAuditAPI: mocks }))
 vi.mock('@/api/admin/groups', () => ({ getAll: mocks.groups }))
 vi.mock('@/stores/app', () => ({ useAppStore: () => mocks }))
@@ -17,7 +19,8 @@ function saved(): SavedConfig {
     models: [{ id: 'a', name: 'Node', base_url: 'https://example.invalid', model: 'test', enabled: true, timeout_ms: 1000 }],
     review_threshold: null, block_threshold: null, aggregation: 'any_block', worker_count: 4, store_pass_events: true,
     warning: { enabled: false, window: 0, limit: 0 }, disable: { enabled: false, limit: 0 }, admin_email: '', revision: 1, warning_rule_revision: 0,
-    has_api_keys: {}, updated_by: 1, updated_at: '2026-09-06T00:00:00Z', application_error: '', applied_revision: 1, instance_id: 'test-instance', model_defaults: { timeout_ms: 300000 } }
+    has_api_keys: {}, updated_by: 1, updated_at: '2026-09-06T00:00:00Z', application_error: '', applied_revision: 1, instance_id: 'test-instance', model_defaults: { timeout_ms: 300000 },
+    rule_defaults: { review_threshold: 0.5, block_threshold: 0.8, warning_window: 10, warning_limit: 3, disable_limit: 5 } }
 }
 const stubs = { BaseDialog: { props: ['show'], template: '<div v-if="show"><slot /></div>' }, Pagination: true }
 
@@ -28,6 +31,8 @@ beforeEach(() => {
   mocks.saveConfig.mockImplementation(async value => ({ ...saved(), ...value.config, revision: 2 }))
   mocks.groups.mockResolvedValue([])
   mocks.probe.mockResolvedValue({ ok: true, model_id: 'a', result: { confidence: 0.1, reason: 'normal' }, tested_at: '2026-09-06T00:00:00Z' })
+  mocks.stats.mockResolvedValue(null)
+  mocks.runtime.mockResolvedValue(null)
 })
 
 describe('third-party audit configuration', () => {
@@ -96,6 +101,26 @@ describe('third-party audit configuration', () => {
     expect(mocks.probe).toHaveBeenCalledWith(expect.objectContaining({ input: '[this is normal text, not JSON]' }))
     wrapper.unmount()
   })
+  it('fills rule defaults when features are enabled and replaces a key only after input', async () => {
+    mocks.getConfig.mockResolvedValue({ ...saved(), has_api_keys: { a: true } })
+    const wrapper = mount(AuditConfigPanel); await flushPromises()
+    const mode = wrapper.findAll('select').find(select => select.find('option[value="async"]').exists())!
+    await mode.setValue('async')
+    const warning = wrapper.findAll('label').find(item => item.text().includes('warning'))!.get('input[type="checkbox"]')
+    await warning.setValue(true)
+    const disable = wrapper.findAll('label').find(item => item.text().includes('disable'))!.get('input[type="checkbox"]')
+    await disable.setValue(true)
+    expect((wrapper.get('[data-test="review-threshold"]').element as HTMLInputElement).value).toBe('50')
+    expect((wrapper.get('[data-test="block-threshold"]').element as HTMLInputElement).value).toBe('80')
+    const numberByLabel = (text: string) => wrapper.findAll('label').find(item => item.text().includes(text))!.get('input[type="number"]')
+    expect((numberByLabel('warningWindow').element as HTMLInputElement).value).toBe('10')
+    expect((numberByLabel('warningLimit').element as HTMLInputElement).value).toBe('3')
+    expect((numberByLabel('disableLimit').element as HTMLInputElement).value).toBe('5')
+    await wrapper.get('input[type="password"]').setValue('replacement-key')
+    await wrapper.get('form').trigger('submit'); await flushPromises()
+    expect(mocks.saveConfig.mock.lastCall?.[0].keys).toContainEqual({ model_id: 'a', action: 'replace', api_key: 'replacement-key' })
+    wrapper.unmount()
+  })
 })
 
 describe('node decision evidence', () => {
@@ -155,6 +180,39 @@ describe('lossless full input', () => {
     await flushPromises()
     expect(wrapper.text()).toContain('9007199254740993')
     expect(wrapper.text()).not.toContain('9007199254740992')
+    wrapper.unmount()
+  })
+  it('renders captured UTF-8 bytes directly in the web view', () => {
+    const original = '{"input":"原始请求"}'
+    const wrapper = mount(CaptureBody, { props: { capture: { id: 2, capture_key: 'c', transport: 'http', protocol: 'responses', body_format: 'entity_bytes', raw_body: btoa(unescape(encodeURIComponent(original))), body_bytes: original.length, body_sha256: 'sha', snapshot_status: 'complete', eligibility_status: 'passed', processing_status: 'done', forwarding_status: 'complete', created_at: '2026-09-06T00:00:00Z', last_error_message: '' } } })
+    expect(wrapper.text()).toContain(original)
+    wrapper.unmount()
+  })
+  it('starts a single-record reaudit and exposes the created job for global refresh', async () => {
+    mocks.job.mockResolvedValue({ job: { id: 1, capture_id: 2, identity: {}, status: 'done', snapshot_status: 'complete', config_snapshot: {} }, outcome: null, attempts: [], actions: [], reaudits: [], input_json: '{}', input_parts: [], non_text: [] })
+    mocks.reaudit.mockResolvedValue({ matched: 1, ready: 1, items: [{ source_job_id: 1, job_id: 9, status: 'created', reason: '' }] })
+    const wrapper = mount(AuditDetail, { props: { source: 'jobs', id: 1 }, global: { stubs } })
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === 'reaudit')!.trigger('click')
+    await flushPromises()
+    expect(mocks.reaudit).toHaveBeenCalledWith({ source: 'jobs', filter: { ids: [1] } })
+    expect(wrapper.emitted('reaudit-created')?.[0]).toEqual([[9]])
+    expect(wrapper.text()).not.toContain('enableAndReset')
+    expect(wrapper.text()).not.toContain('downloadCapture')
+    wrapper.unmount()
+  })
+})
+
+describe('audit overview refresh', () => {
+  it('moves the end time to now before reloading all overview data', async () => {
+    const wrapper = mount(AuditOverview)
+    await flushPromises()
+    const inputs = wrapper.findAll('input[type="datetime-local"]')
+    await inputs[1]!.setValue('2020-01-01T00:00')
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(mocks.stats.mock.lastCall?.[0].to).not.toBe('2020-01-01T00:00:00.000Z')
+    expect(mocks.runtime).toHaveBeenCalledTimes(2)
     wrapper.unmount()
   })
 })

@@ -40,7 +40,11 @@ func TestWebSocketCapturesMessagesAndBlocksBeforeForward(t *testing.T) {
 				decision = audit.IngressDecisionBlock
 			}
 			store := &testCaptures{}
-			proxy, err := New(upstream.URL, store, testAudit{"blocking", decision}, testIdentity{})
+			errorCode := ""
+			if blocked {
+				errorCode = "third_party_audit_blocked"
+			}
+			proxy, err := New(upstream.URL, store, testAudit{mode: "blocking", decision: decision, errorCode: errorCode}, testIdentity{})
 			require.NoError(t, err)
 			ingress := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxy.Serve(w, r, "192.0.2.8") }))
 			defer ingress.Close()
@@ -54,6 +58,7 @@ func TestWebSocketCapturesMessagesAndBlocksBeforeForward(t *testing.T) {
 			require.NoError(t, err)
 			if blocked {
 				require.Contains(t, string(body), `"type":"error"`)
+				require.Contains(t, string(body), "请调整输入后重试")
 				require.Zero(t, received.Load())
 			} else {
 				require.Equal(t, raw, body)

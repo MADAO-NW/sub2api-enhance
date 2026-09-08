@@ -23,6 +23,19 @@ func testConfig() Config {
 }
 
 func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
+	defaults := DefaultConfig()
+	publicDefaults := publicConfig(storedConfig{}).RuleDefaults
+	require.NotNil(t, defaults.ReviewThreshold)
+	require.NotNil(t, defaults.BlockThreshold)
+	require.Equal(t, 0.5, *defaults.ReviewThreshold)
+	require.Equal(t, 0.8, *defaults.BlockThreshold)
+	require.Equal(t, WarningConfig{Window: 10, Limit: 3}, defaults.Warning)
+	require.Equal(t, DisableConfig{Limit: 5}, defaults.Disable)
+	require.Equal(t, 0.5, publicDefaults.ReviewThreshold)
+	require.Equal(t, 0.8, publicDefaults.BlockThreshold)
+	require.Equal(t, 10, publicDefaults.WarningWindow)
+	require.Equal(t, 3, publicDefaults.WarningLimit)
+	require.EqualValues(t, 5, publicDefaults.DisableLimit)
 	model := testConfig().Models[0]
 	require.Equal(t, 300000, publicConfig(storedConfig{}).ModelDefaults.TimeoutMS)
 	for _, timeout := range []int{1, DefaultNodeTimeoutMS, 86400000, int(math.MaxInt64 / int64(time.Millisecond))} {
@@ -85,6 +98,9 @@ func TestConfigRequiresCalibratedThresholdsOnlyWhenActivating(t *testing.T) {
 	config := DefaultConfig()
 	require.NoError(t, validateConfig(config, false))
 	config.Mode = "async"
+	config.Models = testConfig().Models
+	require.NoError(t, validateConfig(config, true))
+	config.ReviewThreshold = nil
 	require.Error(t, validateConfig(config, true))
 	config = testConfig()
 	require.NoError(t, validateConfig(config, true))

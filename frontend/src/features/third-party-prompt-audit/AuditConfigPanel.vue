@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { thirdPartyPromptAuditAPI as api, type AuditConfig, type AuditModel, type Contract, type KeyUpdate, type ProbeResult, type SavedConfig } from '@/api/admin/third-party-prompt-audit'
 import { getAll } from '@/api/admin/groups'
 import type { AdminGroup } from '@/types'
@@ -53,6 +53,9 @@ function restore() {
   for (const id of Object.keys(keys)) delete keys[id]
   for (const model of draft.value.models) keys[model.id] = { model_id: model.id, action: 'keep', api_key: '' }
 }
+function updateKey(modelID: string, value: string) {
+  keys[modelID] = { model_id: modelID, action: value ? 'replace' : 'keep', api_key: value }
+}
 async function load() {
   const preserveDraft = dirty.value
   loading.value = true
@@ -70,8 +73,21 @@ function addModel() {
   if (!draft.value || !saved.value) return
   const id = crypto.randomUUID()
   draft.value.models.push({ id, name: '', enabled: true, base_url: '', model: '', timeout_ms: saved.value.model_defaults.timeout_ms })
-  keys[id] = { model_id: id, action: 'replace', api_key: '' }
+  keys[id] = { model_id: id, action: 'keep', api_key: '' }
 }
+watch(() => draft.value?.mode, mode => {
+  if (!draft.value || !saved.value || mode === 'off') return
+  if (draft.value.review_threshold == null) draft.value.review_threshold = saved.value.rule_defaults.review_threshold
+  if (draft.value.block_threshold == null) draft.value.block_threshold = saved.value.rule_defaults.block_threshold
+})
+watch(() => draft.value?.warning.enabled, enabled => {
+  if (!draft.value || !saved.value || !enabled) return
+  if (draft.value.warning.window < 1) draft.value.warning.window = saved.value.rule_defaults.warning_window
+  if (draft.value.warning.limit < 1) draft.value.warning.limit = saved.value.rule_defaults.warning_limit
+})
+watch(() => draft.value?.disable.enabled, enabled => {
+  if (draft.value && saved.value && enabled && draft.value.disable.limit < 1) draft.value.disable.limit = saved.value.rule_defaults.disable_limit
+})
 function moveModel(index: number, direction: number) {
   const models = draft.value?.models
   if (!models || index + direction < 0 || index + direction >= models.length) return
@@ -163,10 +179,7 @@ onMounted(load)
               <label class="space-y-2"><span class="text-sm">{{ label('timeout') }}</span><input v-model.number="model.timeout_ms" class="input" type="number" min="1" step="1" required /></label>
             </div>
             <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('timeoutHint') }}</p>
-            <div v-if="keys[model.id]" class="grid gap-4 md:grid-cols-2">
-              <label class="space-y-2"><span class="text-sm">{{ label('credential') }} · {{ label(saved.has_api_keys[model.id] ? 'keyPresent' : 'keyAbsent') }}</span><select v-model="keys[model.id]!.action" class="input"><option v-for="action in ['keep', 'replace', 'clear']" :key="action" :value="action">{{ label(action) }}</option></select></label>
-              <label v-if="keys[model.id]?.action === 'replace'" class="space-y-2"><span class="text-sm">{{ label('replace') }}</span><input v-model="keys[model.id]!.api_key" class="input" type="password" autocomplete="new-password" required /></label>
-            </div>
+            <label v-if="keys[model.id]" class="block space-y-2"><span class="text-sm">{{ label('credential') }} · {{ label(saved.has_api_keys[model.id] ? 'keyPresent' : 'keyAbsent') }}</span><input :value="keys[model.id]?.api_key" class="input" type="password" autocomplete="new-password" :placeholder="label(saved.has_api_keys[model.id] ? 'keyKeepHint' : 'keyInputHint')" @input="updateKey(model.id, ($event.target as HTMLInputElement).value)" /></label>
             <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('keyHint') }} · {{ label('modelID') }}: {{ model.id }}</p>
             <button type="button" class="btn btn-secondary" :disabled="probing.includes(model.id)" @click="probe(model)">{{ label(probing.includes(model.id) ? 'loading' : 'probe') }}</button>
             <div v-if="probes[model.id]" class="rounded-lg bg-gray-50 p-3 text-sm dark:bg-dark-900" role="status">
@@ -202,10 +215,10 @@ onMounted(load)
           <h2 class="text-lg font-semibold">{{ label('actions') }}</h2><p class="text-sm text-gray-500 dark:text-dark-400">{{ label('actionHint') }}</p>
           <div class="grid gap-6 md:grid-cols-2">
             <fieldset class="space-y-4"><label class="flex items-center gap-2"><input v-model="draft.warning.enabled" type="checkbox" />{{ label('warning') }}</label>
-              <div v-if="draft.warning.enabled" class="grid grid-cols-2 gap-4"><label class="space-y-2"><span class="text-sm">{{ label('warningWindow') }}</span><input v-model.number="draft.warning.window" class="input" type="number" min="1" step="1" required /></label><label class="space-y-2"><span class="text-sm">{{ label('warningLimit') }}</span><input v-model.number="draft.warning.limit" class="input" type="number" min="1" :max="draft.warning.window" step="1" required /></label></div>
+              <div v-if="draft.warning.enabled" class="space-y-3"><div class="grid grid-cols-2 gap-4"><label class="space-y-2"><span class="text-sm">{{ label('warningWindow') }}</span><input v-model.number="draft.warning.window" class="input" type="number" min="1" step="1" required /></label><label class="space-y-2"><span class="text-sm">{{ label('warningLimit') }}</span><input v-model.number="draft.warning.limit" class="input" type="number" min="1" :max="draft.warning.window" step="1" required /></label></div><p class="text-xs text-gray-500 dark:text-dark-400">{{ label('warningWindowHint') }}</p></div>
             </fieldset>
             <fieldset class="space-y-4"><label class="flex items-center gap-2"><input v-model="draft.disable.enabled" type="checkbox" />{{ label('disable') }}</label><label v-if="draft.disable.enabled" class="block space-y-2"><span class="text-sm">{{ label('disableLimit') }}</span><input v-model.number="draft.disable.limit" class="input" type="number" min="1" step="1" required /></label></fieldset>
-          </div><label class="block space-y-2"><span class="text-sm">{{ label('adminEmail') }}</span><input v-model="draft.admin_email" class="input" type="email" :required="draft.warning.enabled || draft.disable.enabled" /></label>
+          </div><label class="block space-y-2"><span class="text-sm">{{ label('adminEmail') }}</span><input v-model="draft.admin_email" class="input" type="email" :required="draft.warning.enabled || draft.disable.enabled" /><span class="block text-xs text-gray-500 dark:text-dark-400">{{ label('adminEmailHint') }}</span></label>
         </section>
       </fieldset>
       <div class="sticky bottom-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-gray-200 bg-white/95 p-4 shadow-lg backdrop-blur dark:border-dark-600 dark:bg-dark-800/95">

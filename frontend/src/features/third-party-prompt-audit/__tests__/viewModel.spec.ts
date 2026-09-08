@@ -7,7 +7,8 @@ export const savedConfig = (): SavedConfig => ({
   models: [{ id: 'node-a', name: 'Node A', base_url: 'https://example.invalid', model: 'model', enabled: true, timeout_ms: 5000 }],
   review_threshold: null, block_threshold: null, aggregation: 'any_block', worker_count: 4, store_pass_events: true,
   warning: { enabled: false, window: 0, limit: 0 }, disable: { enabled: false, limit: 0 }, admin_email: '',
-  revision: 4, warning_rule_revision: 1, has_api_keys: { 'node-a': true }, updated_by: 1, updated_at: '2026-09-06T01:00:00Z', application_error: '', applied_revision: 1, instance_id: 'test-instance', model_defaults: { timeout_ms: 300000 }
+  revision: 4, warning_rule_revision: 1, has_api_keys: { 'node-a': true }, updated_by: 1, updated_at: '2026-09-06T01:00:00Z', application_error: '', applied_revision: 1, instance_id: 'test-instance', model_defaults: { timeout_ms: 300000 },
+  rule_defaults: { review_threshold: 0.5, block_threshold: 0.8, warning_window: 10, warning_limit: 3, disable_limit: 5 }
 })
 
 describe('third-party audit configuration contract', () => {

@@ -10,7 +10,8 @@ import { formatTime, toLocalInput } from './viewModel'
 import { useAuditLabels } from './labels'
 import NodeDecision from './NodeDecision.vue'
 
-const props = defineProps<{ source: 'events' | 'jobs'; initialFilter?: AuditFilter }>()
+const props = withDefaults(defineProps<{ source: 'events' | 'jobs'; initialFilter?: AuditFilter; refreshKey?: number }>(), { refreshKey: 0 })
+const emit = defineEmits<{ (event: 'reaudit-created', ids: number[]): void }>()
 const label = useAuditLabels(), app = useAppStore()
 const filters = reactive<AuditFilter>({}), applied = ref<AuditFilter>({})
 const from = ref(''), to = ref('')
@@ -68,6 +69,8 @@ async function submit() {
     previewPage.value = 1
     const failures = preview.value.items.filter(item => item.status === 'failed').length
     const created = preview.value.items.filter(item => item.status === 'created').length
+    const activeIDs = preview.value.items.flatMap(item => item.job_id && ['created', 'already_running'].includes(item.status) ? [item.job_id] : [])
+    if (activeIDs.length) emit('reaudit-created', activeIDs)
     if (failures) app.showError(`${label('createdJobs')}: ${created} · ${label('failed')}: ${failures}`)
     else app.showSuccess(`${label('createdJobs')}: ${created}`)
     await load()
@@ -87,6 +90,7 @@ watch(() => props.initialFilter, value => {
   page.value = 1
   void load()
 }, { immediate: true })
+watch(() => props.refreshKey, () => { void load() })
 </script>
 
 <template>
@@ -113,7 +117,7 @@ watch(() => props.initialFilter, value => {
       <tr v-for="row in rows" :key="row.id" class="border-t border-gray-100 align-top dark:border-dark-700"><td class="p-3"><input v-model="selected" type="checkbox" :value="row.id" :aria-label="`#${row.id}`" /></td><td class="whitespace-nowrap p-3"><p>{{ formatTime(row.event?.created_at ?? row.job.created_at) }}</p><p class="mt-1 text-xs text-gray-500">#{{ row.id }} · {{ label(row.job.run_kind) }}</p></td><td class="min-w-48 max-w-80 break-words p-3"><p>{{ row.job.identity.username }} (#{{ row.job.user_id }})</p><p>{{ row.job.identity.user_email }}</p><p class="text-xs text-gray-500">{{ row.job.identity.api_key_name }} · {{ row.job.identity.group_name }}</p></td><td class="max-w-72 break-words p-3"><p>{{ row.job.platform }} · {{ row.job.requested_model }}</p><p class="mt-1 text-xs text-gray-500">{{ row.job.protocol }} · {{ label(row.job.execution_mode) }}</p><p class="mt-1 text-xs">{{ label(row.job.gateway_result) }}</p></td><td class="min-w-40 p-3"><strong :class="row.event?.latest?.decision === 'block' ? 'text-red-600 dark:text-red-400' : row.event?.latest?.decision === 'review' ? 'text-amber-700 dark:text-amber-400' : ''">{{ label(row.event?.latest?.decision ?? row.job.status) }}</strong><p v-if="row.event?.latest?.partial_failure" class="text-xs text-amber-700">{{ label('partial_failure') }}</p><div v-for="model in row.event?.latest?.models ?? []" :key="model.model_id" class="mt-2"><strong class="text-xs">{{ model.model_name }}</strong><NodeDecision :model="model" :config="row.event?.latest?.decision_config" /></div><p v-if="row.event?.reaudit_status" class="mt-1 text-xs">{{ label('reaudit') }}: {{ label(row.event.reaudit_status) }}</p><p class="mt-1 text-xs">{{ label('attempts') }} {{ row.job.attempts }} / {{ row.job.max_attempts }}</p><p v-if="row.job.last_error_code" class="mt-1 break-all text-xs text-red-600 dark:text-red-400">{{ label(row.job.failure_stage) }} · {{ row.job.last_error_code }}</p><p v-if="row.job.status === 'retry'" class="mt-1 text-xs">{{ label('nextRetry') }} {{ formatTime(row.job.next_attempt_at) }}</p></td><td class="p-3 text-xs">{{ label(row.job.snapshot_status) }}</td><td class="p-3"><button class="btn btn-secondary btn-sm whitespace-nowrap" @click="detailID = row.id">{{ label('detail') }}</button></td></tr>
       <tr v-if="!loading && !rows.length"><td colspan="7" class="p-10 text-center text-gray-500">{{ label('empty') }}</td></tr>
     </tbody></table></div><Pagination :page="page" :page-size="pageSize" :page-size-options="[20, 50, 100]" :total="total" @update:page="changePage" @update:page-size="changeSize" /></div>
-    <AuditDetail :id="detailID" :source="source" @close="detailID = null" @changed="load" />
+    <AuditDetail :id="detailID" :source="source" :refresh-key="refreshKey" @close="detailID = null" @changed="load" @reaudit-created="emit('reaudit-created', $event)" />
     <BaseDialog :show="previewRequest !== null" :title="label('preview')" width="wide" :show-close-button="!previewLoading" :close-on-escape="!previewLoading" @close="previewRequest = null">
       <div class="space-y-4"><p class="text-sm text-gray-500 dark:text-dark-400">{{ label('previewHint') }}</p><p v-if="previewLoading" role="status">{{ label('loading') }}</p><template v-if="preview"><p>{{ label('matched') }}: {{ preview.matched }} · {{ label('ready') }}: {{ preview.ready }}</p><div class="max-h-96 overflow-auto"><div v-for="item in previewItems" :key="item.source_job_id" class="border-t border-gray-100 py-3 text-sm dark:border-dark-700"><span>Job #{{ item.source_job_id }} → {{ label(item.status === 'created' ? 'submitted' : item.status) }} <span v-if="item.job_id">#{{ item.job_id }}</span></span><p class="text-gray-500 dark:text-dark-400">{{ item.reason }}</p></div></div><Pagination :page="previewPage" :page-size="20" :total="preview.items.length" :show-page-size-selector="false" @update:page="previewPage = $event" /><button v-if="!submitted" class="btn btn-primary" :disabled="previewLoading || !preview.ready" @click="submit">{{ label('submitReaudit') }}</button><p v-else role="status"><span v-for="state in ['created', 'already_running', 'skipped', 'failed']" :key="state" class="mr-4">{{ label(state === 'created' ? 'createdJobs' : state) }}: {{ preview.items.filter(item => item.status === state).length }}</span></p></template></div>
     </BaseDialog>

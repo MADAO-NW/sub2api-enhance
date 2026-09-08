@@ -51,7 +51,7 @@ func (r *Repository) StartAttempt(ctx context.Context, job *Job, attempt *ModelA
 	err := r.db.QueryRowContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_model_attempts a SET status='started',dispatch_started_at=clock_timestamp()
  WHERE a.id=$1 AND a.status='prepared' AND (a.job_id IS NULL OR EXISTS
  (SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_jobs j WHERE j.id=a.job_id AND j.claim_generation=$2 AND j.status='processing' AND j.lease_until>clock_timestamp()))
- AND (a.call_kind='probe' OR ((SELECT value::json->>'mode' FROM sub2api_enhance.settings WHERE key='third_party_prompt_audit_config') IN ('async','blocking') AND (SELECT value FROM public.settings WHERE key='risk_control_enabled')='true'))
+ AND (a.call_kind='probe' OR (SELECT value::json->>'mode' FROM sub2api_enhance.settings WHERE key='third_party_prompt_audit_config') IN ('async','blocking'))
  RETURNING dispatch_started_at`, attempt.ID, generation).Scan(&attempt.DispatchStartedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		if job != nil {

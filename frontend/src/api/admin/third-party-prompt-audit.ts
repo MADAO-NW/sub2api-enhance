@@ -30,6 +30,7 @@ export interface AuditConfig {
 }
 export interface SavedConfig extends AuditConfig {
   model_defaults: { timeout_ms: number }
+  rule_defaults: { review_threshold: number; block_threshold: number; warning_window: number; warning_limit: number; disable_limit: number }
   applied_revision: number
   instance_id: string
   revision: number
@@ -103,6 +104,11 @@ export interface AuditJob {
   updated_at: string
 }
 export interface AuditEvent { id: number; job_id: number; original_outcome_id: number | null; latest_outcome_id: number; job?: AuditJob; latest?: Outcome; original?: Outcome; reaudit_status?: string; created_at: string; updated_at: string }
+export interface AuditCapture {
+  id: number; capture_key: string; transport: string; protocol: string; body_format: string; raw_body?: string; body_bytes: number; body_sha256: string
+  snapshot_status: string; eligibility_status: string; processing_status: string; forwarding_status: string; created_at: string; last_error_message: string
+  identity?: unknown; metadata?: unknown; forwarding_observations?: unknown
+}
 export interface ModelAttempt {
   id: number; job_id: number | null; call_kind: string; evaluation_round: number | null; model_id: string; model_snapshot: AuditModel
   stage: string; segment_order: number | null; repair_of_attempt_id: number | null; request_metadata: unknown; status: string
@@ -154,9 +160,9 @@ export const thirdPartyPromptAuditAPI = {
   async events(filter: AuditFilter, page = 1, pageSize = 20) { return (await apiClient.get<AuditPage<AuditEvent>>(`${base}/events`, { params: { ...filter, ids: filter.ids?.join(','), page, page_size: pageSize } })).data },
   async job(id: number) { return (await apiClient.get<JobDetail>(`${base}/jobs/${id}`)).data },
   async event(id: number) { return (await apiClient.get<EventDetail>(`${base}/events/${id}`)).data },
+  async capture(id: number) { return (await apiClient.get<AuditCapture>(`${base}/captures/${id}`)).data },
   async preview(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits/preview`, value)).data },
   async reaudit(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits`, value)).data },
   async resume(id: number) { return (await apiClient.post(`${base}/jobs/${id}/resume`)).data },
-  async enableAndReset(id: number) { return (await apiClient.post(`${base}/users/${id}/enable-and-reset`)).data },
   async retryAction(id: number) { return (await apiClient.post(`${base}/actions/${id}/retry`)).data }
 }

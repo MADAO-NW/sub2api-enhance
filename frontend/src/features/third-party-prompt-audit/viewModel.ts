@@ -33,3 +33,10 @@ export function formatMS(value: number | null | undefined): string {
 }
 
 export function sumCounts(value: Record<string, number>): number { return Object.values(value).reduce((sum, count) => sum + count, 0) }
+
+export function decodeCaptureBody(value: string | undefined): string {
+  if (!value) return ''
+  const bytes = Uint8Array.from(atob(value), character => character.charCodeAt(0))
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes) }
+  catch { return value }
+}

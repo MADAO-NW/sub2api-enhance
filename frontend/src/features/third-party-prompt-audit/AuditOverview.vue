@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { thirdPartyPromptAuditAPI as api, type AuditFilter, type AuditRuntime, type AuditStats } from '@/api/admin/third-party-prompt-audit'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { formatMS, formatTime, sumCounts, timeRange, toLocalInput } from './viewModel'
 import { useAuditLabels } from './labels'
 
 const emit = defineEmits<{ (event: 'inspect-jobs', filter: AuditFilter): void }>()
+const props = withDefaults(defineProps<{ refreshKey?: number }>(), { refreshKey: 0 })
 const label = useAuditLabels()
 const from = ref(toLocalInput(new Date(Date.now() - 86400000)))
 const to = ref(toLocalInput(new Date()))
@@ -33,12 +34,17 @@ async function load() {
   error.value = results.filter(result => result.status === 'rejected').map(result => extractApiErrorMessage(result.reason, label('error'))).join(' · ')
   loading.value = false
 }
+async function refresh() {
+  to.value = toLocalInput(new Date())
+  await load()
+}
 onMounted(load)
+watch(() => props.refreshKey, () => { void refresh() })
 </script>
 
 <template>
   <div class="space-y-5">
-    <form class="card flex flex-wrap items-end gap-3 p-4" @submit.prevent="load">
+    <form class="card flex flex-wrap items-end gap-3 p-4" @submit.prevent="refresh">
       <label class="space-y-2"><span class="text-sm">{{ label('from') }}</span><input v-model="from" class="input" type="datetime-local" required /></label>
       <label class="space-y-2"><span class="text-sm">{{ label('to') }}</span><input v-model="to" class="input" type="datetime-local" required /></label>
       <label class="space-y-2"><span class="text-sm">{{ label('mode') }}</span><select v-model="mode" class="input"><option value="">{{ label('all') }}</option><option value="async">{{ label('async') }}</option><option value="blocking">{{ label('blocking') }}</option></select></label>

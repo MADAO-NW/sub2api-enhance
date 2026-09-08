@@ -148,6 +148,14 @@ func writeError(w http.ResponseWriter, protocol string, status int, code, messag
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// auditDeniedMessage 向调用方说明同步审核未转发请求，同时避免泄露审核策略和模型原始理由。
+func auditDeniedMessage(kind audit.IngressDecisionKind) string {
+	if kind == audit.IngressDecisionBlock {
+		return "请求内容未通过第三方模型提示词审核，增强服务已阻止转发。请调整输入后重试，或联系管理员复核。"
+	}
+	return "增强审核暂时无法完成，当前为同步审核模式，原请求未转发。请稍后重试，或联系管理员。"
+}
+
 // Serve 接收的 clientIP 必须由配置了可信代理范围的 Gin 得到。
 func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 	state := &requestContext{clientIP: clientIP, started: time.Now()}
@@ -304,6 +312,6 @@ func (p *Proxy) allow(w http.ResponseWriter, kind string, c *audit.Capture, d *a
 		status = 403
 	}
 	p.observe(context.Background(), c.ID, "blocked", map[string]any{"code": d.ErrorCode})
-	writeError(w, kind, status, d.ErrorCode, "请求未通过增强审核")
+	writeError(w, kind, status, d.ErrorCode, auditDeniedMessage(d.Kind))
 	return false
 }

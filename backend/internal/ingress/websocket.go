@@ -132,7 +132,7 @@ func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *request
 			decision := p.evaluate(ctx, c)
 			if decision != nil && decision.Kind != audit.IngressDecisionAllow && decision.Kind != audit.IngressDecisionFlag {
 				p.observe(ctx, c.ID, "blocked", map[string]any{"code": decision.ErrorCode})
-				sendError(decision.ErrorCode, "该轮输入未通过增强审核")
+				sendError(decision.ErrorCode, auditDeniedMessage(decision.Kind))
 				continue
 			}
 		} else {

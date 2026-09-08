@@ -78,7 +78,7 @@ sudo bash /tmp/sub2api-enhance-install.sh rollback
 ## 首次部署前提
 
 1. 使用实际未改版 sub2api 验证身份表、分组字段、`/api/v1/auth/me`、管理员用户状态 API，以及原版会话 IP/UA 绑定。适配基线为本地 main 0.2.1，不代表所有上游版本都兼容。
-2. 为增强服务准备同库独立 Schema `sub2api_enhance`，给予自己的表和迁移台账所需权限。对 `public.api_keys`、`users`、`groups`、`user_allowed_groups`、`settings` 仅授予必要 SELECT；不授予原用户表 UPDATE 或 public DDL。使用额度模块时增加 `accounts`、`account_groups`、`user_platform_quotas`、`audit_logs` 的必要 SELECT。周一结转需另授予 `public.user_platform_quotas(weekly_usage_usd, weekly_window_start)` 两列 UPDATE；不会修改限额配置、日/月用量或原表结构。Redis 使用独立 ACL 账号。
+2. 为增强服务准备同库独立 Schema `sub2api_enhance`，给予自己的表和迁移台账所需权限。对 `public.api_keys`、`users`、`groups`、`user_allowed_groups` 仅授予必要 SELECT；不授予原用户表 UPDATE 或 public DDL。使用额度模块时增加 `accounts`、`account_groups`、`user_platform_quotas`、`audit_logs` 的必要 SELECT。周一结转需另授予 `public.user_platform_quotas(weekly_usage_usd, weekly_window_start)` 两列 UPDATE；不会修改限额配置、日/月用量或原表结构。Redis 使用独立 ACL 账号。
 3. 服务首次启动会在专用锁中执行自有 SQL migration；启动属于会触发数据库写入的动作，需提前确认。Schema 未预建时，启动角色还需具备目标数据库 CREATE 权限；也可预建由增强角色拥有的 schema，避免授予数据库级 CREATE。不要因此授予 public DDL 权限。
 4. 将 `deploy/.env.example` 的值放入源码目录外的环境文件或 Secret，替换数据库凭据、内部地址、管理员 API Key 和独立加密密钥。管理员 Key 只在后端用于账号动作；页面身份始终使用访问者原版 JWT。
 5. 修改 Nginx 前核对实际端口、可信代理链、输入大小限制、流式超时和全部模型别名。示例不提供自动旁路或 POST 重投；不要开放原版业务端口供外网绕过采集。
@@ -101,15 +101,15 @@ sudo bash /opt/sub2api-enhance/configure-sub2api-menus.sh /etc/sub2api-enhance/s
 
 原版会附带 token、theme、lang 等参数。增强页面立即清理 URL token，以 POST 交换短时 HttpOnly 会话；后续每次管理 API 调用重新向原版验证访问者身份。非本机页面要求 HTTPS。同域页面属于可信后台集成，不能作为权限隔离沙箱。
 
-页面提供概览、事件、任务、原文采集及配置。配置保留草稿、修订冲突、凭据 keep/replace/clear、单节点试审、阈值和多节点聚合。
+页面提供概览、事件、任务、原文采集及配置。配置保留草稿、修订冲突、单节点试审、阈值和多节点聚合；模型凭据输入留空时保留已保存值，填写后替换。
 
 - `off`：透传，不创建新审核任务。流量仍经过增强代理时，代理进程仍是可用性依赖。
 - `async`：原文保存成功后转发，后台审核。原文保存失败返回 503；模型故障不改变已转发请求。
 - `blocking`：原文先保存，审核通过/复核才转发，违规拒绝；不能验证身份或协议时失败关闭。
 
-沿用原方案的只读原版 `risk_control_enabled` 总门禁。原版门禁未开启时，保存增强 async/blocking 配置仍不会生效；在原版已有设置入口明确启用后再验收，不由增强服务写原 settings。
+第三方提示词审计只由增强服务自身的 `off`、`async`、`blocking` 模式控制，不读取或写入原版 `risk_control_enabled`。因此可以在不启用原版风控中心的情况下独立采集和审核。
 
-提醒与停用都默认关闭。账号 API 结果未知时只读核对，避免重复写入；通知只能在账号动作确认后发送。用户详情提供“启用用户并重置审核累计”，原版直接启用不会原子重置增强累计。人工恢复和复核不重复处罚。
+新配置默认使用 50% 待复核/联合审核触发阈值和 80% 违规阈值；提醒与停用都默认关闭，启用时默认使用最近 10 次正式审核中 3 次违规提醒、累计 5 次违规自动停用。账号 API 结果未知时只读核对，避免重复写入；通知只能在账号动作确认后发送。人工恢复和重新审核不重复处罚，重新审核完成后更新原事件的最新结论。
 
 ## 当前协议边界
 

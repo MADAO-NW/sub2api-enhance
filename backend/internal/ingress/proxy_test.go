@@ -2,6 +2,7 @@ package ingress
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"github.com/stretchr/testify/require"
 	"io"
@@ -41,13 +42,14 @@ func (s *testCaptures) Observe(_ context.Context, _ int64, state string, _ map[s
 func (s *testCaptures) Finish(context.Context, int64, string, string) error { return nil }
 
 type testAudit struct {
-	mode     string
-	decision audit.IngressDecisionKind
+	mode      string
+	decision  audit.IngressDecisionKind
+	errorCode string
 }
 
 func (s testAudit) Mode() string { return s.mode }
 func (s testAudit) AuditCapture(context.Context, *audit.Capture) (*audit.IntakeDecision, error) {
-	return &audit.IntakeDecision{JobID: 1, Mode: s.mode, Kind: s.decision}, nil
+	return &audit.IntakeDecision{JobID: 1, Mode: s.mode, Kind: s.decision, ErrorCode: s.errorCode}, nil
 }
 func (s testAudit) ObserveGateway(context.Context, *audit.IntakeDecision, audit.IngressDecision, time.Duration) {
 }
@@ -73,7 +75,7 @@ func TestProtectedInputMustPersistBeforeForward(t *testing.T) {
 				_, _ = io.WriteString(w, "data: {\"text\":\"hello\"}\n\n")
 			}))
 			defer upstream.Close()
-			p, err := New(upstream.URL, store, testAudit{"async", audit.IngressDecisionAllow}, testIdentity{})
+			p, err := New(upstream.URL, store, testAudit{mode: "async", decision: audit.IngressDecisionAllow}, testIdentity{})
 			require.NoError(t, err)
 			body := " {\"input\":\"a  b\\n中文\",\"id\":9007199254740993} "
 			req := httptest.NewRequest("POST", "http://enhance/v1/responses?stream=true", strings.NewReader(body))
@@ -97,10 +99,21 @@ func TestBlockingDecisionPreventsUpstreamSideEffect(t *testing.T) {
 	calls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
 	defer upstream.Close()
-	p, err := New(upstream.URL, &testCaptures{}, testAudit{"blocking", audit.IngressDecisionBlock}, testIdentity{})
+	p, err := New(upstream.URL, &testCaptures{}, testAudit{mode: "blocking", decision: audit.IngressDecisionBlock, errorCode: "third_party_audit_blocked"}, testIdentity{})
 	require.NoError(t, err)
 	recorder := httptest.NewRecorder()
 	p.Serve(recorder, httptest.NewRequest("POST", "http://enhance/v1/responses", strings.NewReader(`{"input":"test"}`)), "192.0.2.7")
 	require.Equal(t, 403, recorder.Code)
 	require.Zero(t, calls)
+	var body struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
+	require.Equal(t, "third_party_audit_blocked", body.Error.Code)
+	require.Equal(t, "enhance_error", body.Error.Type)
+	require.Equal(t, "请求内容未通过第三方模型提示词审核，增强服务已阻止转发。请调整输入后重试，或联系管理员复核。", body.Error.Message)
 }
