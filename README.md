@@ -1,20 +1,223 @@
 # sub2api++
 
-sub2api 的独立增强服务。当前已迁移第三方提示词审计核心及管理页面，并实现外置 HTTP/Responses WebSocket 采集、持久动作和管理员会话。已新增用户日/周限额跟随模块，默认关闭并以观察模式起步。
+[sub2api-enhance](https://github.com/MADAO-NW/sub2api-enhance) 是 Sub2API 的独立增强服务，提供两个功能：
 
-项目包含由 sub2api 改编的代码，相关派生部分继续遵循根目录 `LICENSE` 中的 GNU LGPL v3。仓库初始化时选择的 MIT 文本保存在 `LICENSE-MIT`，其适用边界见 `NOTICE`，不会覆盖第三方或派生代码的原许可。
+- **第三方提示词审计**：保存客户端输入，调用审核模型评估风险，支持异步审计、同步阻断、违规提醒和累计停用。
+- **OpenAI 日/周额度跟随**：观察分组内账号的真实重置窗口，一致确认后重置参加用户的用量；保留原版自然日、周一规则，并支持周一旧周用量结转。
 
-原 sub2api 源码、构建、表结构与迁移台账保持独立。模型输入先保存到 `sub2api_enhance`，再转发到原版；用户停用和启用通过原版管理 API 完成，不直接写原用户表。额度跟随通过原版 API 归零日/周用量；保留自然日和周一规则，并由增强服务在周一受控结转旧周用量。结转仅更新原 OpenAI 配额的 weekly_usage_usd、weekly_window_start；缓存修复仅清理该用户 OpenAI 配额键及对应脏成员。
+无需修改或重新编译 Sub2API。增强服务独立发布、独立运行，前端和数据库迁移包含在同一个二进制中。自有数据放在原数据库的 `sub2api_enhance` schema，不改原版表结构；账号状态和日/周用量归零通过原版管理 API 完成。**周一结转例外需要更新原版 OpenAI 配额表的两列用量/窗口字段，并清理相关 Redis 缓存**，并非所有功能都对原版数据只读。
 
-## 结构与构建
+[下载稳定版](https://github.com/MADAO-NW/sub2api-enhance/releases/latest) · [环境配置示例](deploy/.env.example) · [Nginx 示例](deploy/nginx.conf.example)
 
-- `backend/`：Go 1.27.0、Gin、Wire、database/sql、PostgreSQL；独立 module `sub2api-enhance`。
-- `frontend/`：Vue 3、TypeScript、Vite、Pinia、Vue Router、TailwindCSS，pnpm 管理固定依赖。
-- `backend/migrations/001_prompt_audit.sql`：提示词审计初始结构。
-- `backend/migrations/002_quota_follow.sql`：额度跟随自有表；两份 SQL 均不修改原版表结构。
-- `deploy/`：环境变量和 Nginx 配置示例，不是生产配置。
+## 部署前准备
 
-依赖已固定在 go.mod/go.sum 与 pnpm-lock.yaml。全新环境按用户授权规则安装后可执行：
+推荐在 Sub2API 所在的 Linux 主机上使用脚本部署。服务器不需要 Go、Node.js、pnpm 或项目源码。
+
+| 项目 | 要求 |
+| --- | --- |
+| 操作系统 | Linux amd64 / arm64，使用 systemd |
+| 系统工具 | bash、curl、tar、sha256sum、jq、flock、systemctl、install、getent、useradd、sort；菜单脚本还使用 awk |
+| 原服务 | 已运行的 Sub2API、PostgreSQL 15+；额度结转和缓存修复还需要原版使用的 Redis 7+ |
+| 访问入口 | 原版后台和增强页面使用同一个 HTTPS 域名，由 Nginx 等反向代理分流 |
+| 兼容性 | 当前适配基线为 Sub2API 0.2.1；其他版本需核对管理员 API、身份及配额字段 |
+
+数据库连接必须指向 **Sub2API 实际使用的同一个数据库**。建议使用独立数据库账号，权限按启用功能准备：
+
+- 自有数据：拥有 `sub2api_enhance` schema 及其建表、迁移、读写权限。可由数据库管理员预建并指定所有者；若由服务自动创建 schema，连接角色还需要目标数据库的 `CREATE` 权限。
+- 提示词审计：对 `public.api_keys`、`users`、`groups`、`user_allowed_groups` 授予必要 `SELECT`。
+- 额度跟随：另外读取 `accounts`、`account_groups`、`user_platform_quotas`、`audit_logs`。
+- 周一结转：另外授予 `public.user_platform_quotas` 的 `weekly_usage_usd`、`weekly_window_start` 两列 `UPDATE`。无需授予原用户表 `UPDATE` 或原版表结构修改权限。
+
+安装脚本不安装数据库、Redis、Nginx，也不创建原版数据库账号或授予权限。
+
+## 1. 安装增强服务
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MADAO-NW/sub2api-enhance/main/deploy/install.sh -o /tmp/sub2api-enhance-install.sh
+sudo bash /tmp/sub2api-enhance-install.sh install
+```
+
+脚本会下载最新稳定版、校验 SHA256 和包内版本，创建系统用户、安装程序及 systemd 单元，并启用开机启动。首次安装不会立即启动服务，先填写环境配置。
+
+| 路径 | 用途 |
+| --- | --- |
+| `/opt/sub2api-enhance/sub2api-enhance` | 服务程序，包含前端和迁移 |
+| `/etc/sub2api-enhance/sub2api-enhance.env` | 环境配置 |
+| `/opt/sub2api-enhance/configure-sub2api-menus.sh` | 原版菜单及图标配置脚本 |
+| `/etc/systemd/system/sub2api-enhance.service` | systemd 服务 |
+
+## 2. 填写环境配置并启动
+
+先在 **Sub2API → 系统设置 → 安全 → 管理员 API Key** 中取得管理员密钥，填入下方 `SUB2API_ADMIN_API_KEY`。这不是普通用户在“API 密钥”页创建的模型调用密钥，也不是审核模型供应商的 Key。已有其他服务使用该管理员密钥时，不要为了安装增强服务随意重新生成它。
+
+```bash
+sudoedit /etc/sub2api-enhance/sub2api-enhance.env
+```
+
+优先核对以下字段，完整说明见 [环境配置示例](deploy/.env.example)：
+
+| 配置 | 填写方式 |
+| --- | --- |
+| `ENHANCE_LISTEN` | 增强监听地址，默认 `127.0.0.1:18081` |
+| `ENHANCE_DATABASE_URL` | 原版数据库连接，使用为增强服务准备的账号 |
+| `SUB2API_INTERNAL_URL` | 直达原版的内部地址，例如 `http://127.0.0.1:18080`；不要填写经过增强代理的公网地址 |
+| `ENHANCE_PUBLIC_ORIGIN` | 原版后台的 HTTPS Origin，例如 `https://gateway.example.com`，不带路径 |
+| `SUB2API_ADMIN_API_KEY` | 原版管理员 API Key，用于菜单配置、账号动作和额度操作 |
+| `ENHANCE_ENCRYPTION_KEY` | 独立的 32 字节随机密钥，经 Base64 编码，用于保存审核节点凭据 |
+| `ENHANCE_TRUSTED_PROXIES` | 实际反向代理的地址段；同机 Nginx 可使用 `127.0.0.1/32,::1/128` |
+| `ENHANCE_DB_CONNECTIONS` / `ENHANCE_INGRESS_CONNECTIONS` | 后台与采集连接池大小，示例各为 `8`；额度模块另占最多三条锁连接 |
+
+可用下面的命令生成加密密钥，将输出填入环境文件并妥善备份；更新版本时保持不变，否则已有审核节点凭据将无法解密：
+
+```bash
+openssl rand -base64 32
+```
+
+通知功能需要在同一环境文件填写 `SMTP_HOST`、`SMTP_PORT`、`SMTP_FROM`；需要认证时再填写 `SMTP_USER`、`SMTP_PASSWORD`。页面里的“管理员通知邮箱”是收件人，不是发件服务配置。
+
+```bash
+sudo systemctl start sub2api-enhance
+sudo systemctl status sub2api-enhance --no-pager
+curl -fsS http://127.0.0.1:18081/health
+```
+
+如果改了监听地址，健康检查 URL 也要对应修改。首次启动自动执行自有表迁移，以后按迁移校验和识别已执行版本，无需手工导入增强 SQL。启动失败时查看：
+
+```bash
+sudo journalctl -u sub2api-enhance -n 100 --no-pager
+```
+
+## 3. 配置公网反向代理
+
+**菜单可打开，不代表模型请求已接入增强服务。** 提示词审计要求模型流量经过增强代理：
+
+```text
+浏览器访问后台 /api/、/admin/ 等 → 原版 Sub2API
+浏览器访问 /enhance/            → 增强服务（管理页面和接口）
+客户端访问模型 API              → 增强服务 → 原版 Sub2API → 模型供应商
+```
+
+将 [deploy/nginx.conf.example](deploy/nginx.conf.example) 中的分流规则合并到现有站点，替换域名、证书及两个内部端口。可先下载示例查看，**不要直接覆盖现有站点配置**：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MADAO-NW/sub2api-enhance/main/deploy/nginx.conf.example -o /tmp/sub2api-enhance-nginx.conf.example
+```
+
+- `/enhance/` 转到增强监听地址，保留示例中的客户端 IP、协议头和不记录 token 查询串的日志设置。
+- `/v1/`、`/v1beta/`、`/responses` 等模型路径转到增强服务；完整路径及 WebSocket/SSE 设置见示例。核对客户端实际使用的别名是否也在分流范围内。
+- 其他后台路径继续直达原版。`SUB2API_INTERNAL_URL` 必须绕过增强入口，否则会递归。
+- 保留 WebSocket 升级头，关闭流式缓冲与模型 POST 的代理自动重试。按实际输入大小和审核耗时配置正文限制及超时。
+- 原版业务端口只向本机/可信内网开放，避免客户端绕过审核。若原版在 Docker 中，给宿主机脚本提供受限的本机映射端口；容器内的 `127.0.0.1` 与宿主机不是同一地址。
+
+合并配置后检查并重载 Nginx：
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+完成同域分流后，原客户端通常继续使用原来的域名和模型 API Key，无需重新配 Key，也无需在原版添加一个指向增强服务的模型账号。
+
+## 4. 在 Sub2API 中添加增强菜单
+
+### 推荐：运行菜单脚本
+
+```bash
+sudo bash /opt/sub2api-enhance/configure-sub2api-menus.sh /etc/sub2api-enhance/sub2api-enhance.env
+```
+
+脚本通过原版设置 API 幂等维护两个管理员菜单和 SVG 图标，保留其他菜单及已有排序。它读取环境文件中的内部地址、公网 Origin 和管理员 Key；当前要求原版内部地址为本机 HTTP IP 加端口、公网地址为 HTTPS Origin。
+
+运行成功后刷新原版后台，即可在侧边栏打开：
+
+| 菜单 | 管理员自定义菜单 URL | 原版菜单路由 |
+| --- | --- | --- |
+| 第三方提示词审计 | `https://gateway.example.com/enhance/third-party-prompt-audit` | `/custom/enhance-prompt-audit` |
+| 用户额度跟随 | `https://gateway.example.com/enhance/quota-follow` | `/custom/enhance-quota-follow` |
+
+将示例域名替换为自己的 `ENHANCE_PUBLIC_ORIGIN`。菜单配置填写 `/enhance/` 对应的完整 URL，不能把 `/custom/` 外层路由当作嵌入地址。
+
+### 手工配置
+
+也可以在 **Sub2API → 系统设置 → 自定义菜单** 中添加上述两个完整 URL，将可见范围设为“管理员”。图标可填写 SVG；脚本已提供默认盾牌和时钟图标，无需修改原版前端源码。
+
+从原版菜单打开后，增强页面复用原版管理员登录、主题和语言，不需要创建增强管理员账号，也不要手动在菜单 URL 中拼接 token。增强会话过期会尝试自动恢复；原版登录过期时点击“重新连接”。
+
+## 5. 启用功能并验证接入
+
+### 第三方提示词审计
+
+1. 从原版侧边栏打开“第三方提示词审计”，进入“配置”。
+2. 填写审核节点地址和供应商 Key，点击“获取模型列表”并选择模型；节点名称自动生成。已保存节点的 Key 留空会保留原值。
+3. 使用“测试此节点”确认节点能返回合法评分。“查看调用详情”可查看上游原始响应；节点测试不会生成正式审核任务，也不会执行用户处罚。
+4. 选择审核范围、平台/分组和不审核用户，设置运行模式后保存。无需打开原版“风控中心”开关。
+5. 用现有客户端向已分流的公网模型 API 发起一条普通请求，核对“原文采集”新增记录，以及匹配的任务和采集 ID。仅测试审核节点，不能验证真实请求是否经过增强代理。
+
+| 模式 | 行为 |
+| --- | --- |
+| 关闭 `off` | 不创建新审核任务，业务请求透传；流量经过增强代理时仍依赖其可用性 |
+| 异步 `async` | 原文保存成功后转发，后台审核；原文保存失败返回 503，模型审核故障不撤回已转发请求 |
+| 同步 `blocking` | 原文先保存，审核通过或待复核才转发；最终违规阻断，无法完成审核按不可用处理 |
+
+默认联合审核触发阈值为 **50%**，违规阈值为 **80%**。提醒、累计停用默认关闭；启用时默认最近 10 次正式审核中 3 次违规提醒、累计 5 次违规自动停用。账号恢复入口位于配置页“用户违规累计管理”。
+
+上游拒绝、空 `choices`、超时等技术失败不会自动当作用户违规。重新审核更新最新有效结论，不重复处罚。不审核用户仍保存原文；已有任务的采集详情显示“查看任务”，无任务且可恢复时才显示恢复入口。
+
+### OpenAI 日/周额度跟随
+
+1. 在原版“账号管理/分组管理”中准备目标分组的 OpenAI 账号；参加用户需是有效普通用户，有该分组访问权限及 OpenAI 配额记录。
+2. 在增强“用户额度跟随”页选择目标分组，勾选日/周窗口，先启用“观察模式”并保存。
+3. 核对有效账号、参加用户、时区和重置边界；默认每轮随机间隔 10–15 分钟。所有有效账号周窗口一致确认推进后，才产生跟随事件，利用率下降本身不代表重置。
+4. 确认观察结果后关闭观察模式，后续新事件才会调用原版接口归零用户所选日/周用量。观察期间的旧事件不会补发，模式切换会重新建立基线。
+
+如需周一旧周用量结转及缓存修复，还需完成：
+
+| 配置 | 要求 |
+| --- | --- |
+| `QUOTA_FOLLOW_REDIS_URL` | 指向原版实际使用的 Redis 实例及数据库编号，不要使用另一个空数据库；账号允许 `HGETALL`、`DEL`、`SREM` 及必要连接握手，键限定为 `billing:user_platform_quota:*` 和 `billing:upq:dirty` |
+| `SUB2API_TIMEZONE` | 与原版实际 IANA 时区一致，例如 `Asia/Shanghai` |
+| `SUB2API_USER_PLATFORM_QUOTA_FLUSHER_ENABLED` | 核实原版 `database.user_platform_quota_flusher_enabled` 确实关闭后填 `false`；这个环境变量不会改变原版配置，空值或 `true` 会阻止结转及缓存清理 |
+| 数据库权限 | 具备前述配额表两列的 `UPDATE` 权限 |
+
+原版自然日和周一规则继续保留；周一结转保留或加回旧周已用额度，再等待 OpenAI 账号窗口确认推进后归零。快照过旧、窗口冲突或错过安全窗口会跳过，不追补历史。DB、Redis 与原版并发计费不能保证跨系统强一致；结果不确定时使用记录详情中的只读核对，不盲目重复归零。
+
+## 更新与日常维护
+
+点击增强页面标题旁的 **版本号** 打开更新面板：检测更新 → 下载并应用 → 确认重启。新进程和目标版本就绪后页面会自动刷新；超过两分钟未确认恢复会提供手动连接入口。旧版页面升级到支持自动恢复的版本时，可能仍需手动刷新一次。
+
+命令行也可升级；`/tmp` 中的脚本可能被系统清理，使用前重新下载：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MADAO-NW/sub2api-enhance/main/deploy/install.sh -o /tmp/sub2api-enhance-install.sh
+sudo bash /tmp/sub2api-enhance-install.sh upgrade
+```
+
+使用 `-v` 可指定一个已发布稳定标签，例如 `upgrade -v v0.1.8`；不加版本号则安装最新稳定版。恢复本地备份：
+
+```bash
+sudo bash /tmp/sub2api-enhance-install.sh rollback
+```
+
+更新保留环境配置和业务数据。恢复旧二进制只允许迁移集合一致，不能代替数据库恢复。网页更新只替换程序；环境变量、systemd、Nginx 和菜单脚本有调整时需按发布说明更新。私有仓库或 API 限流时可使用仅用于 GitHub 发布查询/下载的 `UPDATE_GITHUB_TOKEN`；命令行执行时需让安装脚本进程获得该变量。
+
+| 现象 | 优先检查 |
+| --- | --- |
+| `/enhance/` 页面打不开 | 服务健康状态、反向代理路由、HTTPS 域名与 Origin |
+| 菜单能打开，但没有采集 | 客户端实际 API 路径是否转到增强服务，是否绕过了代理 |
+| 原文存在，但没有任务 | 运行模式、分组/平台范围、不审核用户、身份及解析状态 |
+| 模型列表或节点测试失败 | 节点地址、模型及供应商 Key，调用详情中的 HTTP 状态和原始响应 |
+| 邮件未发送 | SMTP 发件配置、收件地址及动作投递状态 |
+| 额度不跟随 | 模块开关、观察模式、账号一致边界、参加用户及分组权限 |
+| 周一结转被跳过 | 原版 Flusher 实际状态、Redis、时区、列权限及快照/窗口原因 |
+
+## 范围与限制
+
+已适配 Responses、Chat Completions、Messages、Gemini 等文本请求及 Responses WebSocket。仅审核客户端实际携带的输入，不主动获取上游隐含历史，不审核模型新生成的输出。multipart 保存文本字段及二进制描述；未知协议或不支持的编码不会被宣称为已完成审核。未适配的 WebSocket（包括部分 Realtime）在启用审计时明确报错。
+
+动态 composite 分组可能无法可靠确认最终平台；大正文、媒体和长连接的资源需求取决于数据库及部署环境，需按实际客户端验收。旧分支的审计数据不会自动导入或删除。
+
+## 从源码构建
+
+开发环境需要 Go 1.27.0 和 pnpm。后端为 Gin / PostgreSQL，前端为 Vue 3 / TypeScript / Vite。
 
 ```bash
 make install
@@ -23,153 +226,10 @@ make test
 make build
 ```
 
-前端构建产物由 Go 二进制嵌入。单独执行后端检查前，先执行 `make frontend`；产物位于 `backend/bin/sub2api-enhance`。构建和测试均不启动真实应用或连接实际业务数据库。
+输出为 `backend/bin/sub2api-enhance`。前端资源嵌入二进制；单独运行后端检查前先执行 `make frontend`。测试覆盖前端、Go race/vet、模拟上游和 SQLmock、部署脚本静态行为，不替代真实数据库及生产链路验收。
 
-`go test` 中的 HTTP/WebSocket 测试使用测试进程内的假上游，数据库使用 SQLmock；它们不等于原版服务运行态联调或 PostgreSQL 真实执行验收。
+仓库通过 GitHub Actions 在推送稳定版本标签时测试并发布 Linux amd64/arm64 归档和 `checksums.txt`。实际发布结果见 [Releases](https://github.com/MADAO-NW/sub2api-enhance/releases)。
 
-## 方式一：脚本部署与在线更新
+## 许可证
 
-发布仓库固定为 [MADAO-NW/sub2api-enhance](https://github.com/MADAO-NW/sub2api-enhance)。以下下载命令在源码上传且首次 GitHub Release 成功后可用；当前源码目录不包含正式发布包。
-
-服务器需要 Linux amd64/arm64、systemd，以及 curl、tar、sha256sum、jq、flock 等系统工具。沿用已经运行的 PostgreSQL 15+、Redis 7+ 与原版 sub2api；脚本不安装或重启这些依赖。
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MADAO-NW/sub2api-enhance/main/deploy/install.sh -o /tmp/sub2api-enhance-install.sh
-sudo bash /tmp/sub2api-enhance-install.sh install
-sudoedit /etc/sub2api-enhance/sub2api-enhance.env
-sudo systemctl start sub2api-enhance
-sudo systemctl status sub2api-enhance
-sudo journalctl -u sub2api-enhance -f
-```
-
-首次安装创建独立系统用户、`/opt/sub2api-enhance`、环境文件和 systemd 服务，并启用开机启动；填写真实配置之前不启动应用。前端与迁移已嵌入二进制，服务器无需 Node、pnpm、Go 或源码，也不另建管理员账号。原版内部地址使用 `SUB2API_INTERNAL_URL`。
-
-启动时自动创建 `sub2api_enhance` 及自有表；已有迁移按文件名与校验和跳过。数据库角色仍须具备下文列出的权限，脚本不擅自使用超级用户创建数据库或扩大原表权限。
-
-两张增强页面顶部的“版本与更新”提供检测版本、查看发布说明、下载应用、备份恢复和重启。更新与恢复携带管理员确认的版本号，发布或备份变化时要求重新确认。仅 Linux Release 允许在线替换；源码构建仍可查看版本。重启沿用应用 shutdown 流程，由 systemd `Restart=always` 拉起，可能短暂中断增强代理连接；随后需从原版后台重新打开菜单恢复管理员会话。
-
-命令行升级与指定版本安装：
-
-```bash
-sudo bash /tmp/sub2api-enhance-install.sh upgrade
-# 将下面的 v1.2.3 替换为仓库中实际存在的稳定标签
-sudo bash /tmp/sub2api-enhance-install.sh upgrade -v v1.2.3
-sudo bash /tmp/sub2api-enhance-install.sh rollback
-```
-
-脚本先完成下载、校验及版本检查，再停止并替换增强服务。成功启动要求健康接口的服务标识和版本均匹配；失败保留备份并报错，不自动降级数据库。网页和脚本使用同一 `.update.lock`，进度与备份信息保存在安装目录 `.update-state.json`；进程重启后核对文件指纹恢复操作状态。配置文件、已保存业务数据和原 sub2api 的安装目录不被版本替换覆盖。
-
-版本恢复仅允许迁移指纹相同的程序。若新版本已增加或修改数据库结构，优先发布修复版本；需要恢复旧数据库时另行安排备份恢复。在线更新只替换二进制，新环境变量或 systemd 配置要求仍应按该版本发布说明处理。
-
-私有仓库或 API 限流时，用 `UPDATE_GITHUB_TOKEN` 注入具有该仓库只读权限的 GitHub 凭据。它与原版管理员 API Key 独立，不发送到前端。私有仓库先通过有权限的渠道取得安装脚本，再在授权环境中执行；普通公开 raw 下载命令不适用于私有仓库。
-
-## GitHub 标签发布
-
-`.github/workflows/ci.yml` 在 main 和 PR 上执行本地同类检查；`release.yml` 在推送 `v主版本.次版本.修订号` 稳定标签时运行校验、测试、前端构建及 GoReleaser。版本、提交与时间在构建时注入，不由程序运行时读 Git；本地普通构建显示 dev/source。
-
-发布产物包括 Linux amd64/arm64 压缩包和 `checksums.txt`。每个包内包含 `sub2api-enhance`、根目录 `release.json`、许可证、README 及部署模板，下载与更新必须校验 SHA256。版本元数据与二进制均来自标签指向的同一源码；元数据在 GoReleaser 的独立临时输入目录生成，不占用其 `dist` 输出目录。归档路径按 [GoReleaser 文件打包规则](https://www.goreleaser.com/customization/package/archives/)配置。
-
-仓库 Actions 使用自动提供的 `GITHUB_TOKEN` 发布 Release；无需把私人 Token 写进代码或 workflow。发布不会自动向源码分支写回版本文件，也不会构建 Docker 镜像或修改线上服务。
-
-首次上传应包含 `.github/`、`.goreleaser.yaml`、`.gitignore`、LICENSE、README、Makefile，以及 backend/frontend/deploy 的源码、测试、锁文件和模板。`go.mod/go.sum`、`pnpm-lock.yaml` 与 Wire 生成源码必须保留。以下内容由 `.gitignore` 排除：本地方案 `my_local_doc/`、`.codegraph/`、node_modules、二进制、嵌入前端构建产物、dist 发布包、测试输出、日志、真实环境文件、私钥和更新运行状态。忽略只控制 Git 上传，不删除本地文件。
-
-推送源码、提交、创建/推送标签及真正发布仍属于部署人员的明确操作；不能把 workflow 配置完成等同于已执行 GitHub 发布。
-
-## 首次部署前提
-
-1. 使用实际未改版 sub2api 验证身份表、分组字段、`/api/v1/auth/me`、管理员用户状态 API，以及原版会话 IP/UA 绑定。适配基线为本地 main 0.2.1，不代表所有上游版本都兼容。
-2. 为增强服务准备同库独立 Schema `sub2api_enhance`，给予自己的表和迁移台账所需权限。对 `public.api_keys`、`users`、`groups`、`user_allowed_groups` 仅授予必要 SELECT；不授予原用户表 UPDATE 或 public DDL。使用额度模块时增加 `accounts`、`account_groups`、`user_platform_quotas`、`audit_logs` 的必要 SELECT。周一结转需另授予 `public.user_platform_quotas(weekly_usage_usd, weekly_window_start)` 两列 UPDATE；不会修改限额配置、日/月用量或原表结构。Redis 使用独立 ACL 账号。
-3. 服务首次启动会在专用锁中执行自有 SQL migration；启动属于会触发数据库写入的动作，需提前确认。Schema 未预建时，启动角色还需具备目标数据库 CREATE 权限；也可预建由增强角色拥有的 schema，避免授予数据库级 CREATE。不要因此授予 public DDL 权限。
-4. 将 `deploy/.env.example` 的值放入源码目录外的环境文件或 Secret，替换数据库凭据、内部地址、管理员 API Key 和独立加密密钥。管理员 Key 只在后端用于账号动作；页面身份始终使用访问者原版 JWT。
-5. 修改 Nginx 前核对实际端口、可信代理链、输入大小限制、流式超时和全部模型别名。示例不提供自动旁路或 POST 重投；不要开放原版业务端口供外网绕过采集。
-
-由用户启动或重启增强服务及原版测试实例后，才进行另行授权的运行态测试。本项目不提供自动启停原版服务的脚本。
-
-## 页面与运行方式
-
-原版管理员自定义菜单 visibility 设为 admin，URL 指向实际域名下的：
-
-```text
-/enhance/third-party-prompt-audit
-```
-
-安装或升级会把 Release 包中的菜单脚本放到 `/opt/sub2api-enhance/`。脚本从增强服务环境文件读取固定原版内部地址、公网 Origin 和管理员 API Key，幂等保留其他自定义菜单，并维护“第三方提示词审计”“用户额度跟随”两个管理员菜单及其 SVG 图标：
-
-```bash
-sudo bash /opt/sub2api-enhance/configure-sub2api-menus.sh /etc/sub2api-enhance/sub2api-enhance.env
-```
-
-原版会附带 token、theme、lang 等参数。增强页面立即清理 URL token，以 POST 交换短时 HttpOnly 会话；后续每次管理 API 调用重新向原版验证访问者身份。增强会话过期时，前端使用仅保存在当前页面内存中的原版令牌自动恢复一次；原版登录过期或权限失效时提供“重新连接”入口。非本机页面要求 HTTPS。同域页面属于可信后台集成，不能作为权限隔离沙箱。
-
-页面提供概览、事件、任务、原文采集及配置。事件和任务显示对应 Capture ID，可直接查看同一份采集原文。配置保留草稿、修订冲突、单节点试审、阈值和多节点聚合；模型凭据输入留空时保留已保存值，填写后替换。节点模型通过后端代理的 OpenAI 兼容 `/v1/models` 接口选择，节点名称由模型名自动生成，重复模型依次追加 `-1`、`-2`。
-
-- `off`：透传，不创建新审核任务。流量仍经过增强代理时，代理进程仍是可用性依赖。
-- `async`：原文保存成功后转发，后台审核。原文保存失败返回 503；模型故障不改变已转发请求。
-- `blocking`：原文先保存，审核通过/复核才转发，违规拒绝；不能验证身份或协议时失败关闭。
-
-第三方提示词审计只由增强服务自身的 `off`、`async`、`blocking` 模式控制，不读取或写入原版 `risk_control_enabled`。因此可以在不启用原版风控中心的情况下独立采集和审核。
-
-新配置默认使用 50% 待复核/联合审核触发阈值和 80% 违规阈值；提醒与停用都默认关闭，启用时默认使用最近 10 次正式审核中 3 次违规提醒、累计 5 次违规自动停用。账号 API 结果未知时只读核对，避免重复写入；通知只能在账号动作确认后发送。人工恢复和重新审核不重复处罚，重新审核完成后更新原事件的最新结论。
-
-配置页可从全部未删除用户（包括管理员）中选择不审核用户。排除仅跳过审核任务、模型调用、阻断和处罚，入口仍按可靠采集要求先保存原文。自动停用后的用户启用和累计清零集中放在配置页“用户违规累计管理”，不放入单条事件或任务详情。
-
-## 当前协议边界
-
-| 输入 | 已实现处理 | 尚需实环境验收 |
-| --- | --- | --- |
-| Responses、Chat Completions、Messages、Gemini 文本 | 字节留存、严格 JSON 提取、原样 HTTP/SSE 转发 | 真实客户端、取消与大正文 |
-| Embeddings、Alpha Search、图像/视频/音频文本入口 | 对应文本提取与采集；未知协议保留原文并显示原因 | 厂商路径、载荷及媒体客户端 |
-| multipart | 完整接收后转发；保存文本字段的名称、顺序、重复项和原字节封装，二进制仅保存描述 | 大文件、编码和故障注入 |
-| Responses WebSocket | 逐文本消息保存；response.create 审核；控制帧传递与协议错误返回 | 分片、压缩、长连接和真实错误信封 |
-| 其他 WebSocket（包括未适配的 Realtime） | 启用审计时明确返回 unsupported_websocket | 需要独立协议适配，不宣称已覆盖 |
-| 动态 composite 分组 | 留存原文，标记实际平台未知，不自动处罚 | 需要原版可验证路由契约 |
-
-保存 gzip/deflate 原始实体后解压提取；其他 Content-Encoding 留存原字节但不宣称可以审核。仅采集客户端实际携带的输入，不主动拉取上游隐含历史，不审核模型新生成输出。
-
-大正文接收阶段使用临时文件，提交 BYTEA 与解析时仍需要内存，受 PostgreSQL 单值能力和实际资源限制。不能据此宣称无限输入容量或既定吞吐。数据库压力、媒体容量、断连、故障恢复以及所有协议的生产性能尚未实测。
-
-## 验证状态与历史来源
-
-已迁入原分支的政策、JSON/角色/轮次提取、联合裁决、复用、多模型、队列、检查点及前端测试；新增测试覆盖采集确认、HTTP/WS 保存前禁止转发、管理员会话、未知账号动作与迁移校验。
-
-部署代码已通过 Go 单元/race、vet、前端类型/lint/20 个测试、构建及安装脚本离线测试；Linux amd64/arm64 交叉编译和不加载运行配置的版本输出也已通过，YAML 已解析核对。本地未安装 GoReleaser，未执行完整 Release 打包；真正的 GitHub Actions、systemd 安装和网页替换/重启仍须在发布及既有测试实例上验收。
-
-尚未执行：实际 PostgreSQL migration、真实 sub2api 联调、浏览器验收、真实审核模型调用、SMTP 投递、账号状态操作、生产切流、旧数据导入。旧表不会自动导入或删除；当前不能据此标为 A01—A24 的生产验收全部通过。
-
-迁移来源：`feat/third-party-prompt-audit` / `f5b4fa6f6d47d55896d729cddb6ae6a82ba673c3`。本项目不使用 Go replace、源码符号链接或共用 node_modules 依赖原仓库，保留来源 LICENSE。
-
-## 额度跟随模块
-
-菜单 URL 使用实际同域地址 `/enhance/quota-follow`，复用管理员会话、主题和语言。页面包含配置、紧随其后的重置记录、一致事件和账号状态。
-
-当前实现一个配置分组，发现其中所有有效 OpenAI 账号，以及有 OpenAI 配额记录的有效普通用户。首次观测建立基线；只有所有账号的 `seven_day.resets_at` 均确认推进、旧边界已到达且候选相差不超过五分钟，才形成唯一事件。利用率下降只提示疑似，边界回退不覆盖可信基线。
-
-默认检测间隔每轮重新随机为 10–15 分钟。启用周期、账号集合、日/周选择以及观察模式切换会重新建立基线。观察事件不创建用户交付，也不会在以后关闭观察模式时补发。
-
-每个事件、用户、窗口只有一条交付，按顺序调用原版 reset API。请求前持久化 inflight；超时、断连、5xx、提交不确定或重启后的无终态发送均保持 uncertain，不自动重调。记录详情的“只读核对”只读取数据库/配额缓存；与原版成功审计准确关联后才确认未知调用的来源。
-
-原版日志采用已处理审计 ID 去重补扫，同时保留 `(created_at,id)` 水位，防止异步迟到日志被高水位跳过。自然窗口变更至少等待下一次完整日志采集再推断；存在多份证据或不确定调用时保留待归因。列表不承诺完整还原停机期间全部自然重置。
-
-额外环境配置：
-
-- `QUOTA_FOLLOW_REDIS_URL`：只观察及 API 跟随时可选；周一结转与缓存修复必需。业务命令为 HGETALL、DEL、SREM；键限定 `billing:user_platform_quota:*` 和 `billing:upq:dirty`。需允许 SDK 的 AUTH、HELLO、SELECT 等必要握手；没有 SET/HSET/EVAL。
-- `SUB2API_TIMEZONE`：原版实际 IANA 时区，用于周一调度与自然边界归因；缺失时阻断结转。
-- `SUB2API_USER_PLATFORM_QUOTA_FLUSHER_ENABLED`：必须与原版实际配置一致；显式 `false` 才允许结转和缓存清理，空值/true 均阻断。增强服务不会修改原版 Flusher，也不能通过现有 API 自动读取其进程配置。
-
-只读缓存按已核对的 schema_version=1、金额字段和 Unix 秒窗口校验。键缺失可记录 absent；window_matches 只代表窗口秒值一致，不保证并发用量完全同步。配置错误不影响提示词审计启动。原版归零成功后，陈旧或未确认缓存进入清理恢复；未知归零不擅自清缓存，待原版审计确认。缓存恢复只删除键和对应脏成员，不再次归零；失败每分钟重试，详情可手动重新排期。
-
-额度的三个调度使用独立锁连接池（最多三条锁连接），避免后台池较小时因持锁连接占满而自锁；实际数据查询仍使用现有后台池。部署时将这三条连接计入 PostgreSQL 总连接预算。
-
-周一结转已实现：同一启用周期、同一账号集合下保存周日前最后一次 DB 已提交用量；Flusher 关闭时以 DB 为来源，不取 Redis/DB 最大值。每秒检查周边界，按配置间隔保存快照，并在边界前最后一秒尝试补采。周一安全窗口及快照有效期均为一个最大检测间隔。
-
-尚未懒重置时保留锁内最新用量并推进周窗口；已经自然重置时加回快照并保留周一新消费。金额使用精确十进制计算。同周唯一记录与原金额更新在同一事务提交，崩溃或提交未知不会重复相加。旧窗口用量下降、其他归零证据、账号不一致、快照过旧等情况均跳过。记录区展示“周一用量结转”和完整前后值。
-
-跨 DB、Redis 与原版并发计费无法强一致：快照至边界间消费、缓存/DB 暂时不同步、DB 写失败、异步审计未落库或手工改库可能造成漏补/无法识别的冲突。错过安全窗口不追补历史。关闭模块/观察模式不再新增金额动作，但会收尾之前已提交动作的缓存清理。
-
-新 migration 尚未实际执行。真实 API、归零、结转写入、Redis ACL、故障恢复、日志归因和浏览器仍需另行授权，并使用用户启动的既有实例联调。
-
-节点测试结果提供“查看调用详情”，展示 HTTP 状态、失败阶段、原始响应及关联的格式修正记录。明确拒绝、上游业务错误、空响应或缺少 choices 不触发格式修正，也不会被换算成违规评分；仅已有审核文本但评分 JSON 不合规时修正一次。
-
-原文采集详情按状态显示恢复入口：已有任务显示关联任务，处理中或等待自动重试时提示刷新，原文不完整时禁止恢复。身份未知时从用户及其 API Key 记录中选择关联对象，不读取密钥字符串；恢复只使用已保存原文，不重发业务请求、不追溯处罚。
-
-页面版本入口直接显示当前增强服务版本号。确认重启后，页面等待新的服务启动时间和目标版本，恢复后自动刷新；两分钟未确认恢复则提示手动连接。此过程不自动重发更新或重启操作。
+本项目包含从 Sub2API 改编的代码，派生部分遵循 [GNU LGPL v3](LICENSE)。原始 MIT 文本保存在 [LICENSE-MIT](LICENSE-MIT)，适用边界见 [NOTICE](NOTICE)。
