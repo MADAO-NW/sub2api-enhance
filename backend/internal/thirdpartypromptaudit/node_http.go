@@ -11,6 +11,15 @@ import (
 )
 
 func chatCompletionsURL(raw string) (string, error) {
+	return nodeEndpointURL(raw, "/v1/chat/completions")
+}
+
+func modelsURL(raw string) (string, error) {
+	return nodeEndpointURL(raw, "/v1/models")
+}
+
+// nodeEndpointURL 统一校验审核节点地址并追加 OpenAI 兼容接口路径。
+func nodeEndpointURL(raw, endpoint string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return "", errors.New("节点地址必须是不含凭据和查询项的 HTTP(S) 地址")
@@ -26,7 +35,7 @@ func chatCompletionsURL(raw string) (string, error) {
 	if u.Path == "/v1" {
 		u.Path = ""
 	}
-	u.Path += "/v1/chat/completions"
+	u.Path += endpoint
 	return u.String(), nil
 }
 func newNodeHTTPClient(model ModelConfig) (*http.Client, error) {

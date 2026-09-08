@@ -7,6 +7,7 @@ import type {AdminGroup} from '@/types'
 import {useAppStore} from '@/stores/app'
 import {extractApiErrorMessage} from '@/utils/apiError'
 import BaseDialog from '@/components/common/BaseDialog.vue'
+import SystemUpdatePanel from '@/features/system-update/SystemUpdatePanel.vue'
 const {t,te}=useI18n(),app=useAppStore()
 const label=(key:string)=>te(`quotaFollow.${key}`)?t(`quotaFollow.${key}`):key
 const groups=ref<AdminGroup[]>([]),runtime=ref<FollowRuntime|null>(null),userCount=ref(0),revision=ref(1)
@@ -31,8 +32,8 @@ async function reconcile(){if(!selected.value?.delivery)return;reconciling.value
 async function repairCache(){if(!selected.value)return;reconciling.value=true;try{await api.repairCache(selected.value.record.id);await detail(selected.value.record.id);app.showSuccess(label('repairScheduled'))}catch(e){app.showError(extractApiErrorMessage(e,label('failure')))}finally{reconciling.value=false}}
 onMounted(()=>refresh(true))
 </script>
-<template><main class="mx-auto max-w-[1600px] space-y-6 p-4 sm:p-6">
- <header><p class="mb-2 text-sm font-semibold text-primary-600">sub2api++</p><h1 class="text-2xl font-bold sm:text-3xl">{{label('title')}}</h1><p class="mt-3 text-gray-500">{{label('description')}}</p></header>
+<template><main class="mx-auto max-w-[1600px] space-y-6 p-4 pt-3 sm:p-6 sm:pt-4">
+ <header><div class="mb-2 flex flex-wrap items-center gap-3"><p class="text-sm font-semibold text-primary-600">sub2api++</p><SystemUpdatePanel /></div><h1 class="text-2xl font-bold sm:text-3xl">{{label('title')}}</h1><p class="mt-3 text-gray-500">{{label('description')}}</p></header>
  <p class="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200" data-test="boundary">{{label('boundary')}}</p>
  <p v-if="error" role="alert" class="text-red-600">{{error}}</p>
  <form class="card space-y-5" @submit.prevent="save"><div class="flex items-center justify-between"><h2 class="text-xl font-semibold">{{label('settings')}}</h2><span class="text-sm text-gray-500">{{label('revision')}} {{revision}}</span></div>

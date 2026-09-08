@@ -17,6 +17,7 @@ export interface AuditConfig {
   platforms: string[]
   all_groups: boolean
   group_ids: number[]
+  excluded_user_ids: number[]
   audit_prompt: string
   models: AuditModel[]
   review_threshold: number | null
@@ -109,6 +110,9 @@ export interface AuditCapture {
   snapshot_status: string; eligibility_status: string; processing_status: string; forwarding_status: string; created_at: string; last_error_message: string
   identity?: unknown; metadata?: unknown; forwarding_observations?: unknown
 }
+export interface AuditUser {
+  id: number; username: string; email: string; role: string; status: string; disable_violation_count: number; disable_reset_at: string | null; action_pending: boolean
+}
 export interface ModelAttempt {
   id: number; job_id: number | null; call_kind: string; evaluation_round: number | null; model_id: string; model_snapshot: AuditModel
   stage: string; segment_order: number | null; repair_of_attempt_id: number | null; request_metadata: unknown; status: string
@@ -150,6 +154,9 @@ export const thirdPartyPromptAuditAPI = {
   async getConfig() { return (await apiClient.get<SavedConfig>(`${base}/config`)).data },
   async saveConfig(value: ConfigUpdate) { return (await apiClient.put<SavedConfig>(`${base}/config`, value)).data },
   async getContract() { return (await apiClient.get<Contract>(`${base}/contract`)).data },
+  async listModels(value: { model_id: string; base_url: string; timeout_ms: number; key_action: 'keep' | 'replace'; api_key?: string }) {
+    return (await apiClient.post<{ models: string[] }>(`${base}/models/list`, value)).data
+  },
   async probe(value: { model: AuditModel; key_action: KeyUpdate['action']; api_key?: string; audit_prompt: string; protocol?: string; input?: string; input_kind: 'text' | 'json' }) {
     // 节点总预算由后端控制，避免浏览器毫秒计时范围截断管理员设置的大值。
     return (await apiClient.post<ProbeResult>(`${base}/models/probe`, value, { timeout: 0 })).data
@@ -161,8 +168,10 @@ export const thirdPartyPromptAuditAPI = {
   async job(id: number) { return (await apiClient.get<JobDetail>(`${base}/jobs/${id}`)).data },
   async event(id: number) { return (await apiClient.get<EventDetail>(`${base}/events/${id}`)).data },
   async capture(id: number) { return (await apiClient.get<AuditCapture>(`${base}/captures/${id}`)).data },
+  async users() { return (await apiClient.get<AuditUser[]>(`${base}/users`)).data },
   async preview(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits/preview`, value)).data },
   async reaudit(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits`, value)).data },
   async resume(id: number) { return (await apiClient.post(`${base}/jobs/${id}/resume`)).data },
+  async enableAndReset(id: number) { return (await apiClient.post<{ action_id: number; execution_status: string }>(`${base}/users/${id}/enable-and-reset`)).data },
   async retryAction(id: number) { return (await apiClient.post(`${base}/actions/${id}/retry`)).data }
 }

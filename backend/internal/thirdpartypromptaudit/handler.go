@@ -106,6 +106,22 @@ func (h *AdminHandler) GetContract(c *gin.Context) {
 	response.Success(c, gin.H{"version": ContractVersion, "default_policy": DefaultPolicy, "output_contract": OutputContract})
 }
 
+func (h *AdminHandler) ListModels(c *gin.Context) {
+	var input ModelCatalogRequest
+	if err := bindStrict(c, &input); err != nil {
+		response.BadRequest(c, "模型列表请求无效："+err.Error())
+		return
+	}
+	input.ActorUserID = adminActor(c)
+	result, err := h.service.ListModels(c.Request.Context(), input)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	middleware.SetAuditExtra(c, map[string]any{"model_id": input.ModelID, "result": "success", "model_count": len(result.Models)})
+	response.Success(c, result)
+}
+
 func (h *AdminHandler) ProbeModel(c *gin.Context) {
 	var input ProbeRequest
 	if err := bindStrict(c, &input); err != nil {

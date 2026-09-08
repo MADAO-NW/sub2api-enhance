@@ -87,7 +87,8 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		return nil
 	}
 	snapshot, configErr := s.config.Active()
-	if configErr == nil && ((!snapshot.AllGroups && (request.GroupID == nil || !slices.Contains(snapshot.GroupIDs, *request.GroupID))) ||
+	if configErr == nil && (slices.Contains(snapshot.ExcludedUserIDs, request.UserID) ||
+		(!snapshot.AllGroups && (request.GroupID == nil || !slices.Contains(snapshot.GroupIDs, *request.GroupID))) ||
 		(len(snapshot.Platforms) > 0 && !slices.Contains(snapshot.Platforms, request.Provider))) {
 		return nil
 	}
@@ -429,7 +430,7 @@ func (s *Service) Probe(ctx context.Context, input ProbeRequest) ProbeResult {
 			key = input.APIKey
 		}
 	case "keep":
-		key, err = s.config.ResolveKey(input.Model)
+		key, err = s.config.ResolveKeyByModelID(input.Model.ID)
 	case "clear":
 	default:
 		err = errors.New("凭据操作无效")

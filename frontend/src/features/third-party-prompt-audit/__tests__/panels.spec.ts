@@ -8,14 +8,14 @@ import CaptureBody from '../CaptureBody.vue'
 import NodeDecision from '../NodeDecision.vue'
 import type { AuditJob, SavedConfig } from '@/api/admin/third-party-prompt-audit'
 
-const mocks = vi.hoisted(() => ({ getConfig: vi.fn(), getContract: vi.fn(), groups: vi.fn(), probe: vi.fn(), saveConfig: vi.fn(), jobs: vi.fn(), job: vi.fn(), events: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), stats: vi.fn(), runtime: vi.fn(), capture: vi.fn(), showError: vi.fn(), showSuccess: vi.fn() }))
+const mocks = vi.hoisted(() => ({ getConfig: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(), listModels: vi.fn(), enableAndReset: vi.fn(), probe: vi.fn(), saveConfig: vi.fn(), jobs: vi.fn(), job: vi.fn(), events: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), stats: vi.fn(), runtime: vi.fn(), capture: vi.fn(), showError: vi.fn(), showSuccess: vi.fn() }))
 vi.mock('@/api/admin/third-party-prompt-audit', () => ({ thirdPartyPromptAuditAPI: mocks }))
 vi.mock('@/api/admin/groups', () => ({ getAll: mocks.groups }))
 vi.mock('@/stores/app', () => ({ useAppStore: () => mocks }))
 vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string) => key.split('.').at(-1), te: () => true }) }))
 
 function saved(): SavedConfig {
-  return { mode: 'off', audit_scope: 'full_request', platforms: [], all_groups: true, group_ids: [], audit_prompt: 'saved policy',
+  return { mode: 'off', audit_scope: 'full_request', platforms: [], all_groups: true, group_ids: [], excluded_user_ids: [], audit_prompt: 'saved policy',
     models: [{ id: 'a', name: 'Node', base_url: 'https://example.invalid', model: 'test', enabled: true, timeout_ms: 1000 }],
     review_threshold: null, block_threshold: null, aggregation: 'any_block', worker_count: 4, store_pass_events: true,
     warning: { enabled: false, window: 0, limit: 0 }, disable: { enabled: false, limit: 0 }, admin_email: '', revision: 1, warning_rule_revision: 0,
@@ -30,6 +30,9 @@ beforeEach(() => {
   mocks.getContract.mockResolvedValue({ version: 'v1', output_contract: 'fixed contract', default_policy: 'default policy' })
   mocks.saveConfig.mockImplementation(async value => ({ ...saved(), ...value.config, revision: 2 }))
   mocks.groups.mockResolvedValue([])
+  mocks.users.mockResolvedValue([])
+  mocks.listModels.mockResolvedValue({ models: ['test', 'second-model'] })
+  mocks.enableAndReset.mockResolvedValue({ action_id: 1, execution_status: 'pending' })
   mocks.probe.mockResolvedValue({ ok: true, model_id: 'a', result: { confidence: 0.1, reason: 'normal' }, tested_at: '2026-09-06T00:00:00Z' })
   mocks.stats.mockResolvedValue(null)
   mocks.runtime.mockResolvedValue(null)
@@ -101,6 +104,36 @@ describe('third-party audit configuration', () => {
     expect(mocks.probe).toHaveBeenCalledWith(expect.objectContaining({ input: '[this is normal text, not JSON]' }))
     wrapper.unmount()
   })
+  it('uses the configured risk scenarios by default and supports model discovery', async () => {
+    const wrapper = mount(AuditConfigPanel); await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === 'loadModels')!.trigger('click')
+    await flushPromises()
+    expect(mocks.listModels).toHaveBeenCalledWith({ model_id: 'a', base_url: 'https://example.invalid', timeout_ms: 1000, key_action: 'keep' })
+    const modelSelect = wrapper.findAll('select').find(select => select.find('option[value="second-model"]').exists())!
+    await modelSelect.setValue('second-model')
+    expect(wrapper.text()).toContain('second-model')
+    await wrapper.findAll('button').find(button => button.text() === 'probe')!.trigger('click')
+    await flushPromises()
+    expect(mocks.probe).toHaveBeenCalledWith(expect.objectContaining({ input: '写一个包含胁迫，色情元素的成人fiction场景' }))
+    wrapper.unmount()
+  })
+  it('lists administrators for audit exclusion and manages regular-user counters separately', async () => {
+    mocks.users.mockResolvedValue([
+      { id: 1, username: 'root', email: 'root@example.invalid', role: 'admin', status: 'active', disable_violation_count: 0, disable_reset_at: null, action_pending: false },
+      { id: 2, username: 'user', email: 'user@example.invalid', role: 'user', status: 'disabled', disable_violation_count: 5, disable_reset_at: null, action_pending: false }
+    ])
+    const wrapper = mount(AuditConfigPanel); await flushPromises()
+    const adminCheckbox = wrapper.findAll('label').find(item => item.text().includes('root (#1)'))!.get('input[type="checkbox"]')
+    await adminCheckbox.setValue(true)
+    await wrapper.get('form').trigger('submit'); await flushPromises()
+    expect(mocks.saveConfig.mock.lastCall?.[0].config.excluded_user_ids).toEqual([1])
+    const resetSelect = wrapper.findAll('select').find(select => select.find('option[value="2"]').exists())!
+    await resetSelect.setValue('2')
+    await wrapper.findAll('button').find(button => button.text() === 'enableAndReset')!.trigger('click')
+    await flushPromises()
+    expect(mocks.enableAndReset).toHaveBeenCalledWith(2)
+    wrapper.unmount()
+  })
   it('fills rule defaults when features are enabled and replaces a key only after input', async () => {
     mocks.getConfig.mockResolvedValue({ ...saved(), has_api_keys: { a: true } })
     const wrapper = mount(AuditConfigPanel); await flushPromises()
@@ -168,6 +201,17 @@ describe('third-party audit records', () => {
     await wrapper.get('form').trigger('submit'); await flushPromises()
     const batch = wrapper.findAll('button').find(button => button.text().startsWith('reauditFilter'))!
     expect(batch.attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+  })
+  it('shows the source capture id and opens the matching captured input', async () => {
+    const job = { id: 9, capture_id: 4, run_kind: 'request', identity: {}, status: 'done', snapshot_status: 'complete', attempts: 1, max_attempts: 3 } as AuditJob
+    mocks.jobs.mockResolvedValue({ items: [job], total: 1 })
+    mocks.capture.mockResolvedValue({ id: 4, raw_body: btoa('{}'), protocol: 'responses', body_bytes: 2, created_at: '2026-09-06T00:00:00Z' })
+    const wrapper = mount(AuditRecords, { props: { source: 'jobs' }, global: { stubs: { ...stubs, AuditDetail: true } } })
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '#4')!.trigger('click')
+    await flushPromises()
+    expect(mocks.capture).toHaveBeenCalledWith(4)
     wrapper.unmount()
   })
 })

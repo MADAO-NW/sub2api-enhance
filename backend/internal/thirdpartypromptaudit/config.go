@@ -66,6 +66,7 @@ type Config struct {
 	Platforms       []string      `json:"platforms"`
 	AllGroups       bool          `json:"all_groups"`
 	GroupIDs        []int64       `json:"group_ids"`
+	ExcludedUserIDs []int64       `json:"excluded_user_ids"`
 	AuditPrompt     string        `json:"audit_prompt"`
 	Models          []ModelConfig `json:"models"`
 	ReviewThreshold *float64      `json:"review_threshold"`
@@ -198,7 +199,7 @@ func NewConfigManager(db *sql.DB, encryptor appconfig.SecretEncryptor, cfg *appc
 func DefaultConfig() Config {
 	reviewThreshold, blockThreshold := defaultReviewThreshold, defaultBlockThreshold
 	return Config{Mode: "off", AuditScope: "full_request", Platforms: []string{}, AllGroups: true,
-		GroupIDs: []int64{}, AuditPrompt: DefaultPolicy, Models: []ModelConfig{},
+		GroupIDs: []int64{}, ExcludedUserIDs: []int64{}, AuditPrompt: DefaultPolicy, Models: []ModelConfig{},
 		ReviewThreshold: &reviewThreshold, BlockThreshold: &blockThreshold,
 		Aggregation: "any_block", WorkerCount: 4, StorePassEvents: true,
 		Warning: WarningConfig{Window: defaultWarningWindow, Limit: defaultWarningLimit},
@@ -225,6 +226,13 @@ func validateConfig(config Config, activating bool) error {
 		if groupID <= 0 {
 			return errors.New("分组 ID 必须大于 0")
 		}
+	}
+	excluded := make(map[int64]bool, len(config.ExcludedUserIDs))
+	for _, userID := range config.ExcludedUserIDs {
+		if userID <= 0 || excluded[userID] {
+			return errors.New("不审核用户 ID 必须为不重复的正整数")
+		}
+		excluded[userID] = true
 	}
 	for _, threshold := range []*float64{config.ReviewThreshold, config.BlockThreshold} {
 		if threshold != nil && (math.IsNaN(*threshold) || math.IsInf(*threshold, 0) || *threshold < 0 || *threshold > 1) {
@@ -283,6 +291,27 @@ func validateModel(model ModelConfig) error {
 	return nil
 }
 
+// normalizeModelNames 以模型名称生成稳定节点名称，同模型按配置顺序追加序号。
+func normalizeModelNames(config *Config) {
+	if config == nil {
+		return
+	}
+	counts := make(map[string]int)
+	for i := range config.Models {
+		model := strings.TrimSpace(config.Models[i].Model)
+		if model == "" {
+			config.Models[i].Name = ""
+			continue
+		}
+		count := counts[model]
+		config.Models[i].Name = model
+		if count > 0 {
+			config.Models[i].Name = fmt.Sprintf("%s-%d", model, count)
+		}
+		counts[model] = count + 1
+	}
+}
+
 func (m *ConfigManager) Reload(ctx context.Context) (loadErr error) {
 	// 数据库读取与发布串行，避免旧查询覆盖新配置。
 	m.reloadMu.Lock()
@@ -322,6 +351,8 @@ func (m *ConfigManager) Reload(ctx context.Context) (loadErr error) {
 	if values[SettingKey] != "" {
 		err = json.Unmarshal([]byte(values[SettingKey]), &stored)
 	}
+	// 节点名称是模型选择的派生展示值，旧配置加载后也立即使用统一规则。
+	normalizeModelNames(&stored.Config)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.expectedMode = stored.Mode
@@ -418,7 +449,10 @@ func publicConfig(stored storedConfig) PublicConfig {
 	for id, encrypted := range stored.EncryptedKeys {
 		keys[id] = encrypted != ""
 	}
-	result := PublicConfig{Config: stored.Config, Revision: stored.Revision,
+	display := stored.Config
+	display.Models = append([]ModelConfig(nil), stored.Models...)
+	normalizeModelNames(&display)
+	result := PublicConfig{Config: display, Revision: stored.Revision,
 		WarningRuleRevision: stored.WarningRuleRevision, HasAPIKeys: keys,
 		UpdatedAt: stored.UpdatedAt, UpdatedBy: stored.UpdatedBy}
 	result.ModelDefaults.TimeoutMS = DefaultNodeTimeoutMS
@@ -431,6 +465,7 @@ func publicConfig(stored storedConfig) PublicConfig {
 }
 
 func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID int64) (PublicConfig, error) {
+	normalizeModelNames(&input.Config)
 	if err := validateConfig(input.Config, input.Config.Mode != "off"); err != nil {
 		return PublicConfig{}, infraerrors.BadRequest("third_party_audit_invalid_config", err.Error())
 	}
@@ -525,6 +560,16 @@ func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID in
 		result.ApplicationError = err.Error()
 	}
 	return result, nil
+}
+
+// ResolveKeyByModelID 为模型列表查询读取节点当前凭据，新节点没有已保存凭据时返回空值。
+func (m *ConfigManager) ResolveKeyByModelID(modelID string) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.active == nil || m.loadError != nil {
+		return "", errors.New("节点配置不可用")
+	}
+	return m.active.Keys[modelID], nil
 }
 
 // ReadSaved 不依赖节点凭据解密或运行快照，使管理员仍能修复不可应用的配置。

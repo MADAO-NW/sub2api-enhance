@@ -48,6 +48,20 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 	}
 }
 
+func TestModelNamesFollowSelectedModelAndUseStableDuplicateSuffixes(t *testing.T) {
+	config := Config{Models: []ModelConfig{{Model: "same"}, {Model: "same"}, {Model: "other"}, {Model: "same"}}}
+	normalizeModelNames(&config)
+	require.Equal(t, []string{"same", "same-1", "other", "same-2"}, []string{config.Models[0].Name, config.Models[1].Name, config.Models[2].Name, config.Models[3].Name})
+}
+
+func TestExcludedUserBypassesAudit(t *testing.T) {
+	config := testConfig()
+	config.ExcludedUserIDs = []int64{7}
+	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config}}}
+	service := &Service{config: manager}
+	require.Nil(t, service.Check(context.Background(), IntakeRequest{UserID: 7, Provider: "openai"}))
+}
+
 func TestRemovedParametersRejectedAtConfigAndProbeBoundaries(t *testing.T) {
 	for _, field := range []string{`"temperature":0`, `"max_tokens":2048`, `"temperature":null`} {
 		for _, probe := range []bool{false, true} {

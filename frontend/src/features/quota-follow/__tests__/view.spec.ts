@@ -6,6 +6,7 @@ vi.mock('@/api/quota-follow',()=>({quotaFollowAPI:mocks}))
 vi.mock('@/api/admin/groups',()=>({getAll:mocks.groups}))
 vi.mock('@/stores/app',()=>({useAppStore:()=>mocks}))
 vi.mock('vue-i18n',()=>({useI18n:()=>({t:(key:string)=>key.split('.').at(-1),te:()=>true})}))
+vi.mock('@/features/system-update/SystemUpdatePanel.vue',()=>({default:{template:'<button>versions</button>'}}))
 beforeEach(()=>{
  vi.resetAllMocks()
  mocks.config.mockResolvedValue({enabled:false,group_id:7,reset_weekly_enabled:true,reset_daily_enabled:false,min_interval_minutes:10,max_interval_minutes:15,observe_only:true,revision:3,epoch:'epoch',enabled_at:null})

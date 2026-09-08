@@ -2,7 +2,6 @@
 import { onMounted, ref } from 'vue'
 import { apiClient } from '@/api/client'
 import { useAppStore } from '@/stores/app'
-import SystemUpdatePanel from '@/features/system-update/SystemUpdatePanel.vue'
 
 const ready = ref(false)
 const error = ref('')
@@ -30,7 +29,6 @@ onMounted(async () => {
     <p v-else class="mx-auto max-w-xl p-12 text-red-600 dark:text-red-400">{{ error }}</p>
   </div>
   <div v-else>
-    <div class="mx-auto flex max-w-[1600px] justify-end px-4 pt-4 sm:px-6"><SystemUpdatePanel /></div>
     <RouterView />
   </div>
   <div v-if="app.message" role="status" class="fixed bottom-6 right-6 z-[100] max-w-lg rounded-xl px-5 py-4 shadow-lg" :class="app.error ? 'bg-red-700 text-white' : 'bg-teal-700 text-white'">
