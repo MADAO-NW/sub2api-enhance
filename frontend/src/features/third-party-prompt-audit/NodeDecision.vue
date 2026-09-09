@@ -23,7 +23,7 @@ const maxSegment = computed(() => props.model.max_segment_confidence !== undefin
     <template v-else-if="model.confidence != null">
       <p>{{ label(model.reused ? 'reusedJoint' : 'jointScore') }}: {{ model.confidence }} · {{ model.decision ? label(model.decision) : '—' }}</p>
       <p>{{ label('rawThresholds') }}: {{ config?.review_threshold ?? '—' }} / {{ config?.block_threshold ?? '—' }}</p>
-      <p v-if="model.joint_attempt_id">{{ label('sourceReference') }} · Attempt #{{ model.joint_attempt_id }}</p>
+      <p v-if="model.joint_attempt_id && !model.reused">{{ label('sourceReference') }} · Attempt #{{ model.joint_attempt_id }}</p>
     </template>
     <p v-else>{{ label('noValidScore') }}</p>
     <p v-if="config">{{ label('decisionRevision') }}: {{ config.revision }}</p>

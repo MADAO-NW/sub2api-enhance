@@ -10,4 +10,8 @@
 .btn-secondary{@apply border border-gray-200 bg-white text-gray-700 hover:bg-gray-50 dark:border-dark-600 dark:bg-dark-800 dark:text-dark-200;}
 .btn-danger{@apply bg-red-600 text-white;}.btn-ghost{@apply text-gray-600 hover:bg-gray-100 dark:text-dark-300;}.btn-sm{@apply px-3 py-1.5 text-xs;}
 .label{@apply mb-2 block text-sm font-medium;}.table{@apply w-full text-left text-sm;} .table th{@apply bg-gray-50 p-3 text-gray-500 dark:bg-dark-900;} .table td{@apply border-t border-gray-100 p-3 dark:border-dark-700;}
+.enhance-page{@apply mx-auto w-full max-w-[1600px];}
 }
+html[data-ui-mode='embedded'] .enhance-page{max-width:none;}
+html[data-ui-mode='embedded'] .enhance-shell{padding-left:1rem;padding-right:1rem;}
+.enhance-page .table,.audit-records table{min-width:72rem;}

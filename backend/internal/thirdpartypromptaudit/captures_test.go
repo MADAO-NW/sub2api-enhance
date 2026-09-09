@@ -42,6 +42,23 @@ func TestUncertainCaptureCommitRequiresDigestConfirmation(t *testing.T) {
 		})
 	}
 }
+
+func TestCaptureListIncludesUsernameAndEmailForDisplay(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	mock.ExpectQuery("SELECT count\\(\\*\\) FROM sub2api_enhance.captures").WithArgs("").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	columns := []string{"id", "capture_key", "conversation_key", "transport", "protocol", "body_format", "body_sha256", "body_bytes", "snapshot_status", "eligibility_status", "processing_status", "forwarding_status", "last_error_message", "created_at", "display_username", "display_email", "user_id"}
+	mock.ExpectQuery("SELECT c.id,c.capture_key").WithArgs("", 20, 0).WillReturnRows(sqlmock.NewRows(columns).AddRow(3, "capture-3", "", "http", "responses", "entity_bytes", "sha", 12, "complete", "passed", "done", "complete", nil, time.Now(), "测试用户", "user@example.invalid", 7))
+	page, err := NewCaptureStore(db).List(context.Background(), 1, 20, "")
+	require.NoError(t, err)
+	require.Len(t, page.Items, 1)
+	require.Equal(t, "测试用户", page.Items[0].DisplayUsername)
+	require.Equal(t, "user@example.invalid", page.Items[0].DisplayEmail)
+	require.EqualValues(t, 7, page.Items[0].Identity.UserID)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestMultipartRepeatedTextFieldsRemainSeparate(t *testing.T) {
 	raw, _ := json.Marshal([]map[string]any{{"name": "prompt", "order": 1, "text": "first"}, {"name": "prompt", "order": 2, "text": "second"}, {"name": "image", "order": 3, "binary_omitted": true}})
 	request, err := captureRequest(&Capture{Raw: raw, Format: "multipart_text_fields", SnapshotStatus: "complete", Identity: sub2api.Identity{UserID: 1}, Metadata: map[string]string{"manual_reprocess": "true", "background": "true"}})

@@ -111,6 +111,10 @@ func (s *Service) Runtime(ctx context.Context) RuntimeSnapshot {
 		result.Revision = s.config.active.Stored.Revision
 		result.WarningEnabled = s.config.active.Stored.Warning.Enabled
 		result.DisableEnabled = s.config.active.Stored.Disable.Enabled
+		for _, rule := range s.config.active.Stored.UserRules {
+			result.WarningEnabled = result.WarningEnabled || rule.Warning.Enabled
+			result.DisableEnabled = result.DisableEnabled || rule.Disable.Enabled
+		}
 	}
 	if s.config.loadError != nil {
 		result.ConfigError = s.config.loadError.Error()

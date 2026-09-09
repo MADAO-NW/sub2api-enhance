@@ -51,6 +51,25 @@ func outcomeView(outcome *Outcome, config *DecisionConfig) *OutcomeView {
 	return view
 }
 
+// latestOutcomeJoin 为任务筛选和列表提供当前有效审核结论。
+const latestOutcomeJoin = ` LEFT JOIN LATERAL (
+ SELECT current.* FROM sub2api_enhance.third_party_prompt_audit_outcomes current
+ WHERE current.job_id=j.id ORDER BY current.audit_round DESC,current.id DESC LIMIT 1
+) o ON true `
+
+// jobOutcomeSummary 将当前结论及节点解释并入任务列表。
+const jobOutcomeSummary = `CASE WHEN o.id IS NULL THEN NULL ELSE json_build_object(
+ 'id',o.id,'job_id',o.job_id,'user_id',o.user_id,'decision',o.decision,'partial_failure',o.partial_failure,
+ 'enforcement_eligible',o.enforcement_eligible,'source_outcome_id',o.source_outcome_id,'audit_round',o.audit_round,
+ 'run_kind',o.run_kind,'requested_by',o.requested_by,'reuse_mode',o.reuse_mode,'created_at',o.created_at,
+ 'started_at',o.started_at,'finished_at',o.finished_at,
+ 'duration_ms',CASE WHEN o.started_at IS NULL OR o.finished_at IS NULL THEN NULL ELSE GREATEST(0,extract(epoch FROM (o.finished_at-o.started_at))*1000)::bigint END,
+ 'models',(SELECT COALESCE(json_agg(json_build_object('model_id',m->>'model_id','model_name',m->>'model_name','decision',m->>'decision','basis',m->>'basis','confidence',m->'confidence',
+   'reused',m->'reused','joint_attempt_id',CASE WHEN COALESCE((m->>'reused')::boolean,false) THEN NULL ELSE m->'joint_attempt_id' END,'error',m->'error','skipped',m->'skipped','skip_reason',m->'skip_reason',
+   'max_segment_confidence',(SELECT MAX((s->'result'->>'confidence')::double precision) FROM json_array_elements(m->'segments') s))),'[]') FROM json_array_elements(o.model_results::json) m),
+ 'decision_config',json_build_object('revision',(o.config_snapshot::json->>'revision')::bigint,'review_threshold',o.config_snapshot::json->'review_threshold','block_threshold',o.config_snapshot::json->'block_threshold')
+) END`
+
 func validateFilter(filter Filter) error {
 	if filter.From != nil && filter.To != nil && !filter.From.Before(*filter.To) {
 		return errors.New("开始时间必须早于结束时间")
@@ -81,26 +100,22 @@ func validateFilter(filter Filter) error {
 }
 
 // filterSQL 在列表、预览和提交中保持同一筛选语义，所有外部值只作为 SQL 参数。
-func filterSQL(filter Filter, events bool, includeTime bool) (string, []any) {
+func filterSQL(filter Filter, includeTime bool) (string, []any) {
 	clauses := make([]string, 0)
 	args := make([]any, 0)
 	add := func(expression string, value any) {
 		args = append(args, value)
 		clauses = append(clauses, fmt.Sprintf(expression, len(args)))
 	}
-	idColumn, timeColumn := "j.id", "j.created_at"
-	if events {
-		idColumn, timeColumn = "e.id", "e.created_at"
-	}
 	if len(filter.IDs) > 0 {
-		add(idColumn+"=ANY($%d)", pq.Array(filter.IDs))
+		add("j.id=ANY($%d)", pq.Array(filter.IDs))
 	}
 	if includeTime {
 		if filter.From != nil {
-			add(timeColumn+">=$%d", *filter.From)
+			add("j.created_at>=$%d", *filter.From)
 		}
 		if filter.To != nil {
-			add(timeColumn+"<$%d", *filter.To)
+			add("j.created_at<$%d", *filter.To)
 		}
 	}
 	if filter.UserID != nil {
@@ -131,18 +146,10 @@ func filterSQL(filter Filter, events bool, includeTime bool) (string, []any) {
 		add("(j.identity_snapshot ILIKE '%%'||$%d||'%%')", filter.Keyword)
 	}
 	if filter.Decision != "" {
-		if events {
-			add("o.decision=$%d", filter.Decision)
-		} else {
-			add("EXISTS(SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_outcomes result WHERE result.job_id=j.id AND result.decision=$%d)", filter.Decision)
-		}
+		add("o.decision=$%d", filter.Decision)
 	}
 	if filter.ModelID != "" {
-		if events {
-			add("EXISTS(SELECT 1 FROM json_array_elements(o.model_results::json) model WHERE model->>'model_id'=$%d)", filter.ModelID)
-		} else {
-			add("EXISTS(SELECT 1 FROM json_array_elements(j.config_snapshot::json->'models') model WHERE model->>'id'=$%d AND model->>'enabled'='true')", filter.ModelID)
-		}
+		add("EXISTS(SELECT 1 FROM json_array_elements(o.model_results::json) model WHERE model->>'model_id'=$%d)", filter.ModelID)
 	}
 	if len(clauses) == 0 {
 		return "TRUE", args
@@ -154,12 +161,14 @@ func (r *Repository) ListJobs(ctx context.Context, filter Filter, page, pageSize
 	if err := validateFilter(filter); err != nil {
 		return nil, err
 	}
-	where, args := filterSQL(filter, false, true)
+	where, args := filterSQL(filter, true)
+	from := jobSource + latestOutcomeJoin
 	result := &Page[Job]{Items: []Job{}, Page: page, PageSize: pageSize}
-	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sub2api_enhance.third_party_prompt_audit_jobs j WHERE `+where, args...).Scan(&result.Total); err != nil {
+	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*)`+from+`WHERE `+where, args...).Scan(&result.Total); err != nil {
 		return nil, err
 	}
-	query := `SELECT row_to_json(record) FROM(SELECT ` + jobProjection(false) + jobSource + ` WHERE ` + where + ` ORDER BY j.created_at DESC,j.id DESC`
+	query := `SELECT row_to_json(record) FROM(SELECT ` + jobProjection(false) + `,` + jobOutcomeSummary + ` AS outcome,
+ (SELECT initial.decision FROM sub2api_enhance.third_party_prompt_audit_outcomes initial WHERE initial.job_id=j.id AND initial.audit_round=1 ORDER BY initial.id LIMIT 1) AS original_decision` + from + `WHERE ` + where + ` ORDER BY j.created_at DESC,j.id DESC`
 	if pageSize > 0 {
 		args = append(args, pageSize, (page-1)*pageSize)
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)-1, len(args))
@@ -184,57 +193,6 @@ func (r *Repository) ListJobs(ctx context.Context, filter Filter, page, pageSize
 	return result, rows.Err()
 }
 
-func (r *Repository) ListEvents(ctx context.Context, filter Filter, page, pageSize int) (*Page[Event], error) {
-	if err := validateFilter(filter); err != nil {
-		return nil, err
-	}
-	where, args := filterSQL(filter, true, true)
-	from := ` FROM sub2api_enhance.third_party_prompt_audit_events e JOIN sub2api_enhance.third_party_prompt_audit_jobs j ON j.id=e.job_id` + jobInputJoins + `JOIN sub2api_enhance.third_party_prompt_audit_outcomes o ON o.id=e.latest_outcome_id `
-	result := &Page[Event]{Items: []Event{}, Page: page, PageSize: pageSize}
-	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*)`+from+`WHERE `+where, args...).Scan(&result.Total); err != nil {
-		return nil, err
-	}
-	query := `SELECT e.id,e.job_id,e.original_outcome_id,e.latest_outcome_id,e.created_at,e.updated_at,
- (SELECT row_to_json(record) FROM(SELECT ` + jobProjection(false) + `) record),o.decision,o.partial_failure,o.created_at,
-	 CASE WHEN j.current_run_kind='reaudit' AND j.status IN ('queued','processing','retry') THEN j.status ELSE COALESCE((SELECT status FROM sub2api_enhance.third_party_prompt_audit_jobs child WHERE child.source_job_id=e.job_id ORDER BY child.id DESC LIMIT 1),'') END,
- (SELECT COALESCE(json_agg(json_build_object('model_id',m->>'model_id','model_name',m->>'model_name','decision',m->>'decision','basis',m->>'basis','confidence',m->'confidence',
-	 'reused',m->'reused','joint_attempt_id',m->'joint_attempt_id','error',m->'error','skipped',m->'skipped','skip_reason',m->'skip_reason',
- 'max_segment_confidence',(SELECT MAX((s->'result'->>'confidence')::double precision) FROM json_array_elements(m->'segments') s))),'[]') FROM json_array_elements(o.model_results::json) m),
-	 json_build_object('revision',(o.config_snapshot::json->>'revision')::bigint,'review_threshold',o.config_snapshot::json->'review_threshold','block_threshold',o.config_snapshot::json->'block_threshold'),o.audit_round,
-	 CASE WHEN o.started_at IS NULL OR o.finished_at IS NULL THEN NULL ELSE GREATEST(0,extract(epoch FROM (o.finished_at-o.started_at))*1000)::bigint END,o.job_id` + from + `WHERE ` + where + ` ORDER BY e.created_at DESC,e.id DESC`
-	if pageSize > 0 {
-		args = append(args, pageSize, (page-1)*pageSize)
-		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)-1, len(args))
-	}
-	rows, err := r.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var event Event
-		var jobRaw, modelsRaw, configRaw []byte
-		latest := &OutcomeView{Outcome: &Outcome{}}
-		if err := rows.Scan(&event.ID, &event.JobID, &event.OriginalOutcomeID, &event.LatestOutcomeID, &event.CreatedAt, &event.UpdatedAt, &jobRaw, &latest.Decision, &latest.PartialFailure, &latest.CreatedAt, &event.ReauditStatus, &modelsRaw, &configRaw, &latest.AuditRound, &latest.DurationMS, &latest.JobID); err != nil {
-			return nil, err
-		}
-		job, err := decodeJob(jobRaw)
-		if err != nil {
-			return nil, err
-		}
-		if err := json.Unmarshal(modelsRaw, &latest.Models); err != nil {
-			return nil, err
-		}
-		if err := json.Unmarshal(configRaw, &latest.DecisionConfig); err != nil {
-			return nil, err
-		}
-		event.Job, event.Latest = job, latest
-		latest.ID = event.LatestOutcomeID
-		result.Items = append(result.Items, event)
-	}
-	return result, rows.Err()
-}
-
 type JobDetail struct {
 	InputJSON   string                  `json:"input_json"`
 	InputParts  []Segment               `json:"input_parts"`
@@ -243,7 +201,6 @@ type JobDetail struct {
 	Job         *Job                    `json:"job"`
 	Outcome     *OutcomeView            `json:"outcome"`
 	Rounds      []*OutcomeView          `json:"rounds"`
-	Reaudits    []Job                   `json:"reaudits"`
 	Attempts    []ModelAttempt          `json:"attempts"`
 	Actions     []Action                `json:"actions"`
 	Enforcement *EnforcementExplanation `json:"enforcement,omitempty"`
@@ -264,7 +221,7 @@ func (r *Repository) JobDetail(ctx context.Context, id int64) (*JobDetail, error
 	if err != nil {
 		return nil, err
 	}
-	result := &JobDetail{Job: job, Reaudits: []Job{}, Rounds: []*OutcomeView{}, InputParts: []Segment{}, NonText: []NonTextInput{}}
+	result := &JobDetail{Job: job, Rounds: []*OutcomeView{}, InputParts: []Segment{}, NonText: []NonTextInput{}}
 	if job.FullInput != nil {
 		raw, err := json.MarshalIndent(job.FullInput, "", "  ")
 		if err != nil {
@@ -284,6 +241,7 @@ func (r *Repository) JobDetail(ctx context.Context, id int64) (*JobDetail, error
 		return nil, err
 	}
 	result.Outcome = outcomeView(outcome, job.DecisionConfig)
+	job.Outcome = result.Outcome
 	roundRows, err := r.db.QueryContext(ctx, `SELECT id FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1 ORDER BY audit_round DESC,id DESC`, job.ID)
 	if err != nil {
 		return nil, err
@@ -305,21 +263,21 @@ func (r *Repository) JobDetail(ctx context.Context, id int64) (*JobDetail, error
 		return nil, err
 	}
 	for _, outcomeID := range roundIDs {
-		round, err := r.queryOutcome(ctx, `SELECT id,job_id,user_id,decision,partial_failure,enforcement_eligible,model_results,source_outcome_id,created_at,audit_round,run_kind,requested_by,config_snapshot,started_at,finished_at FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE id=$1`, outcomeID)
+		round, err := r.queryOutcome(ctx, `SELECT id,job_id,user_id,decision,partial_failure,enforcement_eligible,model_results,source_outcome_id,created_at,audit_round,run_kind,requested_by,config_snapshot,started_at,finished_at,reuse_mode FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE id=$1`, outcomeID)
 		if err != nil {
 			return nil, err
 		}
 		result.Rounds = append(result.Rounds, outcomeView(round, nil))
+		if round.AuditRound == 1 {
+			decision := round.Decision
+			job.OriginalDecision = &decision
+		}
 	}
 	result.Attempts, err = r.ListAttempts(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	rootID := job.ID
-	if job.SourceJobID != nil {
-		rootID = *job.SourceJobID
-	}
-	result.Actions, err = r.ListActions(ctx, job.UserID, rootID)
+	result.Actions, err = r.ListActions(ctx, job.UserID, job.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -327,23 +285,7 @@ func (r *Repository) JobDetail(ctx context.Context, id int64) (*JobDetail, error
 	if err != nil {
 		return nil, err
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT row_to_json(record) FROM(SELECT `+jobProjection(false)+jobSource+`WHERE j.source_job_id=$1 ORDER BY j.id DESC) record`, rootID)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
-			return nil, err
-		}
-		child, err := decodeJob(raw)
-		if err != nil {
-			return nil, err
-		}
-		result.Reaudits = append(result.Reaudits, *child)
-	}
-	return result, rows.Err()
+	return result, nil
 }
 
 // enforcementExplanation 使用当前处置规则和已持久化状态解释最新结论为何触发或未触发账号动作。
@@ -355,10 +297,6 @@ func (r *Repository) enforcementExplanation(ctx context.Context, detail *JobDeta
 		}
 		return nil, err
 	}
-	if view.Role != "user" {
-		view.WarningReason, view.DisableReason = "role_excluded", "role_excluded"
-		return view, nil
-	}
 	current := storedConfig{Config: DefaultConfig()}
 	var raw string
 	if err := r.db.QueryRowContext(ctx, `SELECT value FROM sub2api_enhance.settings WHERE key=$1`, SettingKey).Scan(&raw); err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -369,6 +307,7 @@ func (r *Repository) enforcementExplanation(ctx context.Context, detail *JobDeta
 			return nil, err
 		}
 	}
+	current.Config = effectiveConfigForUser(current.Config, detail.Job.UserID)
 	var warningArmed bool
 	var windowAfter int64
 	if err := r.db.QueryRowContext(ctx, `SELECT warning_window_after_outcome_id,warning_armed,disable_violation_count FROM sub2api_enhance.third_party_prompt_audit_enforcement_states WHERE user_id=$1`, detail.Job.UserID).Scan(&windowAfter, &warningArmed, &view.DisableViolationCount); err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -405,7 +344,7 @@ func (r *Repository) enforcementExplanation(ctx context.Context, detail *JobDeta
 		} else if triggered("warning") {
 			view.WarningReason = "triggered"
 		} else {
-			rows, err := r.db.QueryContext(ctx, `SELECT latest.decision FROM sub2api_enhance.third_party_prompt_audit_jobs root JOIN sub2api_enhance.third_party_prompt_audit_outcomes original ON original.job_id=root.id AND original.audit_round=1 LEFT JOIN sub2api_enhance.third_party_prompt_audit_events event ON event.job_id=root.id JOIN sub2api_enhance.third_party_prompt_audit_outcomes latest ON latest.id=COALESCE(event.latest_outcome_id,original.id) WHERE root.run_kind='request' AND root.user_id=$1 AND original.enforcement_eligible AND original.id>$2 ORDER BY root.id DESC LIMIT $3`, detail.Job.UserID, windowAfter, current.Warning.Window)
+			rows, err := r.db.QueryContext(ctx, `SELECT latest.decision FROM sub2api_enhance.third_party_prompt_audit_jobs root JOIN sub2api_enhance.third_party_prompt_audit_outcomes original ON original.job_id=root.id AND original.audit_round=1 JOIN LATERAL (SELECT current.decision FROM sub2api_enhance.third_party_prompt_audit_outcomes current WHERE current.job_id=root.id ORDER BY current.audit_round DESC,current.id DESC LIMIT 1) latest ON true WHERE root.user_id=$1 AND original.enforcement_eligible AND original.id>$2 ORDER BY root.id DESC LIMIT $3`, detail.Job.UserID, windowAfter, current.Warning.Window)
 			if err != nil {
 				return nil, err
 			}
@@ -435,7 +374,9 @@ func (r *Repository) enforcementExplanation(ctx context.Context, detail *JobDeta
 				view.WarningReason = "no_new_block"
 			}
 		}
-		if !current.Disable.Enabled {
+		if view.Role != "user" {
+			view.DisableReason = "role_excluded"
+		} else if !current.Disable.Enabled {
 			view.DisableReason = "rule_disabled"
 		} else if triggered("disable") {
 			view.DisableReason = "triggered"
@@ -450,62 +391,24 @@ func (r *Repository) enforcementExplanation(ctx context.Context, detail *JobDeta
 	return view, nil
 }
 
-type EventDetail struct {
-	Event  Event      `json:"event"`
-	Detail *JobDetail `json:"detail"`
-}
-
-func (r *Repository) EventDetail(ctx context.Context, id int64) (*EventDetail, error) {
-	var event Event
-	err := r.db.QueryRowContext(ctx, `SELECT id,job_id,original_outcome_id,latest_outcome_id,created_at,updated_at FROM sub2api_enhance.third_party_prompt_audit_events WHERE id=$1`, id).Scan(&event.ID, &event.JobID, &event.OriginalOutcomeID, &event.LatestOutcomeID, &event.CreatedAt, &event.UpdatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	latest, err := r.queryOutcome(ctx, `SELECT id,job_id,user_id,decision,partial_failure,enforcement_eligible,model_results,source_outcome_id,created_at,audit_round,run_kind,requested_by,config_snapshot,started_at,finished_at FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE id=$1`, event.LatestOutcomeID)
-	if err != nil {
-		return nil, err
-	}
-	if event.OriginalOutcomeID != nil {
-		original, err := r.queryOutcome(ctx, `SELECT id,job_id,user_id,decision,partial_failure,enforcement_eligible,model_results,source_outcome_id,created_at,audit_round,run_kind,requested_by,config_snapshot,started_at,finished_at FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE id=$1`, *event.OriginalOutcomeID)
-		if err != nil {
-			return nil, err
-		}
-		event.Original = outcomeView(original, nil)
-	}
-	detail, err := r.JobDetail(ctx, latest.JobID)
-	if err != nil {
-		return nil, err
-	}
-	event.Latest = outcomeView(latest, detail.Job.DecisionConfig)
-	return &EventDetail{Event: event, Detail: detail}, nil
-}
-
 type reauditCandidate struct {
 	ID       int64
+	UserID   int64
 	Ready    bool
 	ActiveID *int64
 	Reason   string
 }
 
 func (r *Repository) reauditCandidates(ctx context.Context, request ReauditRequest) ([]reauditCandidate, error) {
-	if request.Source != "events" && request.Source != "jobs" {
-		return nil, errors.New("复核来源无效")
+	if request.ReuseMode != "" && request.ReuseMode != ReuseModeAllow && request.ReuseMode != ReuseModeForce {
+		return nil, errors.New("复核复用方式无效")
 	}
 	if err := validateFilter(request.Filter); err != nil {
 		return nil, err
 	}
-	where, args := filterSQL(request.Filter, request.Source == "events", true)
-	from := ` FROM sub2api_enhance.third_party_prompt_audit_jobs j `
-	if request.Source == "events" {
-		from = ` FROM sub2api_enhance.third_party_prompt_audit_events e JOIN sub2api_enhance.third_party_prompt_audit_jobs j ON j.id=e.job_id JOIN sub2api_enhance.third_party_prompt_audit_outcomes o ON o.id=e.latest_outcome_id `
-	}
-	query := `SELECT root.id,root.snapshot_status='complete' AND root.full_input_snapshot IS NOT NULL AND COALESCE(root.last_error_code,'')<>'no_text',
-	 COALESCE(CASE WHEN root.status IN ('queued','processing','retry') THEN root.id END,(SELECT child.id FROM sub2api_enhance.third_party_prompt_audit_jobs child WHERE child.source_job_id=root.id AND child.status IN ('queued','processing','retry') LIMIT 1))
- FROM sub2api_enhance.third_party_prompt_audit_jobs root WHERE root.run_kind='request' AND root.id IN
- (SELECT COALESCE(j.source_job_id,j.id)` + from + `WHERE ` + where + `) ORDER BY root.id`
+	where, args := filterSQL(request.Filter, true)
+	query := `SELECT j.id,j.user_id,j.snapshot_status='complete' AND j.full_input_snapshot IS NOT NULL AND COALESCE(j.last_error_code,'')<>'no_text',
+	 CASE WHEN j.status IN ('queued','processing','retry') THEN j.id END` + jobSource + latestOutcomeJoin + `WHERE ` + where + ` ORDER BY j.id`
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -514,7 +417,7 @@ func (r *Repository) reauditCandidates(ctx context.Context, request ReauditReque
 	items := make([]reauditCandidate, 0)
 	for rows.Next() {
 		var item reauditCandidate
-		if err := rows.Scan(&item.ID, &item.Ready, &item.ActiveID); err != nil {
+		if err := rows.Scan(&item.ID, &item.UserID, &item.Ready, &item.ActiveID); err != nil {
 			return nil, err
 		}
 		if !item.Ready {
@@ -532,11 +435,11 @@ func (r *Repository) PreviewReaudits(ctx context.Context, request ReauditRequest
 	}
 	result := &ReauditResult{Matched: int64(len(candidates)), Items: []ReauditItem{}}
 	for _, candidate := range candidates {
-		item := ReauditItem{SourceJobID: candidate.ID, Status: "ready"}
+		item := ReauditItem{JobID: candidate.ID, Status: "ready", userID: candidate.UserID}
 		if !candidate.Ready {
 			item.Status, item.Reason = "skipped", candidate.Reason
 		} else if candidate.ActiveID != nil {
-			item.Status, item.JobID, item.Reason = "already_running", candidate.ActiveID, "该来源已有进行中的复核任务"
+			item.Status, item.Reason = "already_running", "该任务已在处理中"
 		} else {
 			result.Ready++
 		}
@@ -547,11 +450,10 @@ func (r *Repository) PreviewReaudits(ctx context.Context, request ReauditRequest
 
 // CreateReaudits 逐项锁定原任务并开始新的审核轮次，不再创建复核子任务。
 func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest, snapshot ConfigSnapshot, actorID int64) (*ReauditResult, error) {
-	result, err := r.PreviewReaudits(ctx, request)
-	if err != nil {
-		return nil, err
+	if request.ReuseMode == "" {
+		request.ReuseMode = ReuseModeAllow
 	}
-	encoded, err := json.Marshal(snapshot)
+	result, err := r.PreviewReaudits(ctx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -560,24 +462,30 @@ func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest,
 		if item.Status != "ready" {
 			continue
 		}
+		effective := snapshot
+		effective.Config = effectiveConfigForUser(snapshot.Config, item.userID)
+		encoded, err := json.Marshal(effective)
+		if err != nil {
+			item.Status, item.Reason = "failed", err.Error()
+			continue
+		}
 		var id int64
-		err := r.db.QueryRowContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs root SET
-	 audit_round=audit_round+1,current_run_kind='reaudit',current_requested_by=$1,config_revision=$2,config_snapshot=$3,
-	 status='queued',attempts=0,max_attempts=$4,claim_generation=claim_generation+1,lease_until=NULL,next_attempt_at=clock_timestamp(),
-	 result_checkpoint=NULL,reuse_metrics='{"whole_lookups":0,"whole_hits":0,"segment_lookups":0,"segment_hits":0,"within_job_hits":0,"inflight_hits":0,"short_circuited_nodes":0}',
-	 failure_stage=NULL,last_error_code=NULL,last_error_message=NULL,started_at=NULL,finished_at=NULL,input_manifest=NULL,input_hash=NULL,target_hash=NULL,evaluation_hash=NULL,updated_at=clock_timestamp()
-	 WHERE root.id=$5 AND root.run_kind='request' AND root.status IN ('done','failed','skipped') AND root.snapshot_status='complete' AND root.full_input_snapshot IS NOT NULL AND COALESCE(root.last_error_code,'')<>'no_text'
-	 AND NOT EXISTS(SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_jobs child WHERE child.source_job_id=root.id AND child.status IN ('queued','processing','retry'))
-	 RETURNING root.id`, actorID, snapshot.Revision, string(encoded), MaxEvaluationAttempts, item.SourceJobID).Scan(&id)
+		err = r.db.QueryRowContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs root SET
+		 audit_round=audit_round+1,current_run_kind='reaudit',current_requested_by=$1,config_revision=$2,config_snapshot=$3,
+		 reuse_mode=$4,status='queued',attempts=0,max_attempts=$5,claim_generation=claim_generation+1,lease_until=NULL,next_attempt_at=clock_timestamp(),
+		 result_checkpoint=NULL,reuse_metrics='{"whole_lookups":0,"whole_hits":0,"segment_lookups":0,"segment_hits":0,"within_job_hits":0,"inflight_hits":0,"short_circuited_nodes":0}',
+		 failure_stage=NULL,last_error_code=NULL,last_error_message=NULL,started_at=NULL,finished_at=NULL,input_manifest=NULL,input_hash=NULL,target_hash=NULL,evaluation_hash=NULL,updated_at=clock_timestamp()
+		 WHERE root.id=$6 AND root.status IN ('done','failed','skipped') AND root.snapshot_status='complete' AND root.full_input_snapshot IS NOT NULL AND COALESCE(root.last_error_code,'')<>'no_text'
+		 RETURNING root.id`, actorID, snapshot.Revision, string(encoded), request.ReuseMode, MaxEvaluationAttempts, item.JobID).Scan(&id)
 		if err == nil {
-			item.Status, item.JobID = "requeued", &id
+			item.Status, item.JobID = "requeued", id
 			continue
 		}
 		if errors.Is(err, sql.ErrNoRows) {
 			var activeID int64
-			lookupErr := r.db.QueryRowContext(ctx, `SELECT id FROM sub2api_enhance.third_party_prompt_audit_jobs WHERE (id=$1 OR source_job_id=$1) AND status IN ('queued','processing','retry') ORDER BY id LIMIT 1`, item.SourceJobID).Scan(&activeID)
+			lookupErr := r.db.QueryRowContext(ctx, `SELECT id FROM sub2api_enhance.third_party_prompt_audit_jobs WHERE id=$1 AND status IN ('queued','processing','retry')`, item.JobID).Scan(&activeID)
 			if lookupErr == nil {
-				item.Status, item.JobID, item.Reason = "already_running", &activeID, "该来源已有进行中的复核任务"
+				item.Status, item.Reason = "already_running", "该任务已在处理中"
 			} else if errors.Is(lookupErr, sql.ErrNoRows) {
 				item.Status, item.Reason = "skipped", "完整原文已不可用"
 			} else {

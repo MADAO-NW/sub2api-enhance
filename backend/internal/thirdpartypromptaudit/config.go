@@ -66,23 +66,33 @@ type DisableConfig struct {
 	Limit   int64 `json:"limit"`
 }
 
-type Config struct {
+type UserRuleConfig struct {
+	UserID          int64         `json:"user_id"`
 	Mode            string        `json:"mode"`
-	AuditScope      string        `json:"audit_scope"`
-	Platforms       []string      `json:"platforms"`
-	AllGroups       bool          `json:"all_groups"`
-	GroupIDs        []int64       `json:"group_ids"`
-	ExcludedUserIDs []int64       `json:"excluded_user_ids"`
-	AuditPrompt     string        `json:"audit_prompt"`
-	Models          []ModelConfig `json:"models"`
-	ReviewThreshold *float64      `json:"review_threshold"`
-	BlockThreshold  *float64      `json:"block_threshold"`
+	ReviewThreshold float64       `json:"review_threshold"`
+	BlockThreshold  float64       `json:"block_threshold"`
 	Aggregation     string        `json:"aggregation"`
-	WorkerCount     int           `json:"worker_count"`
-	StorePassEvents bool          `json:"store_pass_events"`
 	Warning         WarningConfig `json:"warning"`
 	Disable         DisableConfig `json:"disable"`
-	AdminEmail      string        `json:"admin_email"`
+}
+
+type Config struct {
+	Mode            string           `json:"mode"`
+	AuditScope      string           `json:"audit_scope"`
+	Platforms       []string         `json:"platforms"`
+	AllGroups       bool             `json:"all_groups"`
+	GroupIDs        []int64          `json:"group_ids"`
+	ExcludedUserIDs []int64          `json:"excluded_user_ids"`
+	AuditPrompt     string           `json:"audit_prompt"`
+	Models          []ModelConfig    `json:"models"`
+	ReviewThreshold *float64         `json:"review_threshold"`
+	BlockThreshold  *float64         `json:"block_threshold"`
+	Aggregation     string           `json:"aggregation"`
+	WorkerCount     int              `json:"worker_count"`
+	Warning         WarningConfig    `json:"warning"`
+	Disable         DisableConfig    `json:"disable"`
+	UserRules       []UserRuleConfig `json:"user_rules"`
+	AdminEmail      string           `json:"admin_email"`
 }
 
 type ConfigSnapshot struct {
@@ -210,9 +220,63 @@ func DefaultConfig() Config {
 	return Config{Mode: "off", AuditScope: "current_turn", Platforms: []string{}, AllGroups: true,
 		GroupIDs: []int64{}, ExcludedUserIDs: []int64{}, AuditPrompt: DefaultPolicy, Models: []ModelConfig{},
 		ReviewThreshold: &reviewThreshold, BlockThreshold: &blockThreshold,
-		Aggregation: "any_block", WorkerCount: 4, StorePassEvents: true,
+		Aggregation: "any_block", WorkerCount: 4,
 		Warning: WarningConfig{Window: defaultWarningWindow, Limit: defaultWarningLimit},
-		Disable: DisableConfig{Limit: defaultDisableLimit}}
+		Disable: DisableConfig{Limit: defaultDisableLimit}, UserRules: []UserRuleConfig{}}
+}
+
+// effectiveConfigForUser 将单个用户覆盖合并到全局默认规则，并移除不再需要的覆盖列表。
+func effectiveConfigForUser(config Config, userID int64) Config {
+	globalMode := config.Mode
+	for _, rule := range config.UserRules {
+		if rule.UserID != userID {
+			continue
+		}
+		review, block := rule.ReviewThreshold, rule.BlockThreshold
+		config.ReviewThreshold, config.BlockThreshold = &review, &block
+		mode := rule.Mode
+		if mode == "" {
+			mode = globalMode
+			if mode == "off" {
+				mode = "async"
+			}
+		}
+		config.Mode, config.Aggregation, config.Warning, config.Disable = mode, rule.Aggregation, rule.Warning, rule.Disable
+		break
+	}
+	if globalMode == "off" {
+		config.Mode = "off"
+	}
+	config.UserRules = nil
+	return config
+}
+
+// normalizeUserRuleModes 为未发布开发版本产生的无 mode 用户规则补齐创建时默认值。
+func normalizeUserRuleModes(config *Config) {
+	for i := range config.UserRules {
+		if config.UserRules[i].Mode == "" {
+			config.UserRules[i].Mode = config.Mode
+			if config.UserRules[i].Mode == "off" {
+				config.UserRules[i].Mode = "async"
+			}
+		}
+	}
+}
+
+// warningRuleHash 保留全局规则的历史哈希格式，并让用户覆盖只重置自己的提醒窗口。
+func warningRuleHash(config Config, revision, userID int64) (string, error) {
+	for _, rule := range config.UserRules {
+		if rule.UserID == userID {
+			return fingerprint(struct {
+				Rule   WarningConfig
+				UserID int64
+			}{rule.Warning, userID})
+		}
+	}
+	return fingerprint(struct {
+		Rule     WarningConfig
+		Revision int64
+	}{config.Warning, revision})
 }
 
 func validateConfig(config Config, activating bool) error {
@@ -242,6 +306,29 @@ func validateConfig(config Config, activating bool) error {
 			return errors.New("不审核用户 ID 必须为不重复的正整数")
 		}
 		excluded[userID] = true
+	}
+	userRules := make(map[int64]bool, len(config.UserRules))
+	for _, rule := range config.UserRules {
+		if rule.UserID <= 0 || userRules[rule.UserID] {
+			return errors.New("用户规则必须引用不重复的正整数用户 ID")
+		}
+		userRules[rule.UserID] = true
+		if rule.Mode != "" && rule.Mode != "async" && rule.Mode != "blocking" {
+			return fmt.Errorf("用户 %d 的处理方式必须是异步审核或同步阻断", rule.UserID)
+		}
+		if math.IsNaN(rule.ReviewThreshold) || math.IsInf(rule.ReviewThreshold, 0) || rule.ReviewThreshold < 0 || rule.ReviewThreshold > 1 ||
+			math.IsNaN(rule.BlockThreshold) || math.IsInf(rule.BlockThreshold, 0) || rule.BlockThreshold < 0 || rule.BlockThreshold > 1 || rule.ReviewThreshold > rule.BlockThreshold {
+			return fmt.Errorf("用户 %d 的风险阈值必须满足 0 ≤ 复核阈值 ≤ 阻断阈值 ≤ 1", rule.UserID)
+		}
+		if !slices.Contains([]string{"any_block", "majority_block", "all_block"}, rule.Aggregation) {
+			return fmt.Errorf("用户 %d 的聚合规则无效", rule.UserID)
+		}
+		if rule.Warning.Enabled && (rule.Warning.Window < 1 || rule.Warning.Limit < 1 || rule.Warning.Limit > rule.Warning.Window) {
+			return fmt.Errorf("用户 %d 的提醒规则必须满足 1 ≤ 违规条数 ≤ 成功分类窗口", rule.UserID)
+		}
+		if rule.Disable.Enabled && rule.Disable.Limit < 1 {
+			return fmt.Errorf("用户 %d 的自动停用累计阈值必须大于 0", rule.UserID)
+		}
 	}
 	for _, threshold := range []*float64{config.ReviewThreshold, config.BlockThreshold} {
 		if threshold != nil && (math.IsNaN(*threshold) || math.IsInf(*threshold, 0) || *threshold < 0 || *threshold > 1) {
@@ -368,6 +455,7 @@ func (m *ConfigManager) Reload(ctx context.Context) (loadErr error) {
 	}
 	// 节点名称是模型选择的派生展示值，旧配置加载后也立即使用统一规则。
 	normalizeModelNames(&stored.Config)
+	normalizeUserRuleModes(&stored.Config)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.expectedMode = stored.Mode
@@ -478,18 +566,51 @@ func (m *ConfigManager) EffectiveMode() string {
 	return m.active.Stored.Mode
 }
 
-func (m *ConfigManager) ResolveKey(model ModelConfig) (string, error) {
+func (m *ConfigManager) EffectiveModeForUser(userID int64) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.loadError != nil {
+		if m.expectedMode == "blocking" || m.expectedMode == "async" {
+			return m.expectedMode
+		}
+		return "off"
+	}
+	if m.active == nil || m.active.Stored.Mode == "off" {
+		return "off"
+	}
+	if slices.Contains(m.active.Stored.ExcludedUserIDs, userID) {
+		return "off"
+	}
+	return effectiveConfigForUser(m.active.Stored.Config, userID).Mode
+}
+
+// EvaluationBinding 在同一配置读锁内冻结当前用户规则、审核节点及节点凭据。
+func (m *ConfigManager) EvaluationBinding(userID int64) (ConfigSnapshot, map[string]string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.active == nil || m.loadError != nil {
-		return "", errors.New("节点配置不可用")
+		return ConfigSnapshot{}, nil, errors.New("审核配置或节点凭据不可用")
 	}
-	for _, current := range m.active.Stored.Models {
-		if current.ID == model.ID && current.BaseURL == model.BaseURL && current.Model == model.Model {
-			return m.active.Keys[model.ID], nil
+	if m.active.Stored.Mode == "off" {
+		return ConfigSnapshot{}, nil, ErrAuditPaused
+	}
+	snapshot := ConfigSnapshot{Config: effectiveConfigForUser(m.active.Stored.Config, userID), Revision: m.active.Stored.Revision,
+		WarningRuleRevision: m.active.Stored.WarningRuleRevision, ContractVersion: ContractVersion, FixedContract: OutputContract}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		return ConfigSnapshot{}, nil, err
+	}
+	var cloned ConfigSnapshot
+	if err := json.Unmarshal(raw, &cloned); err != nil {
+		return ConfigSnapshot{}, nil, err
+	}
+	keys := make(map[string]string)
+	for _, model := range cloned.Models {
+		if model.Enabled {
+			keys[model.ID] = m.active.Keys[model.ID]
 		}
 	}
-	return "", errors.New("节点身份或凭据绑定已变化，请使用当前配置重新审核")
+	return cloned, keys, nil
 }
 
 func (m *ConfigManager) Public() (PublicConfig, error) {
@@ -509,6 +630,7 @@ func publicConfig(stored storedConfig) PublicConfig {
 	display := stored.Config
 	display.Models = append([]ModelConfig(nil), stored.Models...)
 	normalizeModelNames(&display)
+	normalizeUserRuleModes(&display)
 	result := PublicConfig{Config: display, Revision: stored.Revision,
 		WarningRuleRevision: stored.WarningRuleRevision, HasAPIKeys: keys,
 		UpdatedAt: stored.UpdatedAt, UpdatedBy: stored.UpdatedBy}
@@ -523,6 +645,7 @@ func publicConfig(stored storedConfig) PublicConfig {
 
 func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID int64) (PublicConfig, error) {
 	normalizeModelNames(&input.Config)
+	normalizeUserRuleModes(&input.Config)
 	if err := validateConfig(input.Config, input.Config.Mode != "off"); err != nil {
 		return PublicConfig{}, infraerrors.BadRequest("third_party_audit_invalid_config", err.Error())
 	}
@@ -550,6 +673,7 @@ func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID in
 		if err := json.Unmarshal([]byte(raw), &current); err != nil {
 			return PublicConfig{}, err
 		}
+		normalizeUserRuleModes(&current.Config)
 	}
 	if current.Revision != input.ExpectedRevision {
 		return PublicConfig{}, infraerrors.Conflict("third_party_audit_config_conflict", "配置已被其他管理员更新，请刷新后再保存")

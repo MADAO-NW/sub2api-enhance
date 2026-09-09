@@ -25,10 +25,19 @@ export interface AuditConfig {
   block_threshold: number | null
   aggregation: 'any_block' | 'majority_block' | 'all_block'
   worker_count: number
-  store_pass_events: boolean
   warning: { enabled: boolean; window: number; limit: number }
   disable: { enabled: boolean; limit: number }
+  user_rules: UserRuleConfig[]
   admin_email: string
+}
+export interface UserRuleConfig {
+  user_id: number
+  mode: 'async' | 'blocking'
+  review_threshold: number
+  block_threshold: number
+  aggregation: 'any_block' | 'majority_block' | 'all_block'
+  warning: { enabled: boolean; window: number; limit: number }
+  disable: { enabled: boolean; limit: number }
 }
 export interface SavedConfig extends AuditConfig {
   model_defaults: { timeout_ms: number }
@@ -65,24 +74,25 @@ export interface ModelResult {
   error?: AuditError
   skipped?: boolean
   skip_reason?: string
-  segments: { order: number; source_path: string; reuse_kind: string; result: Score & { id: number; source_attempt_id: number; source_role: string; policy_role: string; turn_scope: string } }[]
+  segments: { order: number; source_path: string; reuse_kind: string; result: Score & { id: number; source_role: string; policy_role: string; turn_scope: string } }[]
 }
-export interface Outcome { id: number; job_id: number; user_id: number; audit_round: number; run_kind: 'request' | 'reaudit'; requested_by: number | null; config_snapshot?: AuditConfig & { revision: number }; decision: AuditDecision; models: ModelResult[]; partial_failure: boolean; enforcement_eligible: boolean; source_outcome_id?: number; started_at: string | null; finished_at: string | null; duration_ms: number | null; created_at: string; decision_config?: DecisionConfig }
+export interface Outcome { id: number; job_id: number; user_id: number; audit_round: number; run_kind: 'request' | 'reaudit'; requested_by: number | null; reuse_mode: 'allow' | 'force'; config_snapshot?: AuditConfig & { revision: number }; decision: AuditDecision; models: ModelResult[]; partial_failure: boolean; enforcement_eligible: boolean; source_outcome_id?: number; started_at: string | null; finished_at: string | null; duration_ms: number | null; created_at: string; decision_config?: DecisionConfig }
 export interface AuditJob {
   capture_id?: number|null
   id: number
-  run_kind: 'request' | 'reaudit'
   current_run_kind: 'request' | 'reaudit'
   audit_round: number
   current_requested_by: number | null
-  source_job_id: number | null
-  requested_by: number | null
+  reuse_mode: 'allow' | 'force'
+  disable_counted: boolean
   user_id: number
   api_key_id: number | null
   group_id: number | null
   request_id: string
   conversation_key?: string
   identity: { username: string; user_email: string; api_key_name: string; group_name: string; endpoint: string }
+  display_username?: string
+  display_email?: string
   platform: string
   protocol: string
   ingress_stage: string
@@ -109,14 +119,16 @@ export interface AuditJob {
   started_at: string | null
   finished_at: string | null
   duration_ms: number | null
+  outcome?: Outcome | null
+  original_decision?: AuditDecision | null
   created_at: string
   updated_at: string
 }
-export interface AuditEvent { id: number; job_id: number; original_outcome_id: number | null; latest_outcome_id: number; job?: AuditJob; latest?: Outcome; original?: Outcome; reaudit_status?: string; created_at: string; updated_at: string }
 export interface AuditCapture {
   job_id?: number | null
   id: number; capture_key: string; conversation_key?: string; transport: string; protocol: string; body_format: string; raw_body?: string; body_bytes: number; body_sha256: string
   snapshot_status: string; eligibility_status: string; processing_status: string; forwarding_status: string; created_at: string; last_error_message: string
+  display_username?: string; display_email?: string
   identity?: { user_id: number }; metadata?: Record<string, string>; forwarding_observations?: unknown
 }
 export interface AuditUser {
@@ -134,12 +146,11 @@ export interface AuditAction {
   applied_at: string|null; notification_status: string; auth_cache_status: string; auth_cache_error: string
   deliveries: { recipient: string; kind: string; status: string; last_error: string; attempts: unknown[] }[]
 }
-export interface JobDetail { input_json: string; input_parts: (SegmentMeta & { content: { type: string; text: string; source_path: string }[] })[]; audit_target?: { protocol: string; messages: unknown[]; tools: Record<string, unknown> }; non_text: { type: string; source_path: string }[]; job: AuditJob; outcome: Outcome | null; rounds: Outcome[]; reaudits: AuditJob[]; attempts: ModelAttempt[]; actions: AuditAction[]; enforcement?: { role: string; user_status: string; warning_reason: string; disable_reason: string; window_violations: number; window_size: number; disable_violation_count: number } }
-export interface EventDetail { event: AuditEvent; detail: JobDetail }
+export interface JobDetail { input_json: string; input_parts: (SegmentMeta & { content: { type: string; text: string; source_path: string }[] })[]; audit_target?: { protocol: string; messages: unknown[]; tools: Record<string, unknown> }; non_text: { type: string; source_path: string }[]; job: AuditJob; outcome: Outcome | null; rounds: Outcome[]; attempts: ModelAttempt[]; actions: AuditAction[]; enforcement?: { role: string; user_status: string; warning_reason: string; disable_reason: string; window_violations: number; window_size: number; disable_violation_count: number } }
 export interface AuditFilter { ids?: number[]; from?: string; to?: string; user_id?: number; api_key_id?: number; group_id?: number; status?: string; decision?: string; run_kind?: string; mode?: string; platform?: string; request_id?: string; keyword?: string; model_id?: string }
 export interface AuditPage<T> { items: T[]; total: number; page: number; page_size: number }
-export interface ReauditRequest { source: 'jobs' | 'events'; filter: AuditFilter }
-export interface ReauditResult { matched: number; ready: number; items: { source_job_id: number; job_id: number | null; status: string; reason: string }[] }
+export interface ReauditRequest { reuse_mode?: 'allow' | 'force'; filter: AuditFilter }
+export interface ReauditResult { matched: number; ready: number; items: { job_id: number; status: string; reason: string }[] }
 export interface Distribution { count: number; p50_ms: number | null; p95_ms: number | null }
 export interface AuditRuntime {
   warning_enabled: boolean; disable_enabled: boolean
@@ -153,7 +164,7 @@ export interface AuditStats extends StatsQuery {
   capture_stock?: Record<string,number>; forwarding_stock?: Record<string,number>; action_execution_stock?: Record<string,number>;
   as_of: string; stock: Record<string, number>; oldest_waiting_at: string | null; waiting_for_slot: number; cohort: Record<string, number>
   received: number; reaudits_created: number; formal: Record<string, number>; reaudit: Record<string, number>; failures: Record<string, number>
-  events: Record<string, number>; gateway: Record<string, number>; gateway_latency: Distribution; task_latency: Distribution
+  current_decisions: Record<string, number>; gateway: Record<string, number>; gateway_latency: Distribution; task_latency: Distribution
   calls: { model_id: string; call_kind: string; stage: string; total: number; http_success: number; valid_result: number; failed: number; unknown: number; in_flight: number; errors: Record<string, number>; latency: Distribution }[]
   evaluation_rounds: number; reuse: Reuse; actions: Record<string, number>; notification_stock: Record<string, number>; delivery_stock: Record<string, number>; auth_cache_stock: Record<string, number>
 }
@@ -175,9 +186,7 @@ export const thirdPartyPromptAuditAPI = {
   async runtime() { return (await apiClient.get<AuditRuntime>(`${base}/runtime`)).data },
   async stats(params: StatsQuery) { return (await apiClient.get<AuditStats>(`${base}/stats`, { params })).data },
   async jobs(filter: AuditFilter, page = 1, pageSize = 20) { return (await apiClient.get<AuditPage<AuditJob>>(`${base}/jobs`, { params: { ...filter, ids: filter.ids?.join(','), page, page_size: pageSize } })).data },
-  async events(filter: AuditFilter, page = 1, pageSize = 20) { return (await apiClient.get<AuditPage<AuditEvent>>(`${base}/events`, { params: { ...filter, ids: filter.ids?.join(','), page, page_size: pageSize } })).data },
   async job(id: number) { return (await apiClient.get<JobDetail>(`${base}/jobs/${id}`)).data },
-  async event(id: number) { return (await apiClient.get<EventDetail>(`${base}/events/${id}`)).data },
   async capture(id: number) { return (await apiClient.get<AuditCapture>(`${base}/captures/${id}`)).data },
   async users() { return (await apiClient.get<AuditUser[]>(`${base}/users`)).data },
   async preview(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits/preview`, value)).data },

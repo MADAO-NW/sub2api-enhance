@@ -78,3 +78,27 @@ func TestNonTransactionalMigrationMustBeReplayableConcurrentIndexOnly(t *testing
 	_, err = validateMigrationExecutionMode("003.sql", "CREATE INDEX CONCURRENTLY idx ON t(id);")
 	require.Error(t, err)
 }
+
+func TestTaskProjectionMigrationTransfersStateBeforeRemovingLegacyRows(t *testing.T) {
+	raw, err := files.ReadFile("004_prompt_audit_task_projection.sql")
+	require.NoError(t, err)
+	sql := string(raw)
+	for _, required := range []string{
+		"ADD COLUMN disable_counted",
+		"ADD COLUMN target_hash",
+		"SET disable_counted = event.disable_counted",
+		"CREATE INDEX tppa_outcomes_reuse_idx",
+		"ON sub2api_enhance.third_party_prompt_audit_segment_results (model_id, audit_key, id DESC)",
+		"CREATE TEMP TABLE tppa_legacy_reaudit_jobs",
+		"UPDATE sub2api_enhance.third_party_prompt_audit_enforcement_states",
+		"SET repair_of_attempt_id = NULL",
+		"DELETE FROM sub2api_enhance.third_party_prompt_audit_jobs",
+		"DROP TABLE sub2api_enhance.third_party_prompt_audit_events",
+		"DROP COLUMN source_job_id",
+	} {
+		require.Contains(t, sql, required)
+	}
+	require.Less(t, strings.Index(sql, "SET disable_counted = event.disable_counted"), strings.Index(sql, "DROP TABLE sub2api_enhance.third_party_prompt_audit_events"))
+	require.Less(t, strings.Index(sql, "UPDATE sub2api_enhance.third_party_prompt_audit_enforcement_states"), strings.Index(sql, "DELETE FROM sub2api_enhance.third_party_prompt_audit_jobs"))
+	require.Less(t, strings.Index(sql, "SET repair_of_attempt_id = NULL"), strings.Index(sql, "DELETE FROM sub2api_enhance.third_party_prompt_audit_model_attempts"))
+}

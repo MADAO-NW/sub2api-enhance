@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { thirdPartyPromptAuditAPI as api, type AuditConfig, type AuditModel, type AuditUser, type ModelAttempt, type Contract, type KeyUpdate, type ProbeResult, type SavedConfig } from '@/api/admin/third-party-prompt-audit'
+import { thirdPartyPromptAuditAPI as api, type AuditConfig, type AuditModel, type AuditUser, type ModelAttempt, type Contract, type KeyUpdate, type ProbeResult, type SavedConfig, type UserRuleConfig } from '@/api/admin/third-party-prompt-audit'
 import { getAll } from '@/api/admin/groups'
 import type { AdminGroup } from '@/types'
 import { useAppStore } from '@/stores/app'
@@ -29,6 +29,7 @@ const probing = ref<string[]>([])
 const listingModels = ref<string[]>([])
 const resetting = ref(false)
 const selectedResetUserID = ref<number | null>(null)
+const selectedRuleUserID = ref<number | null>(null)
 const probeInputKind = ref('text')
 const probeProtocol = ref('openai_responses')
 const probeScenario = ref('coercive_adult_fiction')
@@ -57,7 +58,9 @@ const probeInput = computed({
 })
 const dirty = computed(() => !!saved.value && !!draft.value && (JSON.stringify(draft.value) !== JSON.stringify(editableConfig(saved.value)) || Object.values(keys).some(key => key.action !== 'keep')))
 const resetUsers = computed(() => users.value.filter(user => user.role === 'user'))
+const ruleUsers = computed(() => users.value.filter(user => !(draft.value?.user_rules ?? []).some(rule => rule.user_id === user.id)))
 const selectedResetUser = computed(() => users.value.find(user => user.id === selectedResetUserID.value) ?? null)
+const auditUser = (id: number) => users.value.find(user => user.id === id)
 const userRoleLabel = (role: string) => label(role === 'admin' ? 'userAdmin' : role === 'user' ? 'userRegular' : role)
 const userStatusLabel = (status: string) => label(status === 'active' ? 'userActive' : status === 'disabled' ? 'userDisabled' : status)
 const reviewPercent = computed({
@@ -221,6 +224,35 @@ function removeModel(id: string) {
   delete probes[id]
   syncModelNames()
 }
+function addUserRule() {
+  if (!draft.value || !saved.value || !selectedRuleUserID.value) return
+  const user = auditUser(selectedRuleUserID.value)
+  if (!user || draft.value.user_rules.some(rule => rule.user_id === user.id)) return
+  draft.value.user_rules.push({
+    user_id: user.id,
+    mode: draft.value.mode === 'blocking' ? 'blocking' : 'async',
+    review_threshold: draft.value.review_threshold ?? saved.value.rule_defaults.review_threshold,
+    block_threshold: draft.value.block_threshold ?? saved.value.rule_defaults.block_threshold,
+    aggregation: draft.value.aggregation,
+    warning: {
+      enabled: draft.value.warning.enabled,
+      window: draft.value.warning.window > 0 ? draft.value.warning.window : saved.value.rule_defaults.warning_window,
+      limit: draft.value.warning.limit > 0 ? draft.value.warning.limit : saved.value.rule_defaults.warning_limit
+    },
+    disable: {
+      enabled: user.role === 'user' && draft.value.disable.enabled,
+      limit: draft.value.disable.limit > 0 ? draft.value.disable.limit : saved.value.rule_defaults.disable_limit
+    }
+  })
+  selectedRuleUserID.value = null
+}
+function removeUserRule(userID: number) {
+  if (draft.value) draft.value.user_rules = draft.value.user_rules.filter(rule => rule.user_id !== userID)
+}
+function updateRuleThreshold(rule: UserRuleConfig, field: 'review_threshold' | 'block_threshold', event: Event) {
+  const value = Number((event.target as HTMLInputElement).value)
+  rule[field] = Number.isFinite(value) ? value / 100 : 0
+}
 async function resetCounter() {
   if (!selectedResetUserID.value) return
   resetting.value = true
@@ -288,8 +320,6 @@ onMounted(load)
           <label class="my-4 flex items-center gap-2 text-sm"><input v-model="draft.all_groups" type="checkbox" />{{ label('allGroups') }}</label>
           <fieldset v-if="!draft.all_groups"><legend class="mb-2 text-sm font-medium">{{ label('groups') }}</legend><div class="flex max-h-48 flex-wrap gap-4 overflow-y-auto"><label v-for="group in groupOptions" :key="group.id" class="flex items-center gap-2 text-sm"><input v-model="draft.group_ids" type="checkbox" :value="group.id" />{{ group.name }} (#{{ group.id }})</label></div></fieldset>
           <fieldset class="mt-5"><legend class="mb-2 text-sm font-medium">{{ label('excludedUsers') }}</legend><p class="mb-3 text-xs text-gray-500 dark:text-dark-400">{{ label('excludedUsersHint') }}</p><div class="grid max-h-52 gap-2 overflow-y-auto rounded-lg border border-gray-200 p-3 dark:border-dark-700 sm:grid-cols-2 xl:grid-cols-3"><label v-for="user in users" :key="user.id" class="flex items-start gap-2 text-sm"><input v-model="draft.excluded_user_ids" class="mt-1" type="checkbox" :value="user.id" /><span class="min-w-0"><span class="block break-words">{{ user.username }} (#{{ user.id }})</span><span class="block break-all text-xs text-gray-500">{{ user.email }} · {{ userRoleLabel(user.role) }} · {{ userStatusLabel(user.status) }}</span></span></label><p v-if="!users.length" class="text-sm text-gray-500">{{ label('empty') }}</p></div></fieldset>
-          <label class="mt-5 flex items-center gap-2 text-sm"><input v-model="draft.store_pass_events" type="checkbox" />{{ label('storePass') }}</label>
-          <p class="mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('storeHint') }}</p>
         </section>
 
         <section class="card p-5 sm:p-6">
@@ -362,6 +392,17 @@ onMounted(load)
             </fieldset>
             <fieldset class="space-y-4"><label class="flex items-center gap-2"><input v-model="draft.disable.enabled" type="checkbox" />{{ label('disable') }}</label><label v-if="draft.disable.enabled" class="block space-y-2"><span class="text-sm">{{ label('disableLimit') }}</span><input v-model.number="draft.disable.limit" class="input" type="number" min="1" step="1" required /></label></fieldset>
           </div><label class="block space-y-2"><span class="text-sm">{{ label('adminEmail') }}</span><input v-model="draft.admin_email" class="input" type="email" /><span class="block text-xs text-gray-500 dark:text-dark-400">{{ label('adminEmailHint') }}</span></label>
+          <div class="border-t border-gray-200 pt-5 dark:border-dark-700">
+            <h3 class="font-semibold">{{ label('userRules') }}</h3><p class="mb-4 mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('userRulesHint') }}</p>
+            <div class="flex flex-wrap items-end gap-3"><label class="min-w-72 flex-1 space-y-2"><span class="text-sm">{{ label('user') }}</span><select v-model="selectedRuleUserID" class="input"><option :value="null">{{ label('chooseRuleUser') }}</option><option v-for="user in ruleUsers" :key="user.id" :value="user.id">{{ user.username }} (#{{ user.id }}) · {{ user.email }} · {{ userRoleLabel(user.role) }}</option></select></label><button type="button" class="btn btn-secondary" :disabled="!selectedRuleUserID" @click="addUserRule">{{ label('addUserRule') }}</button></div>
+            <div class="mt-4 space-y-4">
+              <section v-for="rule in draft.user_rules" :key="rule.user_id" class="rounded-xl border border-gray-200 p-4 dark:border-dark-600">
+                <div class="flex flex-wrap items-start justify-between gap-3"><div><strong>{{ auditUser(rule.user_id)?.username || `#${rule.user_id}` }} (#{{ rule.user_id }})</strong><p class="text-xs text-gray-500">{{ auditUser(rule.user_id)?.email }} · {{ userRoleLabel(auditUser(rule.user_id)?.role || '') }}</p></div><button type="button" class="btn btn-ghost text-red-600" @click="removeUserRule(rule.user_id)">{{ label('removeUserRule') }}</button></div>
+                <div class="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-4"><label class="space-y-2"><span class="text-sm">{{ label('userMode') }}</span><select v-model="rule.mode" class="input"><option value="async">{{ label('async') }}</option><option value="blocking">{{ label('blocking') }}</option></select></label><label class="space-y-2"><span class="text-sm">{{ label('reviewThreshold') }} (%)</span><input :value="rule.review_threshold * 100" class="input" type="number" min="0" max="100" step="any" required @input="updateRuleThreshold(rule, 'review_threshold', $event)" /></label><label class="space-y-2"><span class="text-sm">{{ label('blockThreshold') }} (%)</span><input :value="rule.block_threshold * 100" class="input" type="number" min="0" max="100" step="any" required @input="updateRuleThreshold(rule, 'block_threshold', $event)" /></label><label class="space-y-2"><span class="text-sm">{{ label('aggregation') }}</span><select v-model="rule.aggregation" class="input"><option v-for="strategy in ['any_block', 'majority_block', 'all_block']" :key="strategy" :value="strategy">{{ label(strategy) }}</option></select></label></div>
+                <div class="mt-4 grid gap-6 md:grid-cols-2"><fieldset class="space-y-3"><label class="flex items-center gap-2"><input v-model="rule.warning.enabled" type="checkbox" />{{ label('warning') }}</label><div v-if="rule.warning.enabled" class="grid grid-cols-2 gap-3"><label class="space-y-2"><span class="text-sm">{{ label('warningWindow') }}</span><input v-model.number="rule.warning.window" class="input" type="number" min="1" step="1" required /></label><label class="space-y-2"><span class="text-sm">{{ label('warningLimit') }}</span><input v-model.number="rule.warning.limit" class="input" type="number" min="1" :max="rule.warning.window" step="1" required /></label></div></fieldset><fieldset class="space-y-3"><label class="flex items-center gap-2"><input v-model="rule.disable.enabled" type="checkbox" :disabled="auditUser(rule.user_id)?.role !== 'user'" />{{ label('disable') }}</label><label v-if="rule.disable.enabled" class="block space-y-2"><span class="text-sm">{{ label('disableLimit') }}</span><input v-model.number="rule.disable.limit" class="input" type="number" min="1" step="1" required /></label><p v-if="auditUser(rule.user_id)?.role !== 'user'" class="text-xs text-amber-700 dark:text-amber-400">{{ label('adminDisableHint') }}</p></fieldset></div>
+              </section>
+            </div>
+          </div>
           <div class="border-t border-gray-200 pt-5 dark:border-dark-700"><h3 class="font-semibold">{{ label('counterManagement') }}</h3><p class="mb-4 mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('counterManagementHint') }}</p><div class="grid gap-4 md:grid-cols-[minmax(0,1fr)_auto]"><label class="space-y-2"><span class="text-sm">{{ label('user') }}</span><select v-model="selectedResetUserID" class="input"><option :value="null">{{ label('chooseUser') }}</option><option v-for="user in resetUsers" :key="user.id" :value="user.id">{{ user.username }} (#{{ user.id }}) · {{ userStatusLabel(user.status) }} · {{ label('disableViolationCount') }} {{ user.disable_violation_count }}</option></select></label><button type="button" class="btn btn-secondary self-end" :disabled="!selectedResetUserID || resetting || selectedResetUser?.action_pending" @click="resetCounter">{{ label(resetting ? 'loading' : 'enableAndReset') }}</button></div><p v-if="selectedResetUser" class="mt-3 text-xs text-gray-500 dark:text-dark-400">{{ selectedResetUser.email }} · {{ userRoleLabel(selectedResetUser.role) }} · {{ userStatusLabel(selectedResetUser.status) }} · {{ label('disableViolationCount') }} {{ selectedResetUser.disable_violation_count }} · {{ label('lastCounterReset') }} {{ formatTime(selectedResetUser.disable_reset_at) }}<span v-if="selectedResetUser.action_pending"> · {{ label('actionPending') }}</span></p></div>
         </section>
       </fieldset>

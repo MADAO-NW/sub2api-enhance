@@ -17,6 +17,7 @@ const selected = ref<AuditCapture | null>(null)
 const error = ref('')
 const app = useAppStore()
 const label = useAuditLabels()
+const forwardingLabel = (status: string) => label(`forwarding_${status}`)
 const users = ref<AuditUser[]>([])
 const userID = ref<number | null>(null)
 const keyOptions = ref<{ id: number; name: string }[]>([])
@@ -84,11 +85,11 @@ onMounted(load)
     </header>
     <p v-if="error" class="text-red-600">{{ error }}</p>
     <div class="overflow-auto">
-      <table class="table">
-        <thead><tr><th>ID</th><th>{{ label('created') }}</th><th>{{ label('protocol') }}</th><th>{{ label('captureBytes') }}</th><th>{{ label('captureIntegrity') }}</th><th>{{ label('captureEligibility') }}</th><th>{{ label('captureProcessing') }}</th><th>{{ label('forwardingStock') }}</th><th>{{ label('operation') }}</th></tr></thead>
+      <table class="table min-w-[72rem]">
+        <thead><tr><th>ID</th><th>{{ label('created') }}</th><th>{{ label('user') }}</th><th>{{ label('protocol') }}</th><th>{{ label('captureBytes') }}</th><th>{{ label('captureIntegrity') }}</th><th>{{ label('captureEligibility') }}</th><th>{{ label('captureProcessing') }}</th><th>{{ label('forwardingStock') }}</th><th>{{ label('operation') }}</th></tr></thead>
         <tbody>
           <tr v-for="item in items" :key="item.id">
-            <td>{{ item.id }}</td><td class="whitespace-nowrap">{{ formatTime(item.created_at) }}</td><td>{{ item.protocol }}</td><td>{{ item.body_bytes }}</td><td>{{ label(item.snapshot_status) }}</td><td>{{ label(item.eligibility_status) }}</td><td>{{ label(item.processing_status) }}</td><td>{{ label(item.forwarding_status) }}</td>
+            <td>{{ item.id }}</td><td class="whitespace-nowrap">{{ formatTime(item.created_at) }}</td><td class="min-w-44 break-words"><p>{{ item.display_username || item.display_email || '—' }}<span v-if="item.identity?.user_id"> (#{{ item.identity.user_id }})</span></p><p v-if="item.display_email" class="text-xs text-gray-500">{{ item.display_email }}</p></td><td>{{ item.protocol }}</td><td>{{ item.body_bytes }}</td><td>{{ label(item.snapshot_status) }}</td><td>{{ label(item.eligibility_status) }}</td><td>{{ label(item.processing_status) }}</td><td>{{ item.forwarding_status ? forwardingLabel(item.forwarding_status) : '—' }}</td>
             <td><button class="btn btn-secondary btn-sm whitespace-nowrap" @click="detail(item.id)">{{ label('viewCapture') }}</button></td>
           </tr>
         </tbody>
@@ -114,6 +115,6 @@ onMounted(load)
         </div>
       </template>
     </BaseDialog>
-    <AuditDetail :id="jobID" source="jobs" @close="jobID = null" />
+    <AuditDetail :id="jobID" @close="jobID = null" />
   </section>
 </template>

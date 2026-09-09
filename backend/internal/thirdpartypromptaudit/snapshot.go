@@ -253,6 +253,11 @@ func protocolMessages(protocol string, root map[string]any, prefix string) ([]pr
 			contentPath := path + ".content"
 			var toolData any
 			switch kind {
+			case "additional_tools":
+				if _, ok := entry["tools"].([]any); !ok {
+					return nil, fmt.Errorf("Responses additional_tools 缺少工具数组: %s", path)
+				}
+				continue
 			case "function_call_output", "tool_result":
 				role, content, toolData = "tool", nil, entry
 				contentPath = path

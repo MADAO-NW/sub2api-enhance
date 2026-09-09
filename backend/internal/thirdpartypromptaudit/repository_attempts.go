@@ -17,7 +17,7 @@ type AttemptStore interface {
 
 type EvaluationStore interface {
 	FindWholeResult(context.Context, *Job) (*Outcome, error)
-	FindSegments(context.Context, int64, string, []string) (map[string]SegmentResult, error)
+	FindSegments(context.Context, string, []string) (map[string]SegmentResult, error)
 	SaveSegment(context.Context, *Job, *SegmentResult) error
 }
 
@@ -97,14 +97,14 @@ func (r *Repository) FinishAttempt(ctx context.Context, job *Job, attempt *Model
 	return checkLeaseUpdate(result, err)
 }
 
-func (r *Repository) FindSegments(ctx context.Context, userID int64, modelID string, keys []string) (map[string]SegmentResult, error) {
+func (r *Repository) FindSegments(ctx context.Context, modelID string, keys []string) (map[string]SegmentResult, error) {
 	results := make(map[string]SegmentResult)
 	if len(keys) == 0 {
 		return results, nil
 	}
 	rows, err := r.db.QueryContext(ctx, `SELECT DISTINCT ON (audit_key) id,user_id,model_id,audit_key,source_attempt_id,source_role,policy_role,turn_scope,content_hash,confidence,reason
- FROM sub2api_enhance.third_party_prompt_audit_segment_results WHERE user_id=$1 AND model_id=$2 AND audit_key=ANY($3)
- ORDER BY audit_key,id DESC`, userID, modelID, pq.Array(keys))
+	 FROM sub2api_enhance.third_party_prompt_audit_segment_results WHERE model_id=$1 AND audit_key=ANY($2)
+	 ORDER BY audit_key,id DESC`, modelID, pq.Array(keys))
 	if err != nil {
 		return nil, err
 	}
@@ -136,14 +136,14 @@ func (r *Repository) SaveSegment(ctx context.Context, job *Job, item *SegmentRes
 }
 
 func (r *Repository) FindWholeResult(ctx context.Context, job *Job) (*Outcome, error) {
-	return r.queryOutcome(ctx, `SELECT o.id,o.job_id,o.user_id,o.decision,o.partial_failure,o.enforcement_eligible,o.model_results,o.source_outcome_id,o.created_at,o.audit_round,o.run_kind,o.requested_by,o.config_snapshot,o.started_at,o.finished_at
- FROM sub2api_enhance.third_party_prompt_audit_outcomes o JOIN sub2api_enhance.third_party_prompt_audit_jobs j ON j.id=o.job_id
-	 WHERE j.user_id=$1 AND j.conversation_key=$2 AND j.evaluation_hash=$3 AND j.target_hash=$4 AND NOT o.partial_failure AND o.source_outcome_id IS NULL
-	 ORDER BY o.id DESC LIMIT 1`, job.UserID, job.ConversationKey, job.EvaluationHash, job.TargetHash)
+	return r.queryOutcome(ctx, `SELECT o.id,o.job_id,o.user_id,o.decision,o.partial_failure,o.enforcement_eligible,o.model_results,o.source_outcome_id,o.created_at,o.audit_round,o.run_kind,o.requested_by,o.config_snapshot,o.started_at,o.finished_at,o.reuse_mode
+	 FROM sub2api_enhance.third_party_prompt_audit_outcomes o
+		 WHERE o.evaluation_hash=$1 AND o.target_hash=$2 AND NOT o.partial_failure AND o.source_outcome_id IS NULL
+		 ORDER BY o.id DESC LIMIT 1`, job.EvaluationHash, job.TargetHash)
 }
 
 func (r *Repository) GetOutcome(ctx context.Context, jobID int64) (*Outcome, error) {
-	return r.queryOutcome(ctx, `SELECT id,job_id,user_id,decision,partial_failure,enforcement_eligible,model_results,source_outcome_id,created_at,audit_round,run_kind,requested_by,config_snapshot,started_at,finished_at FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1 ORDER BY audit_round DESC,id DESC LIMIT 1`, jobID)
+	return r.queryOutcome(ctx, `SELECT id,job_id,user_id,decision,partial_failure,enforcement_eligible,model_results,source_outcome_id,created_at,audit_round,run_kind,requested_by,config_snapshot,started_at,finished_at,reuse_mode FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1 ORDER BY audit_round DESC,id DESC LIMIT 1`, jobID)
 }
 
 func (r *Repository) queryOutcome(ctx context.Context, query string, args ...any) (*Outcome, error) {
@@ -151,7 +151,7 @@ func (r *Repository) queryOutcome(ctx context.Context, query string, args ...any
 	var models, config string
 	err := r.db.QueryRowContext(ctx, query, args...).Scan(&outcome.ID, &outcome.JobID, &outcome.UserID, &outcome.Decision,
 		&outcome.PartialFailure, &outcome.EnforcementEligible, &models, &outcome.SourceOutcomeID, &outcome.CreatedAt, &outcome.AuditRound,
-		&outcome.RunKind, &outcome.RequestedBy, &config, &outcome.StartedAt, &outcome.FinishedAt)
+		&outcome.RunKind, &outcome.RequestedBy, &config, &outcome.StartedAt, &outcome.FinishedAt, &outcome.ReuseMode)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -175,9 +175,7 @@ func (r *Repository) queryOutcome(ctx context.Context, query string, args ...any
 }
 
 func (r *Repository) ListAttempts(ctx context.Context, jobID int64) ([]ModelAttempt, error) {
-	return r.listAttempts(ctx, `job_id=$1
- OR id IN (SELECT s.source_attempt_id FROM sub2api_enhance.third_party_prompt_audit_outcomes o JOIN sub2api_enhance.third_party_prompt_audit_outcome_segments link ON link.outcome_id=o.id JOIN sub2api_enhance.third_party_prompt_audit_segment_results s ON s.id=link.segment_result_id WHERE o.job_id=$1)
- OR id IN (SELECT (m->>'joint_attempt_id')::bigint FROM sub2api_enhance.third_party_prompt_audit_outcomes o CROSS JOIN LATERAL json_array_elements(o.model_results::json) m WHERE o.job_id=$1)`, jobID)
+	return r.listAttempts(ctx, `job_id=$1`, jobID)
 }
 
 // listAttempts 统一解码正式任务及节点测试的持久化调用证据。

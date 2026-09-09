@@ -13,7 +13,7 @@ import (
 	"sub2api-enhance/internal/pkg/logger"
 )
 
-// Complete 原子提交分类、事件、计数与动作；同步补写和复核不能获得处罚资格。
+// Complete 原子提交分类、任务当前状态、计数与动作；同步补写和复核不能获得处罚资格。
 func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluation, foreground bool) (*Outcome, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -23,7 +23,8 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 	var status string
 	var generation int64
 	var leaseValid bool
-	err = tx.QueryRowContext(ctx, `SELECT status,claim_generation,COALESCE(lease_until>clock_timestamp(),false) FROM sub2api_enhance.third_party_prompt_audit_jobs WHERE id=$1 FOR UPDATE`, job.ID).Scan(&status, &generation, &leaseValid)
+	var disableCounted bool
+	err = tx.QueryRowContext(ctx, `SELECT status,claim_generation,COALESCE(lease_until>clock_timestamp(),false),disable_counted FROM sub2api_enhance.third_party_prompt_audit_jobs WHERE id=$1 FOR UPDATE`, job.ID).Scan(&status, &generation, &leaseValid, &disableCounted)
 	if err != nil {
 		return nil, err
 	}
@@ -51,16 +52,17 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 	if err := validateConfig(current.Config, current.Mode != "off"); err != nil {
 		return nil, err
 	}
-	rootID := job.ID
-	if job.SourceJobID != nil {
-		rootID = *job.SourceJobID
-		var validSource bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_jobs WHERE id=$1 AND run_kind='request' AND user_id=$2)`, rootID, job.UserID).Scan(&validSource); err != nil {
-			return nil, err
-		}
-		if !validSource {
-			return nil, errors.New("复核来源与任务用户不一致")
-		}
+	configuredRules := current.Config
+	current.Config = effectiveConfigForUser(current.Config, job.UserID)
+	var priorDecision Decision
+	priorErr := tx.QueryRowContext(ctx, `SELECT decision FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1 ORDER BY audit_round DESC,id DESC LIMIT 1`, job.ID).Scan(&priorDecision)
+	if priorErr != nil && !errors.Is(priorErr, sql.ErrNoRows) {
+		return nil, priorErr
+	}
+	var originalEligible bool
+	originalErr := tx.QueryRowContext(ctx, `SELECT enforcement_eligible FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1 AND audit_round=1 ORDER BY id LIMIT 1`, job.ID).Scan(&originalEligible)
+	if originalErr != nil && !errors.Is(originalErr, sql.ErrNoRows) {
+		return nil, originalErr
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_enforcement_states(user_id) VALUES($1) ON CONFLICT(user_id) DO NOTHING`, job.UserID); err != nil {
 		return nil, err
@@ -94,8 +96,8 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 		return nil, err
 	}
 	runKind := job.auditRunKind()
-	cloned.EnforcementEligible = job.IngressStage != "manual_capture_reprocess" && eligible && job.RunKind == "request" && runKind == "request" && (job.ExecutionMode == "async" || foreground) && current.Mode != "off"
-	outcome := &Outcome{JobID: job.ID, UserID: job.UserID, Evaluation: *cloned}
+	cloned.EnforcementEligible = job.IngressStage != "manual_capture_reprocess" && eligible && runKind == "request" && (job.ExecutionMode == "async" || foreground) && current.Mode != "off"
+	outcome := &Outcome{JobID: job.ID, UserID: job.UserID, ReuseMode: job.ReuseMode, Evaluation: *cloned}
 	models, err := json.Marshal(cloned.Models)
 	if err != nil {
 		return nil, err
@@ -105,9 +107,9 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 		return nil, err
 	}
 	outcome.AuditRound, outcome.RunKind, outcome.RequestedBy, outcome.Config, outcome.StartedAt = jobAuditRound(job), runKind, job.CurrentRequestedBy, job.Config, job.StartedAt
-	err = tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_outcomes(job_id,user_id,decision,partial_failure,enforcement_eligible,model_results,source_outcome_id,audit_round,run_kind,requested_by,config_snapshot,started_at,finished_at)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,clock_timestamp()) RETURNING id,created_at,finished_at`, job.ID, job.UserID, cloned.Decision, cloned.PartialFailure, cloned.EnforcementEligible, string(models), cloned.SourceOutcomeID,
-		jobAuditRound(job), runKind, job.CurrentRequestedBy, string(configSnapshot), job.StartedAt).Scan(&outcome.ID, &outcome.CreatedAt, &outcome.FinishedAt)
+	err = tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_outcomes(job_id,user_id,decision,partial_failure,enforcement_eligible,model_results,source_outcome_id,audit_round,run_kind,requested_by,config_snapshot,started_at,finished_at,reuse_mode,target_hash,evaluation_hash)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,clock_timestamp(),$13,$14,$15) RETURNING id,created_at,finished_at`, job.ID, job.UserID, cloned.Decision, cloned.PartialFailure, cloned.EnforcementEligible, string(models), cloned.SourceOutcomeID,
+		jobAuditRound(job), runKind, job.CurrentRequestedBy, string(configSnapshot), job.StartedAt, job.ReuseMode, job.TargetHash, job.EvaluationHash).Scan(&outcome.ID, &outcome.CreatedAt, &outcome.FinishedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -139,32 +141,11 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 		}
 	}
 
-	var originalOutcomeID *int64
-	var priorDecision Decision
-	var originalEligible bool
-	var disableCounted bool
-	priorErr := tx.QueryRowContext(ctx, `SELECT latest.decision,original.enforcement_eligible,event.disable_counted FROM sub2api_enhance.third_party_prompt_audit_events event JOIN sub2api_enhance.third_party_prompt_audit_outcomes latest ON latest.id=event.latest_outcome_id LEFT JOIN sub2api_enhance.third_party_prompt_audit_outcomes original ON original.id=event.original_outcome_id WHERE event.job_id=$1`, rootID).Scan(&priorDecision, &originalEligible, &disableCounted)
-	if priorErr != nil && !errors.Is(priorErr, sql.ErrNoRows) {
-		return nil, priorErr
-	}
-	err = tx.QueryRowContext(ctx, `SELECT id,enforcement_eligible FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1 ORDER BY audit_round,id LIMIT 1`, rootID).Scan(&originalOutcomeID, &originalEligible)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	if runKind == "reaudit" || job.Config.StorePassEvents || outcome.Decision != DecisionPass {
-		_, err = tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_events AS event(job_id,original_outcome_id,latest_outcome_id) VALUES($1,$2,$3) ON CONFLICT(job_id) DO UPDATE SET original_outcome_id=COALESCE(event.original_outcome_id,EXCLUDED.original_outcome_id),latest_outcome_id=CASE WHEN EXISTS(SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_outcomes current WHERE current.id=event.latest_outcome_id AND (current.audit_round,current.id)<($4,$3)) THEN EXCLUDED.latest_outcome_id ELSE event.latest_outcome_id END,updated_at=clock_timestamp()`, rootID, originalOutcomeID, outcome.ID, outcome.AuditRound)
-		if err != nil {
-			return nil, err
-		}
-	}
 	before := state
 	window := make([]Decision, 0)
 	canonicalEligible := outcome.EnforcementEligible || (runKind == "reaudit" && originalEligible)
-	if canonicalEligible && user.Role == "user" {
-		ruleHash, err := fingerprint(struct {
-			Rule     WarningConfig
-			Revision int64
-		}{current.Warning, current.WarningRuleRevision})
+	if canonicalEligible {
+		ruleHash, err := warningRuleHash(configuredRules, current.WarningRuleRevision, job.UserID)
 		if err != nil {
 			return nil, err
 		}
@@ -177,7 +158,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 			state.WarningArmed = true
 		}
 		if current.Warning.Enabled {
-			rows, err := tx.QueryContext(ctx, `SELECT latest.decision FROM sub2api_enhance.third_party_prompt_audit_jobs root JOIN sub2api_enhance.third_party_prompt_audit_outcomes original ON original.job_id=root.id AND original.audit_round=1 LEFT JOIN sub2api_enhance.third_party_prompt_audit_events event ON event.job_id=root.id JOIN sub2api_enhance.third_party_prompt_audit_outcomes latest ON latest.id=COALESCE(event.latest_outcome_id,original.id) WHERE root.run_kind='request' AND root.user_id=$1 AND original.enforcement_eligible AND original.id>$2 ORDER BY root.id DESC LIMIT $3`, job.UserID, state.WarningWindowAfterOutcomeID, current.Warning.Window)
+			rows, err := tx.QueryContext(ctx, `SELECT latest.decision FROM sub2api_enhance.third_party_prompt_audit_jobs root JOIN sub2api_enhance.third_party_prompt_audit_outcomes original ON original.job_id=root.id AND original.audit_round=1 JOIN LATERAL (SELECT current.decision FROM sub2api_enhance.third_party_prompt_audit_outcomes current WHERE current.job_id=root.id ORDER BY current.audit_round DESC,current.id DESC LIMIT 1) latest ON true WHERE root.user_id=$1 AND original.enforcement_eligible AND original.id>$2 ORDER BY root.id DESC LIMIT $3`, job.UserID, state.WarningWindowAfterOutcomeID, current.Warning.Window)
 			if err != nil {
 				return nil, err
 			}
@@ -202,14 +183,8 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 	if capturedAt.IsZero() {
 		capturedAt = job.CreatedAt
 	}
-	if canonicalEligible && user.Role == "user" && current.Disable.Enabled && (state.DisableResetAt == nil || capturedAt.After(*state.DisableResetAt)) {
-		shouldCount := outcome.Decision == DecisionBlock
-		if !disableCounted && shouldCount {
-			state.DisableViolationCount++
-		} else if disableCounted && !shouldCount && state.DisableViolationCount > 0 {
-			state.DisableViolationCount--
-		}
-		disableCounted = shouldCount
+	if canonicalEligible && user.Role == "user" && (current.Disable.Enabled || disableCounted) && (state.DisableResetAt == nil || capturedAt.After(*state.DisableResetAt)) {
+		state.DisableViolationCount, disableCounted = adjustDisableContribution(state.DisableViolationCount, disableCounted, outcome.Decision == DecisionBlock)
 	}
 	triggerBlock := outcome.Decision == DecisionBlock && (runKind == "request" || priorDecision != DecisionBlock)
 	next, actionTypes := decideEnforcement(state, user, canonicalEligible, triggerBlock, current.Config, window)
@@ -223,14 +198,11 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 		}
 	}
 	oldStatus := user.Status
-	if runKind == "request" && outcome.EnforcementEligible && user.Role == "user" {
+	if runKind == "request" && outcome.EnforcementEligible {
 		next.LastOutcomeID = &outcome.ID
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_enforcement_states SET warning_rule_hash=$2,warning_window_after_outcome_id=$3,warning_armed=$4,disable_violation_count=$5,last_outcome_id=$6,updated_at=clock_timestamp() WHERE user_id=$1`, job.UserID, next.WarningRuleHash, next.WarningWindowAfterOutcomeID, next.WarningArmed, next.DisableViolationCount, next.LastOutcomeID)
 	if err != nil {
-		return nil, err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_events SET disable_counted=$2 WHERE job_id=$1`, rootID, disableCounted); err != nil {
 		return nil, err
 	}
 	for _, actionType := range actionTypes {
@@ -261,7 +233,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 			return nil, err
 		}
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs SET status='done',finished_at=clock_timestamp(),lease_until=NULL,result_checkpoint=NULL,failure_stage=NULL,last_error_code=NULL,last_error_message=NULL,updated_at=clock_timestamp() WHERE id=$1 AND claim_generation=$2 AND status='processing'`, job.ID, job.ClaimGeneration)
+	result, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs SET status='done',disable_counted=$3,finished_at=clock_timestamp(),lease_until=NULL,result_checkpoint=NULL,failure_stage=NULL,last_error_code=NULL,last_error_message=NULL,updated_at=clock_timestamp() WHERE id=$1 AND claim_generation=$2 AND status='processing'`, job.ID, job.ClaimGeneration, disableCounted)
 	if err := checkLeaseUpdate(result, err); err != nil {
 		return nil, err
 	}
@@ -275,6 +247,16 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 	resultName := map[Decision]string{DecisionPass: "通过", DecisionReview: "待复核", DecisionBlock: "违规"}[outcome.Decision]
 	logger.LegacyPrintf("third_party_prompt_audit", "审核分类已提交：%s job_id=%d outcome_id=%d decision=%s state_transition=%s", resultName, job.ID, outcome.ID, outcome.Decision, string(transition))
 	return outcome, nil
+}
+
+// adjustDisableContribution 按任务当前结论精确修正一次累计违规贡献，并保证累计值不为负数。
+func adjustDisableContribution(count int64, counted, shouldCount bool) (int64, bool) {
+	if !counted && shouldCount {
+		count++
+	} else if counted && !shouldCount && count > 0 {
+		count--
+	}
+	return count, shouldCount
 }
 
 func actionDeliveries(action Action, user EnforcementUser, adminEmail string) []Delivery {

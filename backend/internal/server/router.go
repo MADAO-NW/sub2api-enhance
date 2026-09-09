@@ -60,8 +60,6 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	a.GET("/jobs", handler.ListJobs)
 	a.GET("/jobs/:id", handler.GetJob)
 	a.POST("/jobs/:id/resume", handler.ResumeResult)
-	a.GET("/events", handler.ListEvents)
-	a.GET("/events/:id", handler.GetEvent)
 	a.POST("/reaudits/preview", handler.PreviewReaudits)
 	a.POST("/reaudits", handler.CreateReaudits)
 	a.POST("/actions/:id/retry", handler.RetryAction)

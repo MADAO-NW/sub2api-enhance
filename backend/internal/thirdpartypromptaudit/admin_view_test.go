@@ -12,7 +12,7 @@ import (
 
 func TestOutcomeExplanationDoesNotMutateStoredScores(t *testing.T) {
 	outcome := &Outcome{JobID: 4, Evaluation: Evaluation{Decision: DecisionPass, Models: []ModelResult{
-		{ModelID: "a", Basis: "segments_all_pass", Segments: []SegmentUse{{Result: SegmentResult{Score: Score{Confidence: .92}}}, {Result: SegmentResult{Score: Score{Confidence: .95}}}}},
+		{ModelID: "a", Basis: "segments_all_pass", Segments: []SegmentUse{{Result: SegmentResult{UserID: 7, SourceAttemptID: 91, Score: Score{Confidence: .92}}}, {Result: SegmentResult{UserID: 7, SourceAttemptID: 92, Score: Score{Confidence: .95}}}}},
 		{ModelID: "b", Error: &AuditError{Code: "timeout"}},
 	}}}
 	threshold := 1.0
@@ -32,36 +32,52 @@ func TestOutcomeExplanationDoesNotMutateStoredScores(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, string(stored), "max_segment_confidence")
 	require.NotContains(t, string(stored), "decision_config")
+	segment, err := json.Marshal(outcome.Models[0].Segments[0].Result)
+	require.NoError(t, err)
+	require.NotContains(t, string(segment), "user_id")
+	require.NotContains(t, string(segment), "source_attempt_id")
 }
 
-func TestEventListExplainsLatestOutcomeWithItsOwnJobRevision(t *testing.T) {
+func TestJobListIncludesLatestOutcomeAndOriginalDecision(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
-	mock.ExpectQuery(`SELECT COUNT\(\*\).*LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs original ON original.id=j.source_job_id LEFT JOIN sub2api_enhance.captures capture ON capture.id=COALESCE\(j.capture_id,original.capture_id\).*JOIN sub2api_enhance.third_party_prompt_audit_outcomes o ON o.id=e.latest_outcome_id`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT COUNT\(\*\).*LEFT JOIN LATERAL.*third_party_prompt_audit_outcomes`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	now := time.Now()
-	columns := []string{"id", "job_id", "original", "latest", "created", "updated", "job", "decision", "partial", "outcome_created", "reaudit_status", "models", "decision_config", "audit_round", "duration_ms", "outcome_job_id"}
-	rows := sqlmock.NewRows(columns).AddRow(1, 4, 10, 11, now, now,
-		`{"id":4,"decision_config":{"revision":3,"review_threshold":1,"block_threshold":1}}`,
-		"review", false, now, "done",
-		`[{"model_id":"a","basis":"joint","confidence":0.65,"max_segment_confidence":0.95,"reused":true,"joint_attempt_id":8}]`,
-		`{"revision":8,"review_threshold":0.5,"block_threshold":0.8}`, 2, int64(125), 9)
-	mock.ExpectQuery(`SELECT e.id.*capture.created_at.*original.capture_id.*LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs original ON original.id=j.source_job_id LEFT JOIN sub2api_enhance.captures capture ON capture.id=COALESCE\(j.capture_id,original.capture_id\).*JOIN sub2api_enhance.third_party_prompt_audit_outcomes o ON o.id=e.latest_outcome_id`).WithArgs(20, 0).WillReturnRows(rows)
-	page, err := NewRepository(db).ListEvents(context.Background(), Filter{}, 1, 20)
+	record := `{"id":4,"created_at":"` + now.Format(time.RFC3339Nano) + `","display_username":"当前用户名","display_email":"current@example.invalid","decision_config":{"revision":3,"review_threshold":1,"block_threshold":1},"original_decision":"block","outcome":{"id":11,"job_id":4,"user_id":7,"decision":"review","partial_failure":false,"audit_round":2,"reuse_mode":"allow","duration_ms":125,"models":[{"model_id":"a","basis":"joint","confidence":0.65,"max_segment_confidence":0.95,"reused":true,"joint_attempt_id":8}],"decision_config":{"revision":8,"review_threshold":0.5,"block_threshold":0.8}}}`
+	mock.ExpectQuery(`SELECT row_to_json\(record\).*AS outcome.*original_decision`).WithArgs(20, 0).WillReturnRows(sqlmock.NewRows([]string{"record"}).AddRow(record))
+	page, err := NewRepository(db).ListJobs(context.Background(), Filter{}, 1, 20)
 	require.NoError(t, err)
 	require.Len(t, page.Items, 1)
-	event := page.Items[0]
-	require.Equal(t, int64(3), event.Job.DecisionConfig.Revision)
-	require.Equal(t, int64(8), event.Latest.DecisionConfig.Revision)
-	require.Equal(t, int64(9), event.Latest.JobID)
-	require.Equal(t, 2, event.Latest.AuditRound)
-	require.EqualValues(t, 125, *event.Latest.DurationMS)
-	require.Equal(t, .5, *event.Latest.DecisionConfig.ReviewThreshold)
-	require.Equal(t, .95, *event.Latest.Models[0].MaxSegmentConfidence)
-	require.True(t, event.Latest.Models[0].Reused)
-	require.Nil(t, event.Job.FullInput)
-	require.Empty(t, event.Job.Config.AuditPrompt)
-	require.Empty(t, event.Latest.Models[0].Segments)
+	job := page.Items[0]
+	require.Equal(t, int64(3), job.DecisionConfig.Revision)
+	require.Equal(t, "当前用户名", job.DisplayUsername)
+	require.Equal(t, "current@example.invalid", job.DisplayEmail)
+	require.Equal(t, DecisionBlock, *job.OriginalDecision)
+	require.Equal(t, int64(8), job.Outcome.DecisionConfig.Revision)
+	require.Equal(t, int64(4), job.Outcome.JobID)
+	require.Equal(t, 2, job.Outcome.AuditRound)
+	require.EqualValues(t, 125, *job.Outcome.DurationMS)
+	require.Equal(t, .5, *job.Outcome.DecisionConfig.ReviewThreshold)
+	require.Equal(t, .95, *job.Outcome.Models[0].MaxSegmentConfidence)
+	require.True(t, job.Outcome.Models[0].Reused)
+	require.Nil(t, job.FullInput)
+	require.Empty(t, job.Config.AuditPrompt)
+	require.Empty(t, job.Outcome.Models[0].Segments)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestJobListDecisionAndModelFiltersUseOnlyLatestOutcome(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	mock.ExpectQuery(`SELECT COUNT\(\*\).*o.decision=\$1.*json_array_elements\(o.model_results::json\)`).
+		WithArgs(DecisionBlock, "node-a").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery(`SELECT row_to_json\(record\).*o.decision=\$1.*json_array_elements\(o.model_results::json\)`).
+		WithArgs(DecisionBlock, "node-a", 20, 0).WillReturnRows(sqlmock.NewRows([]string{"record"}))
+	page, err := NewRepository(db).ListJobs(context.Background(), Filter{Decision: DecisionBlock, ModelID: "node-a"}, 1, 20)
+	require.NoError(t, err)
+	require.Empty(t, page.Items)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

@@ -12,6 +12,12 @@ const SettingKey = "third_party_prompt_audit_config"
 // MaxEvaluationAttempts 是每个新任务的模型评估预算，结果补写不消耗该预算。
 const MaxEvaluationAttempts = 3
 
+// ReuseModeAllow 和 ReuseModeForce 控制当前审核轮次是否读取历史及并发缓存。
+const (
+	ReuseModeAllow = "allow"
+	ReuseModeForce = "force"
+)
+
 type Decision string
 
 const (
@@ -33,18 +39,19 @@ type Job struct {
 	CaptureID          *int64          `json:"capture_id"`
 	ID                 int64           `json:"id"`
 	CaptureKey         string          `json:"-"`
-	RunKind            string          `json:"run_kind"`
 	CurrentRunKind     string          `json:"current_run_kind"`
 	AuditRound         int             `json:"audit_round"`
 	CurrentRequestedBy *int64          `json:"current_requested_by"`
-	SourceJobID        *int64          `json:"source_job_id"`
-	RequestedBy        *int64          `json:"requested_by"`
+	ReuseMode          string          `json:"reuse_mode"`
+	DisableCounted     bool            `json:"disable_counted"`
 	UserID             int64           `json:"user_id"`
 	APIKeyID           *int64          `json:"api_key_id"`
 	GroupID            *int64          `json:"group_id"`
 	RequestID          string          `json:"request_id"`
 	ConversationKey    string          `json:"conversation_key,omitempty"`
 	Identity           Identity        `json:"identity"`
+	DisplayUsername    string          `json:"display_username"`
+	DisplayEmail       string          `json:"display_email"`
 	Platform           string          `json:"platform"`
 	Protocol           string          `json:"protocol"`
 	IngressStage       string          `json:"ingress_stage"`
@@ -75,6 +82,8 @@ type Job struct {
 	StartedAt          *time.Time      `json:"started_at"`
 	FinishedAt         *time.Time      `json:"finished_at"`
 	DurationMS         *int64          `json:"duration_ms"`
+	Outcome            *OutcomeView    `json:"outcome,omitempty"`
+	OriginalDecision   *Decision       `json:"original_decision,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
 	UpdatedAt          time.Time       `json:"updated_at"`
 }
@@ -82,9 +91,6 @@ type Job struct {
 func (j *Job) auditRunKind() string {
 	if j.CurrentRunKind != "" {
 		return j.CurrentRunKind
-	}
-	if j.RunKind == "reaudit" {
-		return "reaudit"
 	}
 	return "request"
 }
@@ -101,10 +107,10 @@ type ReuseMetrics struct {
 
 type SegmentResult struct {
 	ID              int64  `json:"id"`
-	UserID          int64  `json:"user_id"`
+	UserID          int64  `json:"-"`
 	ModelID         string `json:"model_id"`
 	AuditKey        string `json:"audit_key"`
-	SourceAttemptID int64  `json:"source_attempt_id"`
+	SourceAttemptID int64  `json:"-"`
 	SourceRole      string `json:"source_role"`
 	PolicyRole      string `json:"policy_role"`
 	TurnScope       string `json:"turn_scope"`
@@ -149,25 +155,13 @@ type Outcome struct {
 	AuditRound  int            `json:"audit_round"`
 	RunKind     string         `json:"run_kind"`
 	RequestedBy *int64         `json:"requested_by"`
+	ReuseMode   string         `json:"reuse_mode"`
 	Config      ConfigSnapshot `json:"config_snapshot"`
 	Evaluation
 	StartedAt  *time.Time `json:"started_at"`
 	FinishedAt *time.Time `json:"finished_at"`
 	DurationMS *int64     `json:"duration_ms"`
 	CreatedAt  time.Time  `json:"created_at"`
-}
-
-type Event struct {
-	ReauditStatus     string       `json:"reaudit_status"`
-	ID                int64        `json:"id"`
-	JobID             int64        `json:"job_id"`
-	OriginalOutcomeID *int64       `json:"original_outcome_id"`
-	LatestOutcomeID   int64        `json:"latest_outcome_id"`
-	Job               *Job         `json:"job,omitempty"`
-	Latest            *OutcomeView `json:"latest,omitempty"`
-	Original          *OutcomeView `json:"original,omitempty"`
-	CreatedAt         time.Time    `json:"created_at"`
-	UpdatedAt         time.Time    `json:"updated_at"`
 }
 
 type ModelAttempt struct {
@@ -231,15 +225,15 @@ type Page[T any] struct {
 }
 
 type ReauditRequest struct {
-	Source string `json:"source" binding:"required,oneof=jobs events"`
-	Filter Filter `json:"filter"`
+	ReuseMode string `json:"reuse_mode" binding:"omitempty,oneof=allow force"`
+	Filter    Filter `json:"filter"`
 }
 
 type ReauditItem struct {
-	SourceJobID int64  `json:"source_job_id"`
-	JobID       *int64 `json:"job_id"`
-	Status      string `json:"status"`
-	Reason      string `json:"reason"`
+	JobID  int64  `json:"job_id"`
+	Status string `json:"status"`
+	Reason string `json:"reason"`
+	userID int64
 }
 
 type ReauditResult struct {

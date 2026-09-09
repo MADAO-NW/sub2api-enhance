@@ -8,6 +8,7 @@ import { useAuditLabels } from './labels'
 const emit = defineEmits<{ (event: 'inspect-jobs', filter: AuditFilter): void }>()
 const props = withDefaults(defineProps<{ refreshKey?: number }>(), { refreshKey: 0 })
 const label = useAuditLabels()
+const stockLabel = (title: string, status: string) => title === 'forwardingStock' ? label(`forwarding_${status}`) : label(status)
 const from = ref(toLocalInput(new Date(Date.now() - 86400000)))
 const to = ref(toLocalInput(new Date()))
 const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
@@ -15,10 +16,11 @@ const mode = ref(''), modelID = ref(''), stage = ref('')
 const loading = ref(false), error = ref('')
 const stats = ref<AuditStats | null>(null), runtime = ref<AuditRuntime | null>(null)
 const states = ['queued', 'processing', 'retry', 'done', 'failed', 'skipped']
+const forwardingStates = ['not_forwarded', 'started', 'response_started', 'complete', 'blocked', 'unknown']
 const summaries = computed(() => stats.value ? [
   { title: 'formal', hint: 'completedHint', values: stats.value.formal, keys: ['pass', 'review', 'block', 'partial_failure'] },
   { title: 'reaudit', hint: 'completedHint', values: stats.value.reaudit, keys: ['pass', 'review', 'block', 'changed'] },
-  { title: 'currentEvents', hint: 'eventsHint', values: stats.value.events, keys: ['pass', 'review', 'block'] },
+  { title: 'currentDecisions', hint: 'currentDecisionsHint', values: stats.value.current_decisions, keys: ['pass', 'review', 'block'] },
   { title: 'gateway', hint: 'gatewayHint', values: stats.value.gateway, keys: ['continued', 'blocked_here', 'blocked_elsewhere', 'unavailable', 'not_observed'] },
   { title: 'actionWindow', hint: 'completedHint', values: stats.value.actions, keys: ['warning', 'disable', 'counter_reset'] }
 ] : [])
@@ -52,7 +54,7 @@ watch(() => props.refreshKey, () => { void refresh() })
     </form>
     <p v-if="error" class="rounded-xl bg-red-50 p-4 text-red-700 dark:bg-red-950/30 dark:text-red-300" role="alert">{{ error }}</p>
     <template v-if="stats">
-      <section class="card grid gap-5 md:grid-cols-3"><div v-for="(values,title) in {captureStock:stats.capture_stock,forwardingStock:stats.forwarding_stock,accountExecutionStock:stats.action_execution_stock}" :key="title"><h2 class="font-semibold">{{label(title)}}</h2><p class="my-2 text-xs text-gray-500">{{label('allTimeStock')}}</p><p v-for="(count,status) in values" :key="status" class="text-sm">{{label(status)}} · {{count}}</p></div></section>
+      <section class="card grid gap-5 md:grid-cols-3"><div v-for="(values,title) in {captureStock:stats.capture_stock,forwardingStock:stats.forwarding_stock,accountExecutionStock:stats.action_execution_stock}" :key="title"><h2 class="font-semibold">{{label(title)}}</h2><p class="my-2 text-xs text-gray-500">{{ label(title === 'forwardingStock' ? 'forwardingStockHint' : 'allTimeStock') }}</p><p v-for="(count,status) in values" :key="status" class="text-sm">{{ stockLabel(title, status) }} · {{count}}</p><details v-if="title === 'forwardingStock'" class="mt-3 text-xs"><summary class="cursor-pointer text-primary-700 dark:text-primary-400">{{ label('forwardingLegend') }}</summary><p v-for="status in forwardingStates" :key="status" class="mt-2"><strong>{{ stockLabel(title, status) }}</strong>：{{ label(`forwarding_${status}_hint`) }}</p></details></div></section>
       <p class="text-sm text-gray-500 dark:text-dark-400">{{ formatTime(stats.from) }} — {{ formatTime(stats.to) }} · {{ stats.timezone }} · {{ label('mode') }}: {{ label(stats.mode || 'all') }} · {{ label('asOf') }}: {{ formatTime(stats.as_of) }}</p>
       <section class="card p-5">
         <h2 class="text-lg font-semibold">{{ label('stock') }}</h2><p class="my-2 text-sm text-gray-500 dark:text-dark-400">{{ label('stockHint') }}</p>

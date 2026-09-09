@@ -31,6 +31,8 @@ type Capture struct {
 	SnapshotStatus   string            `json:"snapshot_status"`
 	Metadata         map[string]string `json:"metadata"`
 	Identity         sub2api.Identity  `json:"identity"`
+	DisplayUsername  string            `json:"display_username"`
+	DisplayEmail     string            `json:"display_email"`
 	Eligibility      string            `json:"eligibility_status"`
 	ProcessingStatus string            `json:"processing_status"`
 	ForwardingStatus string            `json:"forwarding_status"`
@@ -134,7 +136,10 @@ func (s *CaptureStore) List(ctx context.Context, page, size int, status string) 
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM sub2api_enhance.captures WHERE ($1='' OR processing_status=$1)`, status).Scan(&out.Total); err != nil {
 		return out, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,capture_key,COALESCE(conversation_key,''),transport,protocol,body_format,body_sha256,body_bytes,snapshot_status,eligibility_status,processing_status,forwarding_status,last_error_message,created_at FROM sub2api_enhance.captures WHERE ($1='' OR processing_status=$1) ORDER BY id DESC LIMIT $2 OFFSET $3`, status, size, (page-1)*size)
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.capture_key,COALESCE(c.conversation_key,''),c.transport,c.protocol,c.body_format,c.body_sha256,c.body_bytes,c.snapshot_status,c.eligibility_status,c.processing_status,c.forwarding_status,c.last_error_message,c.created_at,
+ COALESCE(NULLIF(c.identity_snapshot::json->>'username',''),u.username,''),COALESCE(NULLIF(c.identity_snapshot::json->>'user_email',''),u.email,''),COALESCE(c.user_id,0)
+ FROM sub2api_enhance.captures c LEFT JOIN public.users u ON u.id=c.user_id AND u.deleted_at IS NULL
+ WHERE ($1='' OR c.processing_status=$1) ORDER BY c.id DESC LIMIT $2 OFFSET $3`, status, size, (page-1)*size)
 	if err != nil {
 		return out, err
 	}
@@ -142,7 +147,7 @@ func (s *CaptureStore) List(ctx context.Context, page, size int, status string) 
 	for rows.Next() {
 		var c Capture
 		var message *string
-		if err := rows.Scan(&c.ID, &c.Key, &c.ConversationKey, &c.Transport, &c.Protocol, &c.Format, &c.SHA256, &c.Bytes, &c.SnapshotStatus, &c.Eligibility, &c.ProcessingStatus, &c.ForwardingStatus, &message, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Key, &c.ConversationKey, &c.Transport, &c.Protocol, &c.Format, &c.SHA256, &c.Bytes, &c.SnapshotStatus, &c.Eligibility, &c.ProcessingStatus, &c.ForwardingStatus, &message, &c.CreatedAt, &c.DisplayUsername, &c.DisplayEmail, &c.Identity.UserID); err != nil {
 			return out, err
 		}
 		if message != nil {

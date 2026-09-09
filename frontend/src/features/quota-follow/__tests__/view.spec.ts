@@ -16,6 +16,7 @@ beforeEach(()=>{
 describe('quota follow page',()=>{
  it('shows boundaries and keeps configuration drafts when refreshing',async()=>{
   const wrapper=mount(QuotaFollowView);await flushPromises();expect(wrapper.get('[data-test="boundary"]').text()).toBe('boundary')
+  expect(wrapper.classes()).toContain('enhance-page')
   const enabled=wrapper.get('[data-test="enabled"]');await enabled.setValue(true)
   await wrapper.findAll('button').find(b=>b.text()==='refresh')!.trigger('click');await flushPromises()
   expect((enabled.element as HTMLInputElement).checked).toBe(true);expect(mocks.config).toHaveBeenCalledTimes(1);wrapper.unmount()

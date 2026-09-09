@@ -31,6 +31,7 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 	require.Equal(t, 0.8, *defaults.BlockThreshold)
 	require.Equal(t, WarningConfig{Window: 10, Limit: 3}, defaults.Warning)
 	require.Equal(t, DisableConfig{Limit: 5}, defaults.Disable)
+	require.Empty(t, defaults.UserRules)
 	require.Equal(t, "current_turn", defaults.AuditScope)
 	require.Equal(t, 0.5, publicDefaults.ReviewThreshold)
 	require.Equal(t, 0.8, publicDefaults.BlockThreshold)
@@ -47,6 +48,85 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 		model.TimeoutMS = timeout
 		require.Error(t, validateModel(model))
 	}
+}
+
+func TestUserRuleOverridesOnlyTheSelectedUsersDecisionAndActions(t *testing.T) {
+	config := testConfig()
+	config.UserRules = []UserRuleConfig{{UserID: 7, Mode: "blocking", ReviewThreshold: 0.2, BlockThreshold: 0.4, Aggregation: "all_block", Warning: WarningConfig{Enabled: true, Window: 5, Limit: 2}, Disable: DisableConfig{Enabled: true, Limit: 9}}}
+	require.NoError(t, validateConfig(config, true))
+	effective := effectiveConfigForUser(config, 7)
+	require.Equal(t, 0.2, *effective.ReviewThreshold)
+	require.Equal(t, 0.4, *effective.BlockThreshold)
+	require.Equal(t, "blocking", effective.Mode)
+	require.Equal(t, "all_block", effective.Aggregation)
+	require.Equal(t, WarningConfig{Enabled: true, Window: 5, Limit: 2}, effective.Warning)
+	require.Equal(t, DisableConfig{Enabled: true, Limit: 9}, effective.Disable)
+	require.Nil(t, effective.UserRules)
+	inherited := effectiveConfigForUser(config, 8)
+	require.Equal(t, *config.BlockThreshold, *inherited.BlockThreshold)
+	require.Equal(t, config.Warning, inherited.Warning)
+	require.Equal(t, "async", inherited.Mode)
+	config.Mode = "blocking"
+	config.UserRules[0].Mode = "async"
+	require.Equal(t, "async", effectiveConfigForUser(config, 7).Mode)
+	require.Equal(t, "blocking", effectiveConfigForUser(config, 8).Mode)
+}
+
+func TestPerUserModeRespectsGlobalOffAndFreezesEvaluationCredentials(t *testing.T) {
+	config := testConfig()
+	config.UserRules = []UserRuleConfig{{UserID: 7, Mode: "blocking", ReviewThreshold: 0.2, BlockThreshold: 0.4, Aggregation: "any_block", Warning: WarningConfig{Window: 10, Limit: 3}, Disable: DisableConfig{Limit: 5}}}
+	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config, Revision: 4}, Keys: map[string]string{"test-node": "first-key"}}}
+	require.Equal(t, "blocking", manager.EffectiveModeForUser(7))
+	require.Equal(t, "async", manager.EffectiveModeForUser(8))
+	snapshot, keys, err := manager.EvaluationBinding(7)
+	require.NoError(t, err)
+	require.Equal(t, "blocking", snapshot.Mode)
+	require.Equal(t, int64(4), snapshot.Revision)
+	require.Equal(t, "first-key", keys["test-node"])
+	manager.active.Keys["test-node"] = "second-key"
+	require.Equal(t, "first-key", keys["test-node"])
+	manager.active.Stored.Mode = "off"
+	require.Equal(t, "off", manager.EffectiveModeForUser(7))
+	_, _, err = manager.EvaluationBinding(7)
+	require.ErrorIs(t, err, ErrAuditPaused)
+}
+
+func TestEvaluationBindingUsesLatestNodeGeneration(t *testing.T) {
+	oldConfig := testConfig()
+	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: oldConfig, Revision: 3}, Keys: map[string]string{"test-node": "old-key"}}}
+	newConfig := testConfig()
+	newConfig.Models = []ModelConfig{{ID: "replacement", Name: "replacement-model", Model: "replacement-model", BaseURL: "https://replacement.example.invalid", TimeoutMS: 2000, Enabled: true, Parameters: map[string]any{"reasoning_effort": "none"}}}
+	manager.active = &activeConfig{Stored: storedConfig{Config: newConfig, Revision: 4}, Keys: map[string]string{"replacement": "new-key"}}
+	snapshot, keys, err := manager.EvaluationBinding(8)
+	require.NoError(t, err)
+	require.Equal(t, int64(4), snapshot.Revision)
+	require.Len(t, snapshot.Models, 1)
+	require.Equal(t, "replacement", snapshot.Models[0].ID)
+	require.Equal(t, "new-key", keys["replacement"])
+	require.NotContains(t, keys, "test-node")
+}
+
+func TestUserWarningRuleHashDoesNotResetOtherUsers(t *testing.T) {
+	config := testConfig()
+	globalHash, err := warningRuleHash(config, 5, 8)
+	require.NoError(t, err)
+	config.UserRules = []UserRuleConfig{{UserID: 7, Mode: "blocking", ReviewThreshold: 0.2, BlockThreshold: 0.4, Aggregation: "any_block", Warning: WarningConfig{Enabled: true, Window: 5, Limit: 2}, Disable: DisableConfig{Limit: 9}}}
+	otherHash, err := warningRuleHash(config, 5, 8)
+	require.NoError(t, err)
+	require.Equal(t, globalHash, otherHash)
+	userHash, err := warningRuleHash(config, 5, 7)
+	require.NoError(t, err)
+	require.NotEqual(t, globalHash, userHash)
+}
+
+func TestUserRulesRequireUniqueUsersAndCompleteValidRules(t *testing.T) {
+	config := testConfig()
+	rule := UserRuleConfig{UserID: 7, Mode: "async", ReviewThreshold: 0.2, BlockThreshold: 0.4, Aggregation: "any_block", Warning: WarningConfig{Window: 3, Limit: 1}, Disable: DisableConfig{Limit: 2}}
+	config.UserRules = []UserRuleConfig{rule, rule}
+	require.ErrorContains(t, validateConfig(config, true), "不重复")
+	config.UserRules = []UserRuleConfig{rule}
+	config.UserRules[0].ReviewThreshold = 0.5
+	require.ErrorContains(t, validateConfig(config, true), "风险阈值")
 }
 
 func TestEmbeddedDefaultPolicyUsesDocumentBodyWithoutCodeFence(t *testing.T) {
@@ -77,6 +157,23 @@ func TestExcludedUserBypassesAudit(t *testing.T) {
 	config.ExcludedUserIDs = []int64{7}
 	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config}}}
 	service := &Service{config: manager}
+	require.Nil(t, service.Check(context.Background(), IntakeRequest{UserID: 7, Provider: "openai"}))
+}
+
+func TestUserModeIsChosenAtIntakeAndExclusionStillWins(t *testing.T) {
+	config := testConfig()
+	config.UserRules = []UserRuleConfig{{UserID: 7, Mode: "blocking", ReviewThreshold: 0.5, BlockThreshold: 0.8, Aggregation: "any_block", Warning: WarningConfig{Window: 10, Limit: 3}, Disable: DisableConfig{Limit: 5}}}
+	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config}}}
+	service := &Service{config: manager, closing: true, metrics: NewRuntimeMetrics()}
+	decision := service.Check(context.Background(), IntakeRequest{UserID: 7, Provider: "openai"})
+	require.NotNil(t, decision)
+	require.Equal(t, "blocking", decision.Mode)
+	decision = service.Check(context.Background(), IntakeRequest{UserID: 7, Provider: "openai", Background: true})
+	require.NotNil(t, decision)
+	require.Equal(t, "async", decision.Mode)
+	config.ExcludedUserIDs = []int64{7}
+	manager.active.Stored.Config = config
+	require.Equal(t, "off", manager.EffectiveModeForUser(7))
 	require.Nil(t, service.Check(context.Background(), IntakeRequest{UserID: 7, Provider: "openai"}))
 }
 
@@ -117,7 +214,7 @@ func TestHistoricalSnapshotsAreDisplayOnlyAndNewSnapshotsStayClean(t *testing.T)
 		require.NoError(t, err)
 		require.JSONEq(t, old, string(display))
 		// 没有仓储和客户端；旧快照必须在调用或缓存读取前失败。
-		_, failure := (&Evaluator{}).Evaluate(context.Background(), &Job{Config: historical})
+		_, failure := (&Evaluator{}).Evaluate(context.Background(), &Job{Config: historical}, nil)
 		require.Equal(t, "audit_snapshot_requires_reaudit", failure.Code)
 		require.False(t, failure.Retryable)
 	}

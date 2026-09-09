@@ -29,6 +29,7 @@ type captureStore interface {
 }
 type auditor interface {
 	Mode() string
+	ModeForUser(int64) string
 	AuditCapture(context.Context, *audit.Capture) (*audit.IntakeDecision, error)
 	ObserveGateway(context.Context, *audit.IntakeDecision, audit.IngressDecision, time.Duration)
 }
@@ -245,6 +246,7 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 	identityCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	c.Identity, err = p.identity.Resolve(identityCtx, r, clientIP)
 	cancel()
+	c.Metadata["mode"] = p.audit.ModeForUser(c.Identity.UserID)
 	if err != nil {
 		c.Error = c.Identity.Reason
 	}
@@ -279,8 +281,12 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 	}
 }
 func (p *Proxy) evaluate(ctx context.Context, c *audit.Capture) *audit.IntakeDecision {
+	mode := c.Metadata["mode"]
+	if mode == "" {
+		mode = p.audit.ModeForUser(c.Identity.UserID)
+	}
 	if c.Identity.Eligibility != "passed" || c.Protocol == "unsupported" {
-		if p.audit.Mode() == "blocking" {
+		if mode == "blocking" {
 			return &audit.IntakeDecision{Mode: "blocking", Kind: audit.IngressDecisionUnavailable, ErrorCode: "eligibility_unknown"}
 		}
 		return nil
@@ -291,7 +297,7 @@ func (p *Proxy) evaluate(ctx context.Context, c *audit.Capture) *audit.IntakeDec
 	if err != nil {
 		status = "failed"
 		message = err.Error()
-		if p.audit.Mode() == "blocking" {
+		if mode == "blocking" {
 			result = &audit.IntakeDecision{Mode: "blocking", Kind: audit.IngressDecisionUnavailable, ErrorCode: "input_parse_failed"}
 		}
 	} else if result != nil && result.JobID == 0 {

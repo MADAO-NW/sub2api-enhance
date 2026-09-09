@@ -29,22 +29,23 @@ type Repository struct{ db *sql.DB }
 func NewRepository(db *sql.DB) *Repository { return &Repository{db: db} }
 
 // jobColumns 仅列举列表需要的字段，全文通过单独投影读取，避免列表展开大字段。
-const jobColumns = `COALESCE(capture.created_at,j.created_at) AS captured_at,COALESCE(j.capture_id,original.capture_id) AS capture_id,j.id,j.capture_key,j.run_kind,j.source_job_id,j.requested_by,j.user_id,j.api_key_id,j.group_id,
-j.request_id,j.conversation_key,j.identity_snapshot,j.platform,j.protocol,j.ingress_stage,j.requested_model,j.execution_mode,j.audit_round,j.current_run_kind,j.current_requested_by,
-j.config_revision,j.snapshot_status,j.input_hash,j.target_hash,j.evaluation_hash,j.status,j.attempts,j.max_attempts,
+const jobColumns = `COALESCE(capture.created_at,j.created_at) AS captured_at,j.capture_id,j.id,j.capture_key,j.user_id,j.api_key_id,j.group_id,
+j.request_id,j.conversation_key,j.identity_snapshot,COALESCE(NULLIF(j.identity_snapshot::json->>'username',''),display_user.username,'') AS display_username,
+COALESCE(NULLIF(j.identity_snapshot::json->>'user_email',''),display_user.email,'') AS display_email,j.platform,j.protocol,j.ingress_stage,j.requested_model,j.execution_mode,j.audit_round,j.current_run_kind,j.current_requested_by,
+j.reuse_mode,j.disable_counted,j.config_revision,j.snapshot_status,j.input_hash,j.target_hash,j.evaluation_hash,j.status,j.attempts,j.max_attempts,
 j.claim_generation,j.lease_until,j.next_attempt_at,j.reuse_metrics,j.failure_stage,j.last_error_code,j.last_error_message,
 j.gateway_result,j.gateway_completed_at,j.gateway_duration_ms,j.started_at,j.finished_at,
 CASE WHEN j.started_at IS NULL THEN NULL ELSE GREATEST(0,extract(epoch FROM (COALESCE(j.finished_at,clock_timestamp())-j.started_at))*1000)::bigint END AS duration_ms,j.created_at,j.updated_at`
 
-// jobInputJoins 为任务投影补齐原始任务与唯一采集记录。
-const jobInputJoins = ` LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs original ON original.id=j.source_job_id LEFT JOIN sub2api_enhance.captures capture ON capture.id=COALESCE(j.capture_id,original.capture_id) `
+// jobInputJoins 为任务投影补齐唯一采集记录和当前用户展示信息。
+const jobInputJoins = ` LEFT JOIN sub2api_enhance.captures capture ON capture.id=j.capture_id LEFT JOIN public.users display_user ON display_user.id=j.user_id AND display_user.deleted_at IS NULL `
 
-// jobSource 使复核任务直接读取正式任务的唯一输入，避免复制全文和形成引用链。
+// jobSource 是所有任务查询共享的根任务来源。
 const jobSource = ` FROM sub2api_enhance.third_party_prompt_audit_jobs j` + jobInputJoins
 
 func jobProjection(full bool) string {
 	if full {
-		return jobColumns + `,j.config_snapshot,COALESCE(j.full_input_snapshot,original.full_input_snapshot) AS full_input_snapshot,j.input_manifest,j.result_checkpoint`
+		return jobColumns + `,j.config_snapshot,j.full_input_snapshot,j.input_manifest,j.result_checkpoint`
 	}
 	return jobColumns + `,json_build_object('revision',j.config_revision,'review_threshold',j.config_snapshot::json->'review_threshold','block_threshold',j.config_snapshot::json->'block_threshold') AS decision_config`
 }
@@ -111,20 +112,6 @@ func (r *Repository) GetJob(ctx context.Context, id int64, full bool) (*Job, err
 	if err != nil {
 		return nil, err
 	}
-	if full && job.RunKind == "reaudit" && job.CaptureID != nil {
-		capture, err := NewCaptureStore(r.db).Get(ctx, *job.CaptureID)
-		if err != nil {
-			return nil, err
-		}
-		request, err := captureRequest(capture)
-		if err != nil {
-			return nil, err
-		}
-		job.FullInput, err = CaptureInput(request.Protocol, request.Body)
-		if err != nil {
-			return nil, err
-		}
-	}
 	return job, nil
 }
 
@@ -138,17 +125,14 @@ func (r *Repository) CreateJob(ctx context.Context, job *Job) (*Job, bool, error
 	if err != nil {
 		return nil, false, err
 	}
-	var input any
-	if job.RunKind == "request" {
-		if job.FullInput == nil {
-			return nil, false, errors.New("正式任务缺少输入快照")
-		}
-		raw, err := json.Marshal(job.FullInput)
-		if err != nil {
-			return nil, false, err
-		}
-		input = string(raw)
+	if job.FullInput == nil {
+		return nil, false, errors.New("审核任务缺少输入快照")
 	}
+	raw, err := json.Marshal(job.FullInput)
+	if err != nil {
+		return nil, false, err
+	}
+	input := string(raw)
 	manifest, err := json.Marshal(job.Manifest)
 	if err != nil {
 		return nil, false, err
@@ -159,27 +143,30 @@ func (r *Repository) CreateJob(ctx context.Context, job *Job) (*Job, bool, error
 	if job.MaxAttempts == 0 {
 		job.MaxAttempts = MaxEvaluationAttempts
 	}
+	if job.ReuseMode == "" {
+		job.ReuseMode = ReuseModeAllow
+	}
 	if job.Status == "processing" {
 		job.Attempts = 0
 		job.ClaimGeneration = 1
 	}
 	err = r.db.QueryRowContext(ctx, `
 INSERT INTO sub2api_enhance.third_party_prompt_audit_jobs
-(capture_key,run_kind,source_job_id,requested_by,user_id,api_key_id,group_id,request_id,conversation_key,identity_snapshot,
+(capture_key,user_id,api_key_id,group_id,request_id,conversation_key,identity_snapshot,
  platform,protocol,ingress_stage,requested_model,execution_mode,config_revision,config_snapshot,full_input_snapshot,
- snapshot_status,input_manifest,input_hash,target_hash,evaluation_hash,status,attempts,max_attempts,claim_generation,
+ snapshot_status,input_manifest,input_hash,target_hash,evaluation_hash,status,attempts,max_attempts,claim_generation,reuse_mode,
  lease_until,started_at,finished_at,failure_stage,last_error_code,last_error_message,capture_id)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,
- CASE WHEN $24='processing' THEN clock_timestamp()+$28::interval END,
- CASE WHEN $24='processing' THEN clock_timestamp() END,
- CASE WHEN $24 IN ('failed','skipped') THEN clock_timestamp() END,$29,$30,$31,$32)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,
+ CASE WHEN $21='processing' THEN clock_timestamp()+$26::interval END,
+ CASE WHEN $21='processing' THEN clock_timestamp() END,
+ CASE WHEN $21 IN ('failed','skipped') THEN clock_timestamp() END,$27,$28,$29,$30)
 ON CONFLICT (capture_key) DO NOTHING
 RETURNING id,created_at,updated_at,lease_until,started_at,finished_at,next_attempt_at`,
-		job.CaptureKey, job.RunKind, job.SourceJobID, job.RequestedBy, job.UserID, job.APIKeyID, job.GroupID,
-		job.RequestID, nullIfEmpty(job.ConversationKey), string(identity), job.Platform, job.Protocol, job.IngressStage, encodeStoredText(job.RequestedModel),
+		job.CaptureKey, job.UserID, job.APIKeyID, job.GroupID, job.RequestID, nullIfEmpty(job.ConversationKey), string(identity),
+		job.Platform, job.Protocol, job.IngressStage, encodeStoredText(job.RequestedModel),
 		job.ExecutionMode, job.Config.Revision, string(config), input, job.SnapshotStatus, string(manifest),
 		job.InputHash, job.TargetHash, job.EvaluationHash, job.Status, job.Attempts, job.MaxAttempts,
-		job.ClaimGeneration, interval(leaseDuration), job.FailureStage, job.LastErrorCode, encodeStoredText(job.LastErrorMessage), job.CaptureID,
+		job.ClaimGeneration, job.ReuseMode, interval(leaseDuration), job.FailureStage, job.LastErrorCode, encodeStoredText(job.LastErrorMessage), job.CaptureID,
 	).Scan(&job.ID, &job.CreatedAt, &job.UpdatedAt, &job.LeaseUntil, &job.StartedAt, &job.FinishedAt, &job.NextAttemptAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		var id int64
@@ -333,8 +320,26 @@ func (r *Repository) BeginForegroundEvaluation(ctx context.Context, job *Job) er
 	return nil
 }
 
+// BindEvaluationConfig 在模型调用前以当前租约冻结本次评估配置，原文快照保持不变。
+func (r *Repository) BindEvaluationConfig(ctx context.Context, job *Job, snapshot ConfigSnapshot) error {
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+	result, err := r.db.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs SET config_revision=$3,config_snapshot=$4,
+ input_manifest=NULL,input_hash=NULL,target_hash=NULL,evaluation_hash=NULL,updated_at=clock_timestamp()
+ WHERE id=$1 AND claim_generation=$2 AND status='processing' AND lease_until>clock_timestamp()`, job.ID, job.ClaimGeneration, snapshot.Revision, string(raw))
+	if err := checkLeaseUpdate(result, err); err != nil {
+		return err
+	}
+	job.Config = snapshot
+	job.Manifest = nil
+	job.InputHash, job.TargetHash, job.EvaluationHash = "", "", ""
+	return nil
+}
+
 func (r *Repository) RecordGateway(ctx context.Context, jobID int64, result string, duration time.Duration) error {
-	_, err := r.db.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs SET gateway_result=$2,gateway_completed_at=clock_timestamp(),gateway_duration_ms=$3,updated_at=clock_timestamp() WHERE id=$1 AND gateway_result='not_observed' AND run_kind='request'`, jobID, result, duration.Milliseconds())
+	_, err := r.db.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs SET gateway_result=$2,gateway_completed_at=clock_timestamp(),gateway_duration_ms=$3,updated_at=clock_timestamp() WHERE id=$1 AND gateway_result='not_observed'`, jobID, result, duration.Milliseconds())
 	return err
 }
 

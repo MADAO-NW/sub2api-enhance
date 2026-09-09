@@ -60,10 +60,10 @@ type Action struct {
 	UpdatedAt          time.Time        `json:"updated_at"`
 }
 
-// decideEnforcement 同时返回提醒和停用动作；管理员只保留请求级审核及阻断通知。
+// decideEnforcement 同时返回提醒和停用动作；原版账号停用仍只适用于普通用户。
 func decideEnforcement(state EnforcementState, user EnforcementUser, eligible, triggerBlock bool, config Config, window []Decision) (EnforcementState, []string) {
 	next := state
-	if !eligible || user.Role != "user" {
+	if !eligible {
 		return next, nil
 	}
 	actions := make([]string, 0, 2)
@@ -81,7 +81,7 @@ func decideEnforcement(state EnforcementState, user EnforcementUser, eligible, t
 			actions = append(actions, "warning")
 		}
 	}
-	if config.Disable.Enabled && user.Status == "active" && triggerBlock && next.DisableViolationCount >= config.Disable.Limit {
+	if user.Role == "user" && config.Disable.Enabled && user.Status == "active" && triggerBlock && next.DisableViolationCount >= config.Disable.Limit {
 		actions = append(actions, "disable")
 	}
 	return next, actions

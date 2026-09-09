@@ -251,20 +251,6 @@ func (h *AdminHandler) ListJobs(c *gin.Context) {
 	response.Success(c, result)
 }
 
-func (h *AdminHandler) ListEvents(c *gin.Context) {
-	filter, page, size, err := listQuery(c)
-	if err != nil {
-		response.BadRequest(c, err.Error())
-		return
-	}
-	result, err := h.repo.ListEvents(c.Request.Context(), filter, page, size)
-	if err != nil {
-		respondError(c, err)
-		return
-	}
-	response.Success(c, result)
-}
-
 func recordID(c *gin.Context) (int64, bool) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
@@ -280,19 +266,6 @@ func (h *AdminHandler) GetJob(c *gin.Context) {
 		return
 	}
 	result, err := h.repo.JobDetail(c.Request.Context(), id)
-	if err != nil {
-		respondError(c, err)
-		return
-	}
-	response.Success(c, result)
-}
-
-func (h *AdminHandler) GetEvent(c *gin.Context) {
-	id, ok := recordID(c)
-	if !ok {
-		return
-	}
-	result, err := h.repo.EventDetail(c.Request.Context(), id)
 	if err != nil {
 		respondError(c, err)
 		return

@@ -2,9 +2,9 @@ import type { AuditConfig, ConfigUpdate, KeyUpdate, SavedConfig } from '@/api/ad
 
 export function editableConfig(value: SavedConfig): AuditConfig {
   const { mode, audit_scope, platforms, all_groups, group_ids, excluded_user_ids, audit_prompt, models, review_threshold, block_threshold,
-    aggregation, worker_count, store_pass_events, warning, disable, admin_email } = value
+	aggregation, worker_count, warning, disable, user_rules, admin_email } = value
   return JSON.parse(JSON.stringify({ mode, audit_scope, platforms: platforms ?? [], all_groups, group_ids: group_ids ?? [], excluded_user_ids: excluded_user_ids ?? [], audit_prompt,
-    models: models ?? [], review_threshold, block_threshold, aggregation, worker_count, store_pass_events, warning, disable, admin_email })) as AuditConfig
+	models: models ?? [], review_threshold, block_threshold, aggregation, worker_count, warning, disable, user_rules: user_rules ?? [], admin_email })) as AuditConfig
 }
 
 export function configUpdate(config: AuditConfig, revision: number, keys: Record<string, KeyUpdate>): ConfigUpdate {

@@ -18,7 +18,7 @@ func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *request
 		return
 	}
 	identity, err := p.identity.Resolve(r.Context(), r, state.clientIP)
-	if err != nil && p.audit.Mode() == "blocking" {
+	if err != nil && p.audit.ModeForUser(identity.UserID) == "blocking" {
 		writeError(w, "responses", 503, "identity_unavailable", "身份暂不可验证")
 		return
 	}
@@ -112,7 +112,7 @@ func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *request
 		}
 		sequence++
 		seq := sequence
-		c := &audit.Capture{Key: uuid.NewString(), ConversationKey: connectionKey, Transport: "websocket", ConnectionKey: &connectionKey, Sequence: &seq, Protocol: "responses_websocket", Format: "websocket_message", Raw: raw, SnapshotStatus: "complete", Identity: identity, Metadata: map[string]string{"path": r.URL.Path, "mode": p.audit.Mode(), "client_ip": state.clientIP, "content_type": "application/json"}}
+		c := &audit.Capture{Key: uuid.NewString(), ConversationKey: connectionKey, Transport: "websocket", ConnectionKey: &connectionKey, Sequence: &seq, Protocol: "responses_websocket", Format: "websocket_message", Raw: raw, SnapshotStatus: "complete", Identity: identity, Metadata: map[string]string{"path": r.URL.Path, "mode": p.audit.ModeForUser(identity.UserID), "client_ip": state.clientIP, "content_type": "application/json"}}
 		if p.audit.Mode() == "off" {
 			if err := upstream.WriteMessage(kind, raw); err != nil {
 				return

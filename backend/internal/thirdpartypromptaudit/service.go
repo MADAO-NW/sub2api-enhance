@@ -92,9 +92,6 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDecision {
 	mode := s.config.EffectiveMode()
-	if request.Background && mode == "blocking" {
-		mode = "async"
-	}
 	if mode == "off" {
 		return nil
 	}
@@ -103,6 +100,16 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		(!snapshot.AllGroups && (request.GroupID == nil || !slices.Contains(snapshot.GroupIDs, *request.GroupID))) ||
 		(len(snapshot.Platforms) > 0 && !slices.Contains(snapshot.Platforms, request.Provider))) {
 		return nil
+	}
+	if configErr == nil {
+		snapshot.Config = effectiveConfigForUser(snapshot.Config, request.UserID)
+		mode = snapshot.Mode
+	}
+	if request.Background && mode == "blocking" {
+		mode = "async"
+		if configErr == nil {
+			snapshot.Mode = mode
+		}
 	}
 	s.mu.Lock()
 	if s.closing {
@@ -137,7 +144,7 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		key = uuid.NewString()
 	}
 	apiKeyID := request.APIKeyID
-	job := &Job{CapturedAt: request.CapturedAt, CaptureID: request.CaptureID, CaptureKey: key, RunKind: "request", UserID: request.UserID, APIKeyID: &apiKeyID, GroupID: request.GroupID, RequestID: request.RequestID,
+	job := &Job{CapturedAt: request.CapturedAt, CaptureID: request.CaptureID, CaptureKey: key, ReuseMode: ReuseModeAllow, UserID: request.UserID, APIKeyID: &apiKeyID, GroupID: request.GroupID, RequestID: request.RequestID,
 		ConversationKey: request.ConversationKey, CurrentRunKind: "request", AuditRound: 1,
 		Identity: Identity{Username: request.Username, UserEmail: request.UserEmail, APIKeyName: request.APIKeyName, GroupName: request.GroupName, Endpoint: request.Endpoint},
 		Platform: request.Provider, Protocol: request.Protocol, IngressStage: request.Stage, RequestedModel: request.Model, ExecutionMode: mode,
@@ -282,14 +289,32 @@ func (s *Service) processJob(parent context.Context, job *Job, foreground bool) 
 			return nil, &AuditError{Code: "blocking_request_ended", Stage: "worker", Message: "同步请求已经结束，不能在后台重新调用模型"}
 		}
 		started := time.Now()
-		_, err := prepareTarget(job)
 		var failure *AuditError
-		if err != nil {
-			failure = &AuditError{Code: "input_parse_failed", Stage: "input_parse", Message: err.Error()}
-		} else if err = s.repo.SaveTarget(ctx, job); err != nil {
-			failure = persistenceFailure(err, "target_persist_failed")
+		binding, keys, err := s.config.EvaluationBinding(job.UserID)
+		if errors.Is(err, ErrAuditPaused) {
+			failure = persistenceFailure(err, "audit_paused")
+		} else if err != nil {
+			failure = &AuditError{Code: "evaluation_binding_unavailable", Stage: "config", Message: err.Error(), Retryable: true}
 		} else {
-			evaluation, failure = s.evaluateWithInflightReuse(ctx, job)
+			// 请求的同步/异步语义在入口确定；重新绑定只更新本轮审核配置。
+			binding.Mode = job.ExecutionMode
+			if err = s.repo.BindEvaluationConfig(ctx, job, binding); err != nil {
+				failure = persistenceFailure(err, "evaluation_binding_persist_failed")
+			}
+		}
+		if failure == nil {
+			_, err = prepareTarget(job)
+			if err != nil {
+				failure = &AuditError{Code: "input_parse_failed", Stage: "input_parse", Message: err.Error()}
+			}
+		}
+		if failure == nil {
+			if err = s.repo.SaveTarget(ctx, job); err != nil {
+				failure = persistenceFailure(err, "target_persist_failed")
+			}
+		}
+		if failure == nil {
+			evaluation, failure = s.evaluateWithInflightReuse(ctx, job, keys)
 		}
 		s.metrics.ObserveEvaluation(started, time.Now())
 		if failure != nil {
@@ -327,12 +352,22 @@ func (s *Service) processJob(parent context.Context, job *Job, foreground bool) 
 	return outcome, nil
 }
 
-// evaluateWithInflightReuse 只在可靠会话内合并完全相同的正式审核，不把不同会话按用户串行化。
-func (s *Service) evaluateWithInflightReuse(ctx context.Context, job *Job) (*Evaluation, *AuditError) {
-	if job.auditRunKind() != "request" || job.ConversationKey == "" {
-		return s.evaluator.Evaluate(ctx, job)
+// evaluateWithInflightReuse 在相同裁决配置下合并全库完全一致的完整目标。
+func (s *Service) evaluateWithInflightReuse(ctx context.Context, job *Job, boundKeys ...map[string]string) (*Evaluation, *AuditError) {
+	keys := map[string]string{}
+	if len(boundKeys) > 0 {
+		keys = boundKeys[0]
 	}
-	key := fmt.Sprintf("%d\x00%s\x00%s\x00%s", job.UserID, job.ConversationKey, job.TargetHash, job.EvaluationHash)
+	if job.ReuseMode == ReuseModeForce {
+		return s.evaluator.Evaluate(ctx, job, keys)
+	}
+	key, err := fingerprint(struct {
+		TargetHash, EvaluationHash, Aggregation string
+		ReviewThreshold, BlockThreshold         *float64
+	}{job.TargetHash, job.EvaluationHash, job.Config.Aggregation, job.Config.ReviewThreshold, job.Config.BlockThreshold})
+	if err != nil {
+		return nil, &AuditError{Code: "inflight_key_failed", Stage: "worker", Message: err.Error()}
+	}
 	s.flightMu.Lock()
 	if s.flights == nil {
 		s.flights = make(map[string]*evaluationFlight)
@@ -355,6 +390,7 @@ func (s *Service) evaluateWithInflightReuse(ctx context.Context, job *Job) (*Eva
 					continue
 				}
 				cloned.Models[i].Reused = true
+				cloned.Models[i].JointAttemptID = nil
 				for j := range cloned.Models[i].Segments {
 					cloned.Models[i].Segments[j].ReuseKind = "inflight"
 				}
@@ -371,7 +407,7 @@ func (s *Service) evaluateWithInflightReuse(ctx context.Context, job *Job) (*Eva
 	}
 	s.flightLeaders[job.ID] = key
 	s.flightMu.Unlock()
-	evaluation, failure := s.evaluator.Evaluate(ctx, job)
+	evaluation, failure := s.evaluator.Evaluate(ctx, job, keys)
 	s.flightMu.Lock()
 	flight.evaluation, flight.failure = evaluation, failure
 	close(flight.done)
@@ -574,6 +610,12 @@ func (s *Service) Probe(ctx context.Context, input ProbeRequest) ProbeResult {
 }
 
 func (s *Service) CreateReaudits(ctx context.Context, request ReauditRequest, actorID int64) (*ReauditResult, error) {
+	if request.ReuseMode == "" {
+		request.ReuseMode = ReuseModeAllow
+	}
+	if request.ReuseMode != ReuseModeAllow && request.ReuseMode != ReuseModeForce {
+		return nil, errors.New("复核复用方式无效")
+	}
 	snapshot, err := s.config.Active()
 	if err != nil {
 		return nil, err

@@ -5,24 +5,28 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
-
-type KeyResolver interface {
-	ResolveKey(ModelConfig) (string, error)
-}
 
 // ErrNoText 区分纯媒体输入与无法解析的文本，纯媒体不参与文本风险分类。
 var ErrNoText = errors.New("没有可审核的文本输入")
 
 type Evaluator struct {
-	store  EvaluationStore
-	client *ModelClient
-	keys   KeyResolver
+	store          EvaluationStore
+	client         *ModelClient
+	segmentMu      sync.Mutex
+	segmentFlights map[string]*segmentFlight
 }
 
-func NewEvaluator(repository *Repository, client *ModelClient, config *ConfigManager) *Evaluator {
-	return &Evaluator{store: repository, client: client, keys: config}
+func NewEvaluator(repository *Repository, client *ModelClient) *Evaluator {
+	return &Evaluator{store: repository, client: client, segmentFlights: make(map[string]*segmentFlight)}
+}
+
+type segmentFlight struct {
+	done    chan struct{}
+	result  SegmentResult
+	failure *AuditError
 }
 
 type auditTarget struct {
@@ -95,6 +99,15 @@ func collectApplicationContext(root map[string]any, path string, result map[stri
 	if response, ok := root["response"].(map[string]any); ok {
 		collectApplicationContext(response, path+".response", result)
 	}
+	if input, ok := root["input"].([]any); ok {
+		for i, item := range input {
+			entry, _ := item.(map[string]any)
+			kind, _ := entry["type"].(string)
+			if kind == "additional_tools" {
+				result[fmt.Sprintf("%s.input[%d].tools", path, i)] = entry["tools"]
+			}
+		}
+	}
 	if requests, ok := root["requests"].([]any); ok {
 		for i, item := range requests {
 			if request, ok := item.(map[string]any); ok {
@@ -111,7 +124,7 @@ func modelSemantics(model ModelConfig) any {
 	}{model.ID, model.BaseURL, model.Model, model.Parameters}
 }
 
-func segmentKey(snapshot ConfigSnapshot, model ModelConfig, segment Segment, conversationKey string) (string, string, error) {
+func segmentKey(snapshot ConfigSnapshot, model ModelConfig, segment Segment) (string, string, error) {
 	content := make([]struct{ Type, Text string }, 0, len(segment.Content))
 	for _, block := range segment.Content {
 		content = append(content, struct{ Type, Text string }{block.Type, block.Text})
@@ -120,16 +133,17 @@ func segmentKey(snapshot ConfigSnapshot, model ModelConfig, segment Segment, con
 	if err != nil {
 		return "", "", err
 	}
+	// 保留旧指纹字段但固定为空，使无会话历史缓存可继续命中，同时移除会话隔离语义。
 	key, err := fingerprint(struct {
 		Model                                                                                      any
 		Policy, Contract, Version, SourceRole, PolicyRole, TurnScope, ContentHash, ConversationKey string
 		Stage                                                                                      string
 	}{modelSemantics(model), snapshot.AuditPrompt, snapshot.FixedContract, snapshot.ContractVersion,
-		segment.SourceRole, segment.PolicyRole, segment.TurnScope, contentHash, conversationKey, "segment"})
+		segment.SourceRole, segment.PolicyRole, segment.TurnScope, contentHash, "", "segment"})
 	return key, contentHash, err
 }
 
-func (e *Evaluator) Evaluate(ctx context.Context, job *Job) (*Evaluation, *AuditError) {
+func (e *Evaluator) Evaluate(ctx context.Context, job *Job, keys map[string]string) (*Evaluation, *AuditError) {
 	if job.Config.historicalJSON != nil {
 		return nil, &AuditError{Code: "audit_snapshot_requires_reaudit", Stage: "config", Message: "规则结构已更新，请按当前配置重新审核"}
 	}
@@ -143,8 +157,11 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job) (*Evaluation, *Audit
 	if err != nil {
 		return nil, &AuditError{Code: "input_parse_failed", Stage: "input_parse", Message: err.Error()}
 	}
+	if keys == nil {
+		keys = map[string]string{}
+	}
 	var whole *Outcome
-	if job.auditRunKind() != "reaudit" && job.ConversationKey != "" {
+	if job.ReuseMode != ReuseModeForce {
 		job.Reuse.WholeLookups++
 		// 复用读取失败可回退评估；真实调用仍须先完成调用日志持久化。
 		whole, _ = e.store.FindWholeResult(ctx, job)
@@ -173,6 +190,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job) (*Evaluation, *Audit
 			prior.Segments = append([]SegmentUse(nil), prior.Segments...)
 			prior.ModelName = model.Name
 			prior.Reused = true
+			prior.JointAttemptID = nil
 			if prior.Confidence != nil {
 				prior.Decision = classifyScore(*prior.Confidence, job.Config.Config)
 			}
@@ -191,7 +209,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job) (*Evaluation, *Audit
 		}
 		allWhole = false
 		nodeCtx, cancel := context.WithTimeout(ctx, time.Duration(model.TimeoutMS)*time.Millisecond)
-		node := e.evaluateModel(nodeCtx, job, model, target)
+		node := e.evaluateModel(nodeCtx, job, model, target, keys)
 		cancel()
 		if node.Error != nil && node.Error.Code == "audit_paused" {
 			return nil, node.Error
@@ -256,12 +274,12 @@ func reusableModel(model ModelResult, config Config) bool {
 	return true
 }
 
-func (e *Evaluator) evaluateModel(ctx context.Context, job *Job, model ModelConfig, target auditTarget) ModelResult {
+func (e *Evaluator) evaluateModel(ctx context.Context, job *Job, model ModelConfig, target auditTarget, credentials map[string]string) ModelResult {
 	node := ModelResult{ModelID: model.ID, ModelName: model.Name, Segments: []SegmentUse{}}
 	keys := make([]string, len(target.Messages))
 	hashes := make([]string, len(target.Messages))
 	for i, segment := range target.Messages {
-		key, hash, err := segmentKey(job.Config, model, segment, job.ConversationKey)
+		key, hash, err := segmentKey(job.Config, model, segment)
 		if err != nil {
 			node.Error = &AuditError{Code: "input_hash_failed", Stage: "input_parse", Message: err.Error()}
 			return node
@@ -269,17 +287,13 @@ func (e *Evaluator) evaluateModel(ctx context.Context, job *Job, model ModelConf
 		keys[i], hashes[i] = key, hash
 	}
 	stored := make(map[string]SegmentResult)
-	if job.auditRunKind() != "reaudit" && job.ConversationKey != "" {
+	if job.ReuseMode != ReuseModeForce {
 		job.Reuse.SegmentLookups += len(keys)
-		if found, err := e.store.FindSegments(ctx, job.UserID, model.ID, keys); err == nil {
+		if found, err := e.store.FindSegments(ctx, model.ID, keys); err == nil {
 			stored = found
 		}
 	}
-	key, err := e.keys.ResolveKey(model)
-	if err != nil {
-		node.Error = &AuditError{Code: "credential_binding_unavailable", Stage: "config", Message: err.Error()}
-		return node
-	}
+	key := credentials[model.ID]
 	client, url, err := nodeHTTPClient(model)
 	if err != nil {
 		node.Error = &AuditError{Code: "node_unavailable", Stage: "config", Message: err.Error()}
@@ -298,17 +312,29 @@ func (e *Evaluator) evaluateModel(ctx context.Context, job *Job, model ModelConf
 			raw, reuseKind = previous, "history"
 			job.Reuse.SegmentHits++
 		} else {
-			order := segment.Order
-			score, attemptID, failure := e.client.EvaluateTarget(ctx, job, model, key, job.Config, client, url, "segment", segment, &order)
+			var failure *AuditError
+			fresh := func() (SegmentResult, *AuditError) {
+				order := segment.Order
+				score, attemptID, failure := e.client.EvaluateTarget(ctx, job, model, key, job.Config, client, url, "segment", segment, &order)
+				if failure != nil {
+					return SegmentResult{}, failure
+				}
+				result := SegmentResult{UserID: job.UserID, ModelID: model.ID, AuditKey: keys[i], SourceAttemptID: attemptID,
+					SourceRole: segment.SourceRole, PolicyRole: segment.PolicyRole, TurnScope: segment.TurnScope, ContentHash: hashes[i], Score: *score}
+				if err := e.store.SaveSegment(ctx, job, &result); err != nil {
+					return SegmentResult{}, persistenceFailure(err, "segment_persist_failed")
+				}
+				return result, nil
+			}
+			raw, reuseKind, failure = e.evaluateSegment(ctx, job, model.ID, keys[i], fresh)
 			if failure != nil {
 				node.Error = failure
 				return node
 			}
-			raw = SegmentResult{UserID: job.UserID, ModelID: model.ID, AuditKey: keys[i], SourceAttemptID: attemptID,
-				SourceRole: segment.SourceRole, PolicyRole: segment.PolicyRole, TurnScope: segment.TurnScope, ContentHash: hashes[i], Score: *score}
-			if err := e.store.SaveSegment(ctx, job, &raw); err != nil {
-				node.Error = persistenceFailure(err, "segment_persist_failed")
-				return node
+			if reuseKind == "history" {
+				job.Reuse.SegmentHits++
+			} else if reuseKind == "inflight" {
+				job.Reuse.InflightHits++
 			}
 		}
 		within[keys[i]] = raw
@@ -333,6 +359,54 @@ func (e *Evaluator) evaluateModel(ctx context.Context, job *Job, model ModelConf
 	node.Basis = "joint"
 	node.Decision = classifyScore(score.Confidence, job.Config.Config)
 	return node
+}
+
+// evaluateSegment 合并当前实例内完全相同的首次片段审核，并在领头调用前再次查询全库缓存。
+func (e *Evaluator) evaluateSegment(ctx context.Context, job *Job, modelID, auditKey string, fresh func() (SegmentResult, *AuditError)) (SegmentResult, string, *AuditError) {
+	if job.ReuseMode == ReuseModeForce {
+		result, failure := fresh()
+		return result, "fresh", failure
+	}
+	e.segmentMu.Lock()
+	if e.segmentFlights == nil {
+		e.segmentFlights = make(map[string]*segmentFlight)
+	}
+	if current := e.segmentFlights[auditKey]; current != nil {
+		e.segmentMu.Unlock()
+		select {
+		case <-current.done:
+			if current.failure != nil {
+				failure := *current.failure
+				return SegmentResult{}, "inflight", &failure
+			}
+			return current.result, "inflight", nil
+		case <-ctx.Done():
+			return SegmentResult{}, "inflight", requestFailure(ctx.Err())
+		}
+	}
+	flight := &segmentFlight{done: make(chan struct{})}
+	e.segmentFlights[auditKey] = flight
+	e.segmentMu.Unlock()
+
+	reuseKind := "fresh"
+	if found, err := e.store.FindSegments(ctx, modelID, []string{auditKey}); err == nil {
+		if cached, ok := found[auditKey]; ok {
+			flight.result = cached
+			reuseKind = "history"
+		} else {
+			flight.result, flight.failure = fresh()
+		}
+	} else {
+		flight.result, flight.failure = fresh()
+	}
+	e.segmentMu.Lock()
+	delete(e.segmentFlights, auditKey)
+	close(flight.done)
+	e.segmentMu.Unlock()
+	if flight.failure != nil {
+		return SegmentResult{}, reuseKind, flight.failure
+	}
+	return flight.result, reuseKind, nil
 }
 
 func classifyScore(score float64, config Config) Decision {

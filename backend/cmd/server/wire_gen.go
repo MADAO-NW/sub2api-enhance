@@ -27,7 +27,7 @@ func initializeCore(db *sql.DB, cfg *config.Config, captures *thirdpartypromptau
 	}
 	configManager := thirdpartypromptaudit.NewConfigManager(db, encryptor, cfg)
 	modelClient := thirdpartypromptaudit.NewModelClient(repository, configManager)
-	evaluator := thirdpartypromptaudit.NewEvaluator(repository, modelClient, configManager)
+	evaluator := thirdpartypromptaudit.NewEvaluator(repository, modelClient)
 	smtp := notify.NewSMTP(cfg)
 	service := thirdpartypromptaudit.NewService(repository, configManager, evaluator, modelClient, smtp)
 	adminHandler := thirdpartypromptaudit.NewAdminHandler(service, configManager, repository, captures)

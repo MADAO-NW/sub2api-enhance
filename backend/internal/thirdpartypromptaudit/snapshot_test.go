@@ -150,6 +150,18 @@ func TestProtocolSpecificMediaNeverDeletesToolBusinessFields(t *testing.T) {
 	require.Equal(t, "$.input[0].output[1]", snapshot.NonText[0].SourcePath)
 }
 
+func TestResponsesAdditionalToolsAreApplicationContext(t *testing.T) {
+	input := `{"input":[{"id":"tools-1","role":"developer","type":"additional_tools","tools":[{"type":"namespace","name":"workspace","tools":[{"type":"function","name":"read"}]}]},{"role":"user","content":[{"type":"input_text","text":"检查项目"}]}]}`
+	snapshot, err := CaptureInput("openai_responses", []byte(input))
+	require.NoError(t, err)
+	job := &Job{Config: ConfigSnapshot{Config: DefaultConfig()}, Protocol: "openai_responses", FullInput: snapshot}
+	target, err := prepareTarget(job)
+	require.NoError(t, err)
+	require.Len(t, target.Messages, 1)
+	require.Equal(t, "检查项目", target.Messages[0].Content[0].Text)
+	require.Contains(t, target.Tools, "$.input[0].tools")
+}
+
 func TestMediaRootExcludesBinaryWhileKeepingPrompt(t *testing.T) {
 	snapshot, err := CaptureInput("openai_images", []byte(`{"prompt":"原样的绘图说明","image":"data:image/png;base64,AAAA","mask":{"b64_json":"BBBB","mime_type":"image/png"}}`))
 	require.NoError(t, err)

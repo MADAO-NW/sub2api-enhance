@@ -116,7 +116,7 @@ func (r *Repository) RetryAction(ctx context.Context, id int64) error {
 }
 func (r *Repository) ListActions(ctx context.Context, userID, rootID int64) ([]Action, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT `+actionColumns+` FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions WHERE user_id=$1 AND
- (outcome_id IN(SELECT o.id FROM sub2api_enhance.third_party_prompt_audit_outcomes o JOIN sub2api_enhance.third_party_prompt_audit_jobs j ON j.id=o.job_id WHERE j.id=$2 OR j.source_job_id=$2) OR action_type='counter_reset') ORDER BY id`, userID, rootID)
+	 (outcome_id IN(SELECT id FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$2) OR action_type='counter_reset') ORDER BY id`, userID, rootID)
 	if err != nil {
 		return nil, err
 	}

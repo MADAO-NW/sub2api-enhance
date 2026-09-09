@@ -47,11 +47,18 @@ func (s *testCaptures) Finish(context.Context, int64, string, string) error { re
 
 type testAudit struct {
 	mode      string
+	userMode  string
 	decision  audit.IngressDecisionKind
 	errorCode string
 }
 
 func (s testAudit) Mode() string { return s.mode }
+func (s testAudit) ModeForUser(int64) string {
+	if s.userMode != "" {
+		return s.userMode
+	}
+	return s.mode
+}
 func (s testAudit) AuditCapture(context.Context, *audit.Capture) (*audit.IntakeDecision, error) {
 	return &audit.IntakeDecision{JobID: 1, Mode: s.mode, Kind: s.decision, ErrorCode: s.errorCode}, nil
 }
@@ -63,6 +70,38 @@ type testIdentity struct{}
 func (testIdentity) Resolve(context.Context, *http.Request, string) (sub2api.Identity, error) {
 	return sub2api.Identity{UserID: 1, APIKeyID: 2, Platform: "openai", Eligibility: "passed"}, nil
 }
+
+type unknownIdentity struct{}
+
+func (unknownIdentity) Resolve(context.Context, *http.Request, string) (sub2api.Identity, error) {
+	return sub2api.Identity{UserID: 7, APIKeyID: 2, Platform: "openai", Eligibility: "unknown"}, nil
+}
+
+func TestPerUserModeControlsPreAuditFailureHandling(t *testing.T) {
+	for _, test := range []struct {
+		userMode string
+		status   int
+		calls    int
+	}{{"blocking", http.StatusServiceUnavailable, 0}, {"async", http.StatusNoContent, 1}} {
+		t.Run(test.userMode, func(t *testing.T) {
+			calls := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls++
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer upstream.Close()
+			store := &testCaptures{}
+			proxy, err := New(upstream.URL, store, testAudit{mode: "async", userMode: test.userMode, decision: audit.IngressDecisionAllow}, unknownIdentity{})
+			require.NoError(t, err)
+			recorder := httptest.NewRecorder()
+			proxy.Serve(recorder, httptest.NewRequest(http.MethodPost, "http://enhance/v1/responses", strings.NewReader(`{"input":"test"}`)), "192.0.2.7")
+			require.Equal(t, test.status, recorder.Code)
+			require.Equal(t, test.calls, calls)
+			require.Equal(t, test.userMode, store.metadata["mode"])
+		})
+	}
+}
+
 func TestProtectedInputMustPersistBeforeForward(t *testing.T) {
 	for _, fail := range []bool{false, true} {
 		t.Run(map[bool]string{false: "保存后透传", true: "保存失败不转发"}[fail], func(t *testing.T) {

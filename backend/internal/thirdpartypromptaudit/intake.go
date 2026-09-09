@@ -35,3 +35,5 @@ type IngressDecision struct {
 }
 
 func (s *Service) Mode() string { return s.config.EffectiveMode() }
+
+func (s *Service) ModeForUser(userID int64) string { return s.config.EffectiveModeForUser(userID) }
