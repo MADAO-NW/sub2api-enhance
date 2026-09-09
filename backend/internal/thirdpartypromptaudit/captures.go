@@ -137,7 +137,7 @@ func (s *CaptureStore) List(ctx context.Context, page, size int, status string) 
 		return out, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.capture_key,COALESCE(c.conversation_key,''),c.transport,c.protocol,c.body_format,c.body_sha256,c.body_bytes,c.snapshot_status,c.eligibility_status,c.processing_status,c.forwarding_status,c.last_error_message,c.created_at,
- COALESCE(NULLIF(c.identity_snapshot::json->>'username',''),u.username,''),COALESCE(NULLIF(c.identity_snapshot::json->>'user_email',''),u.email,''),COALESCE(c.user_id,0)
+ COALESCE(NULLIF(u.username,''),c.identity_snapshot::json->>'username',''),COALESCE(NULLIF(u.email,''),c.identity_snapshot::json->>'user_email',''),COALESCE(c.user_id,0)
  FROM sub2api_enhance.captures c LEFT JOIN public.users u ON u.id=c.user_id AND u.deleted_at IS NULL
  WHERE ($1='' OR c.processing_status=$1) ORDER BY c.id DESC LIMIT $2 OFFSET $3`, status, size, (page-1)*size)
 	if err != nil {
@@ -167,10 +167,41 @@ func (s *Service) AuditCapture(ctx context.Context, c *Capture) (*IntakeDecision
 	return s.Check(ctx, request), nil
 }
 
+// ReviewCapture 为管理员从既有原文创建无处罚资格的异步审核任务。
+func (s *Service) ReviewCapture(ctx context.Context, c *Capture, actorUserID int64) (*IntakeDecision, error) {
+	request, err := captureRequest(c)
+	if err != nil {
+		return nil, err
+	}
+	request.Manual = true
+	request.Background = true
+	request.ActorUserID = actorUserID
+	return s.Check(ctx, request), nil
+}
+
 // captureRequest 供正式采集和人工复核从同一原文按当前提取规则生成输入。
 func captureRequest(c *Capture) (IntakeRequest, error) {
-	if c.SnapshotStatus != "complete" || c.Identity.UserID <= 0 {
+	if c.Identity.UserID <= 0 {
 		return IntakeRequest{}, errors.New("采集输入或身份不完整")
+	}
+	protocol, raw, err := captureAuditBody(c)
+	if err != nil {
+		return IntakeRequest{}, err
+	}
+	request := IntakeRequest{CapturedAt: c.CreatedAt, CaptureKey: c.Key, CaptureID: &c.ID, RequestID: c.Key, ConversationKey: c.ConversationKey, UserID: c.Identity.UserID, APIKeyID: c.Identity.APIKeyID, GroupID: c.Identity.GroupID, Username: c.Identity.Username, UserEmail: c.Identity.UserEmail, APIKeyName: c.Identity.APIKeyName, GroupName: c.Identity.GroupName, Provider: c.Identity.Platform, Endpoint: c.Metadata["path"], Protocol: protocol, Stage: "external_ingress", Body: raw, Background: c.Metadata["background"] == "true", Manual: c.Metadata["manual_reprocess"] == "true"}
+	var model struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(request.Body, &model) == nil {
+		request.Model = model.Model
+	}
+	return request, nil
+}
+
+// captureAuditBody 只恢复可解析请求正文，不要求采集当时已经识别用户身份。
+func captureAuditBody(c *Capture) (string, []byte, error) {
+	if c == nil || c.SnapshotStatus != "complete" {
+		return "", nil, errors.New("采集输入不完整")
 	}
 	raw := c.Raw
 	if encoding := c.Metadata["content_encoding"]; encoding != "" && encoding != "identity" {
@@ -185,19 +216,19 @@ func captureRequest(c *Capture) (IntakeRequest, error) {
 			err = errors.New("该内容编码尚未支持审核解析")
 		}
 		if err != nil {
-			return IntakeRequest{}, err
+			return "", nil, err
 		}
 		raw, err = io.ReadAll(reader)
 		_ = reader.Close()
 		if err != nil {
-			return IntakeRequest{}, err
+			return "", nil, err
 		}
 	}
-	request := IntakeRequest{CapturedAt: c.CreatedAt, CaptureKey: c.Key, CaptureID: &c.ID, RequestID: c.Key, ConversationKey: c.ConversationKey, UserID: c.Identity.UserID, APIKeyID: c.Identity.APIKeyID, GroupID: c.Identity.GroupID, Username: c.Identity.Username, UserEmail: c.Identity.UserEmail, APIKeyName: c.Identity.APIKeyName, GroupName: c.Identity.GroupName, Provider: c.Identity.Platform, Endpoint: c.Metadata["path"], Protocol: c.Protocol, Stage: "external_ingress", Body: raw, Background: c.Metadata["background"] == "true", Manual: c.Metadata["manual_reprocess"] == "true"}
+	protocol := c.Protocol
 	if c.Format == "multipart_text_fields" {
 		var fields []map[string]any
 		if err := json.Unmarshal(raw, &fields); err != nil {
-			return IntakeRequest{}, err
+			return "", nil, err
 		}
 		texts := []any{}
 		for _, field := range fields {
@@ -206,20 +237,14 @@ func captureRequest(c *Capture) (IntakeRequest, error) {
 			}
 		}
 		body := map[string]any{"messages": []any{map[string]any{"role": "user", "content": texts}}}
-		raw, err := json.Marshal(body)
+		encoded, err := json.Marshal(body)
 		if err != nil {
-			return IntakeRequest{}, err
+			return "", nil, err
 		}
-		request.Body = raw
-		request.Protocol = "chat_completions"
+		raw = encoded
+		protocol = "chat_completions"
 	}
-	var model struct {
-		Model string `json:"model"`
-	}
-	if json.Unmarshal(request.Body, &model) == nil {
-		request.Model = model.Model
-	}
-	return request, nil
+	return protocol, raw, nil
 }
 
 // captureLoop 仅恢复落库后的异步派生任务；正式 Job 的唯一采集引用防止重复创建。
@@ -241,6 +266,7 @@ func (s *Service) captureLoop(ctx context.Context) {
 			err := s.repo.db.QueryRowContext(ctx, `WITH candidate AS (
     SELECT id FROM sub2api_enhance.captures WHERE (processing_status IN ('queued','retry') OR (processing_status='processing' AND lease_until<clock_timestamp()))
     AND next_attempt_at<=clock_timestamp() AND created_at<clock_timestamp()-interval '10 seconds' AND eligibility_status='passed' AND request_metadata::json->>'mode'='async'
+    AND COALESCE(request_metadata::json->>'audit_required','true')='true'
     ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
     UPDATE sub2api_enhance.captures SET processing_status='processing',claim_generation=claim_generation+1,lease_until=clock_timestamp()+interval '30 seconds',processing_attempts=processing_attempts+1
     WHERE id IN(SELECT id FROM candidate) RETURNING id,claim_generation`).Scan(&id, &generation)

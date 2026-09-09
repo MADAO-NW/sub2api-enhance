@@ -24,6 +24,7 @@ type testCaptures struct {
 	conversationKey string
 	mu              sync.Mutex
 	observations    []string
+	finishedStatus  string
 }
 
 func (s *testCaptures) Save(_ context.Context, c *audit.Capture) error {
@@ -43,13 +44,17 @@ func (s *testCaptures) Observe(_ context.Context, _ int64, state string, _ map[s
 	s.observations = append(s.observations, state)
 	return nil
 }
-func (s *testCaptures) Finish(context.Context, int64, string, string) error { return nil }
+func (s *testCaptures) Finish(_ context.Context, _ int64, status, _ string) error {
+	s.finishedStatus = status
+	return nil
+}
 
 type testAudit struct {
-	mode      string
-	userMode  string
-	decision  audit.IngressDecisionKind
-	errorCode string
+	mode           string
+	userMode       string
+	decision       audit.IngressDecisionKind
+	errorCode      string
+	captureWhenOff bool
 }
 
 func (s testAudit) Mode() string { return s.mode }
@@ -58,6 +63,10 @@ func (s testAudit) ModeForUser(int64) string {
 		return s.userMode
 	}
 	return s.mode
+}
+func (s testAudit) CaptureWhenAuditOff() bool { return s.captureWhenOff }
+func (s testAudit) RequiresAudit(_ int64, _ *int64, _ string) bool {
+	return s.ModeForUser(0) != "off"
 }
 func (s testAudit) AuditCapture(context.Context, *audit.Capture) (*audit.IntakeDecision, error) {
 	return &audit.IntakeDecision{JobID: 1, Mode: s.mode, Kind: s.decision, ErrorCode: s.errorCode}, nil
@@ -137,6 +146,32 @@ func TestProtectedInputMustPersistBeforeForward(t *testing.T) {
 				require.Equal(t, "conversation-a", store.conversationKey)
 				require.Equal(t, 1, calls)
 				require.Equal(t, "data: {\"text\":\"hello\"}\n\n", recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestCaptureOnlyModeForwardsEvenWhenPersistenceFails(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(map[bool]string{false: "保存后等待人工审核", true: "保存失败仍转发"}[fail], func(t *testing.T) {
+			store := &testCaptures{fail: fail}
+			calls := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls++
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer upstream.Close()
+			proxy, err := New(upstream.URL, store, testAudit{mode: "off", captureWhenOff: true}, testIdentity{})
+			require.NoError(t, err)
+			recorder := httptest.NewRecorder()
+			proxy.Serve(recorder, httptest.NewRequest(http.MethodPost, "http://enhance/v1/responses", strings.NewReader(`{"input":"test"}`)), "192.0.2.7")
+			require.Equal(t, http.StatusNoContent, recorder.Code)
+			require.Equal(t, 1, calls)
+			if fail {
+				require.False(t, store.saved)
+			} else {
+				require.True(t, store.saved)
+				require.Equal(t, "awaiting_review", store.finishedStatus)
 			}
 		})
 	}

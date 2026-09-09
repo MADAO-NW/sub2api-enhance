@@ -1,6 +1,9 @@
 package thirdpartypromptaudit
 
-import "time"
+import (
+	"slices"
+	"time"
+)
 
 type IngressDecisionKind string
 
@@ -17,6 +20,7 @@ type IntakeRequest struct {
 	Manual                                                                                                                         bool
 	CaptureKey, RequestID, ConversationKey, Username, UserEmail, APIKeyName, GroupName, Provider, Endpoint, Protocol, Model, Stage string
 	UserID, APIKeyID                                                                                                               int64
+	ActorUserID                                                                                                                    int64
 	CaptureID                                                                                                                      *int64
 	GroupID                                                                                                                        *int64
 	Body                                                                                                                           []byte
@@ -37,3 +41,16 @@ type IngressDecision struct {
 func (s *Service) Mode() string { return s.config.EffectiveMode() }
 
 func (s *Service) ModeForUser(userID int64) string { return s.config.EffectiveModeForUser(userID) }
+
+func (s *Service) CaptureWhenAuditOff() bool { return s.config.CaptureWhenAuditOff() }
+
+// RequiresAudit 判断当前请求是否属于自动审核范围，供入口决定采集失败语义。
+func (s *Service) RequiresAudit(userID int64, groupID *int64, provider string) bool {
+	snapshot, err := s.config.Active()
+	if err != nil {
+		return s.config.EffectiveModeForUser(userID) != "off"
+	}
+	return snapshot.Mode != "off" && !slices.Contains(snapshot.ExcludedUserIDs, userID) &&
+		(snapshot.AllGroups || (groupID != nil && slices.Contains(snapshot.GroupIDs, *groupID))) &&
+		(len(snapshot.Platforms) == 0 || slices.Contains(snapshot.Platforms, provider))
+}

@@ -1,9 +1,9 @@
 import type { AuditConfig, ConfigUpdate, KeyUpdate, SavedConfig } from '@/api/admin/third-party-prompt-audit'
 
 export function editableConfig(value: SavedConfig): AuditConfig {
-  const { mode, audit_scope, platforms, all_groups, group_ids, excluded_user_ids, audit_prompt, models, review_threshold, block_threshold,
+  const { mode, capture_when_audit_off, audit_scope, platforms, all_groups, group_ids, excluded_user_ids, audit_prompt, models, review_threshold, block_threshold,
 	aggregation, worker_count, warning, disable, user_rules, admin_email } = value
-  return JSON.parse(JSON.stringify({ mode, audit_scope, platforms: platforms ?? [], all_groups, group_ids: group_ids ?? [], excluded_user_ids: excluded_user_ids ?? [], audit_prompt,
+  return JSON.parse(JSON.stringify({ mode, capture_when_audit_off, audit_scope, platforms: platforms ?? [], all_groups, group_ids: group_ids ?? [], excluded_user_ids: excluded_user_ids ?? [], audit_prompt,
 	models: models ?? [], review_threshold, block_threshold, aggregation, worker_count, warning, disable, user_rules: user_rules ?? [], admin_email })) as AuditConfig
 }
 

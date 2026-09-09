@@ -30,8 +30,8 @@ func NewRepository(db *sql.DB) *Repository { return &Repository{db: db} }
 
 // jobColumns 仅列举列表需要的字段，全文通过单独投影读取，避免列表展开大字段。
 const jobColumns = `COALESCE(capture.created_at,j.created_at) AS captured_at,j.capture_id,j.id,j.capture_key,j.user_id,j.api_key_id,j.group_id,
-j.request_id,j.conversation_key,j.identity_snapshot,COALESCE(NULLIF(j.identity_snapshot::json->>'username',''),display_user.username,'') AS display_username,
-COALESCE(NULLIF(j.identity_snapshot::json->>'user_email',''),display_user.email,'') AS display_email,j.platform,j.protocol,j.ingress_stage,j.requested_model,j.execution_mode,j.audit_round,j.current_run_kind,j.current_requested_by,
+j.request_id,j.conversation_key,j.identity_snapshot,COALESCE(NULLIF(display_user.username,''),j.identity_snapshot::json->>'username','') AS display_username,
+COALESCE(NULLIF(display_user.email,''),j.identity_snapshot::json->>'user_email','') AS display_email,j.platform,j.protocol,j.ingress_stage,j.requested_model,j.execution_mode,j.audit_round,j.current_run_kind,j.current_requested_by,
 j.reuse_mode,j.disable_counted,j.config_revision,j.snapshot_status,j.input_hash,j.target_hash,j.evaluation_hash,j.status,j.attempts,j.max_attempts,
 j.claim_generation,j.lease_until,j.next_attempt_at,j.reuse_metrics,j.failure_stage,j.last_error_code,j.last_error_message,
 j.gateway_result,j.gateway_completed_at,j.gateway_duration_ms,j.started_at,j.finished_at,
@@ -155,18 +155,18 @@ INSERT INTO sub2api_enhance.third_party_prompt_audit_jobs
 (capture_key,user_id,api_key_id,group_id,request_id,conversation_key,identity_snapshot,
  platform,protocol,ingress_stage,requested_model,execution_mode,config_revision,config_snapshot,full_input_snapshot,
  snapshot_status,input_manifest,input_hash,target_hash,evaluation_hash,status,attempts,max_attempts,claim_generation,reuse_mode,
- lease_until,started_at,finished_at,failure_stage,last_error_code,last_error_message,capture_id)
+ lease_until,started_at,finished_at,failure_stage,last_error_code,last_error_message,current_requested_by,capture_id)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,
  CASE WHEN $21='processing' THEN clock_timestamp()+$26::interval END,
  CASE WHEN $21='processing' THEN clock_timestamp() END,
- CASE WHEN $21 IN ('failed','skipped') THEN clock_timestamp() END,$27,$28,$29,$30)
+ CASE WHEN $21 IN ('failed','skipped') THEN clock_timestamp() END,$27,$28,$29,$30,$31)
 ON CONFLICT (capture_key) DO NOTHING
 RETURNING id,created_at,updated_at,lease_until,started_at,finished_at,next_attempt_at`,
 		job.CaptureKey, job.UserID, job.APIKeyID, job.GroupID, job.RequestID, nullIfEmpty(job.ConversationKey), string(identity),
 		job.Platform, job.Protocol, job.IngressStage, encodeStoredText(job.RequestedModel),
 		job.ExecutionMode, job.Config.Revision, string(config), input, job.SnapshotStatus, string(manifest),
 		job.InputHash, job.TargetHash, job.EvaluationHash, job.Status, job.Attempts, job.MaxAttempts,
-		job.ClaimGeneration, job.ReuseMode, interval(leaseDuration), job.FailureStage, job.LastErrorCode, encodeStoredText(job.LastErrorMessage), job.CaptureID,
+		job.ClaimGeneration, job.ReuseMode, interval(leaseDuration), job.FailureStage, job.LastErrorCode, encodeStoredText(job.LastErrorMessage), job.CurrentRequestedBy, job.CaptureID,
 	).Scan(&job.ID, &job.CreatedAt, &job.UpdatedAt, &job.LeaseUntil, &job.StartedAt, &job.FinishedAt, &job.NextAttemptAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		var id int64

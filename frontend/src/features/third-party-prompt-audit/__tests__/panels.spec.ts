@@ -6,20 +6,23 @@ import AuditDetail from '../AuditDetail.vue'
 import AuditOverview from '../AuditOverview.vue'
 import CaptureBody from '../CaptureBody.vue'
 import NodeDecision from '../NodeDecision.vue'
+import LatestUserContent from '../LatestUserContent.vue'
+import BaseDialog from '@/components/common/BaseDialog.vue'
+import ThirdPartyPromptAuditView from '@/views/admin/ThirdPartyPromptAuditView.vue'
 import type { AuditJob, SavedConfig } from '@/api/admin/third-party-prompt-audit'
 
-const mocks = vi.hoisted(() => ({ getConfig: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(), listModels: vi.fn(), enableAndReset: vi.fn(), probeDetails: vi.fn(), probe: vi.fn(), saveConfig: vi.fn(), jobs: vi.fn(), job: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), stats: vi.fn(), runtime: vi.fn(), capture: vi.fn(), showError: vi.fn(), showSuccess: vi.fn() }))
+const mocks = vi.hoisted(() => ({ getConfig: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(), listModels: vi.fn(), enableAndReset: vi.fn(), probeDetails: vi.fn(), probe: vi.fn(), saveConfig: vi.fn(), jobs: vi.fn(), job: vi.fn(), jobLatestUserContent: vi.fn(), captureLatestUserContent: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), stats: vi.fn(), runtime: vi.fn(), capture: vi.fn(), showError: vi.fn(), showSuccess: vi.fn() }))
 vi.mock('@/api/admin/third-party-prompt-audit', () => ({ thirdPartyPromptAuditAPI: mocks }))
 vi.mock('@/api/admin/groups', () => ({ getAll: mocks.groups }))
 vi.mock('@/stores/app', () => ({ useAppStore: () => mocks }))
 vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string) => key.split('.').at(-1), te: () => true }) }))
 
 function saved(): SavedConfig {
-  return { mode: 'off', audit_scope: 'full_request', platforms: [], all_groups: true, group_ids: [], excluded_user_ids: [], audit_prompt: 'saved policy',
-    models: [{ id: 'a', name: 'Node', base_url: 'https://example.invalid', model: 'test', enabled: true, timeout_ms: 1000 }],
+  return { mode: 'off', capture_when_audit_off: false, audit_scope: 'full_request', platforms: [], all_groups: true, group_ids: [], excluded_user_ids: [], audit_prompt: 'saved policy',
+    models: [{ id: 'a', name: 'Node', base_url: 'https://example.invalid', model: 'test', enabled: true, timeout_ms: 1000, max_concurrency: 4 }],
     review_threshold: null, block_threshold: null, aggregation: 'any_block', worker_count: 4,
     warning: { enabled: false, window: 0, limit: 0 }, disable: { enabled: false, limit: 0 }, user_rules: [], admin_email: '', revision: 1, warning_rule_revision: 0,
-    has_api_keys: {}, updated_by: 1, updated_at: '2026-09-06T00:00:00Z', application_error: '', applied_revision: 1, instance_id: 'test-instance', model_defaults: { timeout_ms: 300000 },
+    has_api_keys: {}, updated_by: 1, updated_at: '2026-09-06T00:00:00Z', application_error: '', applied_revision: 1, instance_id: 'test-instance', model_defaults: { timeout_ms: 300000, max_concurrency: 4 },
     rule_defaults: { review_threshold: 0.5, block_threshold: 0.8, warning_window: 10, warning_limit: 3, disable_limit: 5 } }
 }
 const stubs = { BaseDialog: { props: ['show'], template: '<div v-if="show"><slot /></div>' }, Pagination: true }
@@ -36,6 +39,8 @@ beforeEach(() => {
   mocks.probe.mockResolvedValue({ ok: true, model_id: 'a', result: { confidence: 0.1, reason: 'normal' }, tested_at: '2026-09-06T00:00:00Z' })
   mocks.stats.mockResolvedValue(null)
   mocks.runtime.mockResolvedValue(null)
+  mocks.jobLatestUserContent.mockResolvedValue({ content: 'latest user text', unavailable_reason: '' })
+  mocks.captureLatestUserContent.mockResolvedValue({ content: 'captured user text', unavailable_reason: '' })
 })
 
 describe('third-party audit configuration', () => {
@@ -84,6 +89,13 @@ describe('third-party audit configuration', () => {
     await refresh.trigger('click'); await flushPromises()
     expect((wrapper.get('[data-test="audit-policy"]').element as HTMLTextAreaElement).value).toBe('unsaved policy')
     expect(wrapper.get('[data-test="fixed-contract"]').element.tagName).toBe('PRE')
+    wrapper.unmount()
+  })
+  it('discards an unsaved draft when its tab refresh key changes', async () => {
+    const wrapper = mount(AuditConfigPanel, { props: { refreshKey: 0 } }); await flushPromises()
+    await wrapper.get('[data-test="audit-policy"]').setValue('unsaved policy')
+    await wrapper.setProps({ refreshKey: 1 }); await flushPromises()
+    expect((wrapper.get('[data-test="audit-policy"]').element as HTMLTextAreaElement).value).toBe('saved policy')
     wrapper.unmount()
   })
   it('sends structural samples as raw JSON text for lossless backend parsing', async () => {
@@ -285,6 +297,17 @@ describe('third-party audit records', () => {
     expect(mocks.capture).toHaveBeenCalledWith(4)
     wrapper.unmount()
   })
+  it('shows live identity order and the latest outcome segment reuse rate', async () => {
+    const job = { id: 9, user_id: 2, display_username: 'nw', display_email: 'nwjump@163.com', current_run_kind: 'request', identity: { api_key_name: 'nw', group_name: 'openai' }, status: 'done', snapshot_status: 'complete', attempts: 1, max_attempts: 3,
+      outcome: { decision: 'pass', models: [], segment_reuse: { reused: 18, total: 20, rate: 0.9 } } } as unknown as AuditJob
+    mocks.jobs.mockResolvedValue({ items: [job], total: 1 })
+    const wrapper = mount(AuditRecords, { global: { stubs: { ...stubs, AuditDetail: true, LatestUserContent: true } } })
+    await flushPromises()
+    expect(wrapper.text()).toContain('(#2)nw')
+    expect(wrapper.text()).toContain('nwjump@163.com')
+    expect(wrapper.text()).toContain('segmentReuseRate 90% 18 / 20')
+    wrapper.unmount()
+  })
   it('defaults batch reaudit to global reuse and can force fresh model calls', async () => {
     const job = { id: 9, current_run_kind: 'request', identity: {}, status: 'failed', snapshot_status: 'complete', attempts: 3, max_attempts: 3 } as unknown as AuditJob
     mocks.jobs.mockResolvedValue({ items: [job], total: 1 })
@@ -338,7 +361,63 @@ describe('lossless full input', () => {
   })
 })
 
+describe('latest user content and dialogs', () => {
+  it('loads job user content lazily on hover', async () => {
+    const wrapper = mount(LatestUserContent, { props: { source: 'job', id: 9, variant: 'popover' }, attachTo: document.body })
+    await wrapper.get('span.inline-block').trigger('mouseenter'); await flushPromises()
+    expect(mocks.jobLatestUserContent).toHaveBeenCalledWith(9)
+    expect(document.body.textContent).toContain('latest user text')
+    await wrapper.get('span.inline-block').trigger('mouseenter'); await flushPromises()
+    expect(mocks.jobLatestUserContent).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+  it('only closes a dialog from its backdrop when enabled', async () => {
+    const enabled = mount(BaseDialog, { props: { show: true, title: 'test', closeOnClickOutside: true }, slots: { default: 'body' }, attachTo: document.body })
+    const enabledBackdrop = document.querySelector('[data-test="dialog-backdrop"]') as HTMLElement
+    enabledBackdrop.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await flushPromises()
+    expect(enabled.emitted('close')).toHaveLength(1)
+    enabled.unmount()
+    const disabled = mount(BaseDialog, { props: { show: true, title: 'test', closeOnClickOutside: false, showCloseButton: false }, attachTo: document.body })
+    const disabledBackdrop = document.querySelector('[data-test="dialog-backdrop"]') as HTMLElement
+    disabledBackdrop.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await flushPromises()
+    expect(disabled.emitted('close')).toBeUndefined()
+    expect(disabled.find('button').exists()).toBe(false)
+    disabled.unmount()
+  })
+})
+
+describe('audit page tab refresh', () => {
+  it('increments only the clicked tab refresh key, including repeated clicks', async () => {
+    history.replaceState(null, '', '/enhance/third-party-prompt-audit')
+    const component = (name: string) => ({ props: ['refreshKey'], template: `<div data-test="${name}">{{ refreshKey }}</div>` })
+    const wrapper = mount(ThirdPartyPromptAuditView, { global: { stubs: { AuditOverview: component('overview'), AuditRecords: component('jobs'), CaptureRecords: component('captures'), AuditConfigPanel: component('config'), SystemUpdatePanel: true } } })
+    const jobs = wrapper.findAll('button').find(button => button.text() === 'jobs')!
+    await jobs.trigger('click')
+    expect(wrapper.get('[data-test="jobs"]').text()).toBe('1')
+    await jobs.trigger('click')
+    expect(wrapper.get('[data-test="jobs"]').text()).toBe('2')
+    expect(wrapper.get('[data-test="overview"]').text()).toBe('0')
+    wrapper.unmount()
+  })
+})
+
 describe('audit overview refresh', () => {
+  it('shows the global segment reuse rate for the current filter', async () => {
+    mocks.stats.mockResolvedValue({
+      from: '2026-09-09T00:00:00Z', to: '2026-09-10T00:00:00Z', timezone: 'Asia/Shanghai', mode: '', model_id: '', stage: '', as_of: '2026-09-10T00:00:00Z',
+      capture_stock: {}, forwarding_stock: {}, action_execution_stock: {}, stock: {}, oldest_waiting_at: null, waiting_for_slot: 0, cohort: {}, received: 0, reaudits_created: 0,
+      formal: {}, reaudit: {}, failures: {}, current_decisions: {}, gateway: {}, gateway_latency: { count: 0, p50_ms: null, p95_ms: null }, task_latency: { count: 0, p50_ms: null, p95_ms: null },
+      calls: [], evaluation_rounds: 0, reuse: { whole_lookups: 0, whole_hits: 0, segment_lookups: 0, segment_hits: 0, within_job_hits: 0, inflight_hits: 0, short_circuited_nodes: 0 },
+      segment_reuse: { reused: 18, total: 20, rate: 0.9 }, actions: {}, notification_stock: {}, delivery_stock: {}, auth_cache_stock: {}
+    })
+    const wrapper = mount(AuditOverview)
+    await flushPromises()
+    expect(wrapper.text()).toContain('globalSegmentReuseRate')
+    expect(wrapper.text()).toContain('90% 18 / 20')
+    wrapper.unmount()
+  })
   it('moves the end time to now before reloading all overview data', async () => {
     const wrapper = mount(AuditOverview)
     await flushPromises()

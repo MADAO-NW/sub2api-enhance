@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	audit "sub2api-enhance/internal/thirdpartypromptaudit"
 	"sync"
@@ -113,22 +115,29 @@ func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *request
 		sequence++
 		seq := sequence
 		c := &audit.Capture{Key: uuid.NewString(), ConversationKey: connectionKey, Transport: "websocket", ConnectionKey: &connectionKey, Sequence: &seq, Protocol: "responses_websocket", Format: "websocket_message", Raw: raw, SnapshotStatus: "complete", Identity: identity, Metadata: map[string]string{"path": r.URL.Path, "mode": p.audit.ModeForUser(identity.UserID), "client_ip": state.clientIP, "content_type": "application/json"}}
-		if p.audit.Mode() == "off" {
+		auditRequired := p.audit.RequiresAudit(identity.UserID, identity.GroupID, identity.Platform)
+		c.Metadata["audit_required"] = strconv.FormatBool(auditRequired)
+		if err := p.captures.Save(ctx, c); err != nil {
+			if auditRequired {
+				sendError("capture_unavailable", "原文尚未确认保存，未转发消息")
+				return
+			}
+			log.Printf("WebSocket 原文保存失败 capture_key=%s error=%v", c.Key, err)
 			if err := upstream.WriteMessage(kind, raw); err != nil {
 				return
 			}
 			continue
-		}
-		if err := p.captures.Save(ctx, c); err != nil {
-			sendError("capture_unavailable", "原文尚未确认保存，未转发消息")
-			return
 		}
 		var event struct {
 			Type string `json:"type"`
 		}
 		_ = json.Unmarshal(raw, &event)
 		// 初始化及更新消息留存但不当作一次违规生成；已有提取器负责 response.create 内的字段。
-		if strings.TrimSpace(event.Type) == "response.create" {
+		if !auditRequired {
+			if err := p.captures.Finish(ctx, c.ID, "awaiting_review", "仅采集原文，等待管理员审核"); err != nil {
+				log.Printf("WebSocket 采集待审核状态补写失败 capture_id=%d error=%v", c.ID, err)
+			}
+		} else if strings.TrimSpace(event.Type) == "response.create" {
 			decision := p.evaluate(ctx, c)
 			if decision != nil && decision.Kind != audit.IngressDecisionAllow && decision.Kind != audit.IngressDecisionFlag {
 				p.observe(ctx, c.ID, "blocked", map[string]any{"code": decision.ErrorCode})

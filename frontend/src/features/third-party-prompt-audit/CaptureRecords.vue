@@ -9,7 +9,9 @@ import { extractApiErrorMessage } from '@/utils/apiError'
 import CaptureBody from './CaptureBody.vue'
 import { useAuditLabels } from './labels'
 import { formatTime } from './viewModel'
+import LatestUserContent from './LatestUserContent.vue'
 
+const props = withDefaults(defineProps<{ refreshKey?: number }>(), { refreshKey: 0 })
 const items = ref<AuditCapture[]>([])
 const total = ref(0)
 const page = ref(1)
@@ -72,6 +74,7 @@ async function reprocess(id: number) {
 }
 
 onMounted(load)
+watch(() => props.refreshKey, () => { void load() })
 </script>
 
 <template>
@@ -89,8 +92,8 @@ onMounted(load)
         <thead><tr><th>ID</th><th>{{ label('created') }}</th><th>{{ label('user') }}</th><th>{{ label('protocol') }}</th><th>{{ label('captureBytes') }}</th><th>{{ label('captureIntegrity') }}</th><th>{{ label('captureEligibility') }}</th><th>{{ label('captureProcessing') }}</th><th>{{ label('forwardingStock') }}</th><th>{{ label('operation') }}</th></tr></thead>
         <tbody>
           <tr v-for="item in items" :key="item.id">
-            <td>{{ item.id }}</td><td class="whitespace-nowrap">{{ formatTime(item.created_at) }}</td><td class="min-w-44 break-words"><p>{{ item.display_username || item.display_email || '—' }}<span v-if="item.identity?.user_id"> (#{{ item.identity.user_id }})</span></p><p v-if="item.display_email" class="text-xs text-gray-500">{{ item.display_email }}</p></td><td>{{ item.protocol }}</td><td>{{ item.body_bytes }}</td><td>{{ label(item.snapshot_status) }}</td><td>{{ label(item.eligibility_status) }}</td><td>{{ label(item.processing_status) }}</td><td>{{ item.forwarding_status ? forwardingLabel(item.forwarding_status) : '—' }}</td>
-            <td><button class="btn btn-secondary btn-sm whitespace-nowrap" @click="detail(item.id)">{{ label('viewCapture') }}</button></td>
+            <td>{{ item.id }}</td><td class="whitespace-nowrap">{{ formatTime(item.created_at) }}</td><td class="min-w-44 break-words"><p v-if="item.identity?.user_id">(#{{ item.identity.user_id }})<span v-if="item.display_username" class="ml-1">{{ item.display_username }}</span></p><p v-else>{{ item.display_username || item.display_email || '—' }}</p><p v-if="item.display_email" class="text-xs text-gray-500">{{ item.display_email }}</p></td><td>{{ item.protocol }}</td><td>{{ item.body_bytes }}</td><td>{{ label(item.snapshot_status) }}</td><td>{{ label(item.eligibility_status) }}</td><td>{{ label(item.processing_status) }}</td><td>{{ item.forwarding_status ? forwardingLabel(item.forwarding_status) : '—' }}</td>
+            <td class="space-x-2"><button class="btn btn-secondary btn-sm whitespace-nowrap" @click="detail(item.id)">{{ label('viewCapture') }}</button><LatestUserContent source="capture" :id="item.id" variant="dialog" /></td>
           </tr>
         </tbody>
       </table>

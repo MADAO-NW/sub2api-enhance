@@ -1,6 +1,8 @@
 package thirdpartypromptaudit
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -70,4 +72,39 @@ func TestMultipartRepeatedTextFieldsRemainSeparate(t *testing.T) {
 	text, _ := json.Marshal(snapshot)
 	require.Contains(t, string(text), "first")
 	require.Contains(t, string(text), "second")
+}
+
+func TestCaptureLatestUserContentDoesNotRequireResolvedIdentity(t *testing.T) {
+	capture := &Capture{Protocol: "responses", Format: "entity_bytes", Raw: []byte(`{"input":"latest capture text"}`), SnapshotStatus: "complete", Metadata: map[string]string{}}
+	result := captureLatestUserContent(capture)
+	require.NotNil(t, result.Content)
+	require.Equal(t, "latest capture text", *result.Content)
+}
+
+func TestCaptureLatestUserContentRestoresCompressedAndMultipartBodies(t *testing.T) {
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	_, err := writer.Write([]byte(`{"messages":[{"role":"user","content":"compressed"}]}`))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	result := captureLatestUserContent(&Capture{Protocol: "openai_chat", Format: "entity_bytes", Raw: compressed.Bytes(), SnapshotStatus: "complete", Metadata: map[string]string{"content_encoding": "gzip"}})
+	require.NotNil(t, result.Content)
+	require.Equal(t, "compressed", *result.Content)
+
+	raw, err := json.Marshal([]map[string]any{{"name": "prompt", "order": 1, "text": "first"}, {"name": "prompt", "order": 2, "text": "second"}})
+	require.NoError(t, err)
+	result = captureLatestUserContent(&Capture{Format: "multipart_text_fields", Raw: raw, SnapshotStatus: "complete", Metadata: map[string]string{}})
+	require.NotNil(t, result.Content)
+	require.Equal(t, "first\nsecond", *result.Content)
+}
+
+func TestCaptureLatestUserContentReportsUnavailableInput(t *testing.T) {
+	for _, capture := range []*Capture{
+		{Protocol: "unknown", Format: "entity_bytes", Raw: []byte(`{}`), SnapshotStatus: "complete", Metadata: map[string]string{}},
+		{Protocol: "openai_chat", Format: "entity_bytes", SnapshotStatus: "incomplete", Metadata: map[string]string{}},
+	} {
+		result := captureLatestUserContent(capture)
+		require.Nil(t, result.Content)
+		require.Equal(t, "input_unavailable", result.UnavailableReason)
+	}
 }

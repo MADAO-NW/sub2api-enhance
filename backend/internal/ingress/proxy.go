@@ -14,6 +14,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sub2api-enhance/internal/sub2api"
 	audit "sub2api-enhance/internal/thirdpartypromptaudit"
@@ -30,6 +31,8 @@ type captureStore interface {
 type auditor interface {
 	Mode() string
 	ModeForUser(int64) string
+	CaptureWhenAuditOff() bool
+	RequiresAudit(int64, *int64, string) bool
 	AuditCapture(context.Context, *audit.Capture) (*audit.IntakeDecision, error)
 	ObserveGateway(context.Context, *audit.IntakeDecision, audit.IngressDecision, time.Duration)
 }
@@ -162,11 +165,16 @@ func auditDeniedMessage(kind audit.IngressDecisionKind) string {
 func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 	state := &requestContext{clientIP: clientIP, started: time.Now()}
 	r = r.WithContext(context.WithValue(r.Context(), contextKey{}, state))
-	if p.audit.Mode() == "off" {
+	auditOff := p.audit.Mode() == "off"
+	if auditOff && !p.audit.CaptureWhenAuditOff() {
 		p.http.ServeHTTP(w, r)
 		return
 	}
 	if websocket.IsWebSocketUpgrade(r) {
+		if auditOff && protocol(r.URL.Path) != "responses" {
+			p.http.ServeHTTP(w, r)
+			return
+		}
 		p.websocket(w, r, state)
 		return
 	}
@@ -247,6 +255,8 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 	c.Identity, err = p.identity.Resolve(identityCtx, r, clientIP)
 	cancel()
 	c.Metadata["mode"] = p.audit.ModeForUser(c.Identity.UserID)
+	auditRequired := kind != "unsupported" && p.audit.RequiresAudit(c.Identity.UserID, c.Identity.GroupID, c.Identity.Platform)
+	c.Metadata["audit_required"] = strconv.FormatBool(auditRequired)
 	if err != nil {
 		c.Error = c.Identity.Reason
 	}
@@ -254,16 +264,30 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 	err = p.captures.Save(save, c)
 	cancel()
 	if err != nil {
-		log.Printf("请求原文保存失败 capture_key=%s", c.Key)
-		writeError(w, kind, 503, "capture_unavailable", "原文尚未确认保存，未转发请求")
-		return
+		log.Printf("请求原文保存失败 capture_key=%s error=%v", c.Key, err)
+		if auditRequired {
+			writeError(w, kind, 503, "capture_unavailable", "原文尚未确认保存，未转发请求")
+			return
+		}
+	} else {
+		state.capture = c
 	}
-	state.capture = c
 	if readErr != nil || c.SnapshotStatus != "complete" {
 		writeError(w, kind, 400, "incomplete_input", "请求输入不完整")
 		return
 	}
-	decision := p.evaluate(r.Context(), c)
+	var decision *audit.IntakeDecision
+	if err == nil {
+		if auditRequired {
+			decision = p.evaluate(r.Context(), c)
+		} else {
+			finish, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+			if finishErr := p.captures.Finish(finish, c.ID, "awaiting_review", "仅采集原文，等待管理员审核"); finishErr != nil {
+				log.Printf("采集待审核状态补写失败 capture_id=%d error=%v", c.ID, finishErr)
+			}
+			cancel()
+		}
+	}
 	if !p.allow(w, kind, c, decision) {
 		return
 	}
@@ -274,7 +298,9 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 	r.Body = io.NopCloser(file)
 	r.ContentLength = count
 	r.GetBody = nil
-	p.observe(r.Context(), c.ID, "started", map[string]any{"transport": "http"})
+	if state.capture != nil {
+		p.observe(r.Context(), c.ID, "started", map[string]any{"transport": "http"})
+	}
 	p.http.ServeHTTP(w, r)
 	if decision != nil {
 		p.audit.ObserveGateway(r.Context(), decision, audit.IngressDecision{AllowNextStage: true, Kind: audit.IngressDecisionAllow}, time.Since(state.started))
@@ -286,6 +312,11 @@ func (p *Proxy) evaluate(ctx context.Context, c *audit.Capture) *audit.IntakeDec
 		mode = p.audit.ModeForUser(c.Identity.UserID)
 	}
 	if c.Identity.Eligibility != "passed" || c.Protocol == "unsupported" {
+		finish, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		if err := p.captures.Finish(finish, c.ID, "awaiting_review", "输入身份或协议不满足自动审核条件，等待管理员审核"); err != nil {
+			log.Printf("采集待审核状态补写失败 capture_id=%d error=%v", c.ID, err)
+		}
+		cancel()
 		if mode == "blocking" {
 			return &audit.IntakeDecision{Mode: "blocking", Kind: audit.IngressDecisionUnavailable, ErrorCode: "eligibility_unknown"}
 		}
@@ -300,7 +331,10 @@ func (p *Proxy) evaluate(ctx context.Context, c *audit.Capture) *audit.IntakeDec
 		if mode == "blocking" {
 			result = &audit.IntakeDecision{Mode: "blocking", Kind: audit.IngressDecisionUnavailable, ErrorCode: "input_parse_failed"}
 		}
-	} else if result != nil && result.JobID == 0 {
+	} else if result == nil {
+		status = "awaiting_review"
+		message = "仅采集原文，等待管理员审核"
+	} else if result.JobID == 0 {
 		status = "retry"
 	}
 	finish, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onUnmounted, ref } from 'vue'
+import { onUnmounted, reactive, ref } from 'vue'
 import CaptureRecords from '@/features/third-party-prompt-audit/CaptureRecords.vue'
 import AuditOverview from '@/features/third-party-prompt-audit/AuditOverview.vue'
 import AuditRecords from '@/features/third-party-prompt-audit/AuditRecords.vue'
@@ -15,11 +15,12 @@ const active = ref(initialTab)
 const visited = ref(initialTab === 'overview' ? ['overview'] : ['overview', initialTab])
 const jobFilter = ref<AuditFilter>({})
 const refreshKey = ref(0)
+const tabRefresh = reactive<Record<string, number>>({ overview: 0, jobs: 0, captures: 0, config: 0 })
 const trackedReaudits = new Map<number, string>()
 let tracking = false
 let disposed = false
-function select(tab: string) { active.value = tab; if (!visited.value.includes(tab)) visited.value.push(tab) }
-function inspectJobs(filter: AuditFilter) { jobFilter.value = filter; select('jobs') }
+function select(tab: string, refresh = true) { active.value = tab; if (!visited.value.includes(tab)) visited.value.push(tab); if (refresh) tabRefresh[tab] = (tabRefresh[tab] ?? 0) + 1 }
+function inspectJobs(filter: AuditFilter) { jobFilter.value = filter; select('jobs', false) }
 async function trackReaudits(ids: number[]) {
   for (const id of ids) if (!trackedReaudits.has(id)) trackedReaudits.set(id, '')
   refreshKey.value++
@@ -55,10 +56,10 @@ onUnmounted(() => { disposed = true })
     <div class="enhance-page space-y-6 pb-8">
       <header><div class="mb-2 flex flex-wrap items-center gap-3"><p class="text-sm font-semibold text-primary-600 dark:text-primary-400">{{ $t('nav.securityAudit') }}</p><SystemUpdatePanel /></div><h1 class="text-2xl font-bold tracking-tight sm:text-3xl">{{ label('title') }}</h1><p class="mt-3 text-gray-500 dark:text-dark-400">{{ label('description') }}</p></header>
       <nav class="flex flex-wrap gap-2" :aria-label="label('title')"><button v-for="tab in ['overview', 'jobs', 'captures', 'config']" :key="tab" class="rounded-xl px-5 py-3 text-sm font-medium transition" :class="active === tab ? 'bg-primary-600 text-white' : 'bg-white text-gray-600 hover:bg-primary-50 dark:bg-dark-800 dark:text-dark-300'" :aria-current="active === tab ? 'page' : undefined" @click="select(tab)">{{ label(tab) }}</button></nav>
-      <AuditOverview v-show="active === 'overview'" :refresh-key="refreshKey" @inspect-jobs="inspectJobs" />
-      <AuditRecords v-if="visited.includes('jobs')" v-show="active === 'jobs'" :initial-filter="jobFilter" :refresh-key="refreshKey" @reaudit-created="trackReaudits" />
-      <CaptureRecords v-if="visited.includes('captures')" v-show="active === 'captures'" />
-      <AuditConfigPanel v-if="visited.includes('config')" v-show="active === 'config'" />
+      <AuditOverview v-show="active === 'overview'" :refresh-key="tabRefresh.overview + refreshKey" @inspect-jobs="inspectJobs" />
+      <AuditRecords v-if="visited.includes('jobs')" v-show="active === 'jobs'" :initial-filter="jobFilter" :refresh-key="tabRefresh.jobs + refreshKey" @reaudit-created="trackReaudits" />
+      <CaptureRecords v-if="visited.includes('captures')" v-show="active === 'captures'" :refresh-key="tabRefresh.captures" />
+      <AuditConfigPanel v-if="visited.includes('config')" v-show="active === 'config'" :refresh-key="tabRefresh.config" />
     </div>
   </main>
 </template>

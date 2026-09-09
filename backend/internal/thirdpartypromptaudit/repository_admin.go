@@ -27,6 +27,13 @@ type OutcomeView struct {
 	*Outcome
 	Models         []ModelResultView `json:"models"`
 	DecisionConfig *DecisionConfig   `json:"decision_config,omitempty"`
+	SegmentReuse   SegmentReuseView  `json:"segment_reuse"`
+}
+
+type SegmentReuseView struct {
+	Reused int      `json:"reused"`
+	Total  int      `json:"total"`
+	Rate   *float64 `json:"rate"`
 }
 
 // outcomeView 派生解释字段，不向持久化结果复制片段最大值或当前配置。
@@ -41,12 +48,20 @@ func outcomeView(outcome *Outcome, config *DecisionConfig) *OutcomeView {
 	for _, model := range outcome.Models {
 		item := ModelResultView{ModelResult: model}
 		for _, segment := range model.Segments {
+			view.SegmentReuse.Total++
+			if slices.Contains([]string{"history", "within_job", "inflight", "full_evaluation"}, segment.ReuseKind) {
+				view.SegmentReuse.Reused++
+			}
 			if item.MaxSegmentConfidence == nil || segment.Result.Confidence > *item.MaxSegmentConfidence {
 				score := segment.Result.Confidence
 				item.MaxSegmentConfidence = &score
 			}
 		}
 		view.Models = append(view.Models, item)
+	}
+	if view.SegmentReuse.Total > 0 {
+		rate := float64(view.SegmentReuse.Reused) / float64(view.SegmentReuse.Total)
+		view.SegmentReuse.Rate = &rate
 	}
 	return view
 }
@@ -67,7 +82,10 @@ const jobOutcomeSummary = `CASE WHEN o.id IS NULL THEN NULL ELSE json_build_obje
  'models',(SELECT COALESCE(json_agg(json_build_object('model_id',m->>'model_id','model_name',m->>'model_name','decision',m->>'decision','basis',m->>'basis','confidence',m->'confidence',
    'reused',m->'reused','joint_attempt_id',CASE WHEN COALESCE((m->>'reused')::boolean,false) THEN NULL ELSE m->'joint_attempt_id' END,'error',m->'error','skipped',m->'skipped','skip_reason',m->'skip_reason',
    'max_segment_confidence',(SELECT MAX((s->'result'->>'confidence')::double precision) FROM json_array_elements(m->'segments') s))),'[]') FROM json_array_elements(o.model_results::json) m),
- 'decision_config',json_build_object('revision',(o.config_snapshot::json->>'revision')::bigint,'review_threshold',o.config_snapshot::json->'review_threshold','block_threshold',o.config_snapshot::json->'block_threshold')
+ 'decision_config',json_build_object('revision',(o.config_snapshot::json->>'revision')::bigint,'review_threshold',o.config_snapshot::json->'review_threshold','block_threshold',o.config_snapshot::json->'block_threshold'),
+ 'segment_reuse',(SELECT json_build_object('reused',count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')),'total',count(*),
+   'rate',CASE WHEN count(*)=0 THEN NULL ELSE (count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')))::double precision/count(*) END)
+   FROM json_array_elements(o.model_results::json) m CROSS JOIN LATERAL json_array_elements(COALESCE(m->'segments','[]'::json)) s)
 ) END`
 
 func validateFilter(filter Filter) error {

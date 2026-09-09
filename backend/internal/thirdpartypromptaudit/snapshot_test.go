@@ -196,3 +196,42 @@ func TestCurrentTurnRetainsTextOnBothSidesOfToolResult(t *testing.T) {
 	}
 	require.Equal(t, "$.messages[0].content[2].text", segments[2].Content[0].SourcePath)
 }
+
+func TestLatestUserContentReturnsOnlyTheLastRealUserSegment(t *testing.T) {
+	snapshot, err := CaptureInput("openai_chat_completions", []byte(`{"messages":[{"role":"user","content":"first"},{"role":"assistant","content":"answer"},{"role":"user","content":[{"type":"text","text":"latest-a"},{"type":"text","text":"latest-b"}]},{"role":"assistant","content":"tail"}]}`))
+	require.NoError(t, err)
+	result := latestUserContent(snapshot)
+	require.NotNil(t, result.Content)
+	require.Equal(t, "latest-a\nlatest-b", *result.Content)
+	require.Empty(t, result.UnavailableReason)
+}
+
+func TestLatestUserContentDoesNotFallBackToAnotherRole(t *testing.T) {
+	snapshot, err := CaptureInput("openai_chat_completions", []byte(`{"messages":[{"role":"system","content":"policy"},{"role":"assistant","content":"answer"}]}`))
+	require.NoError(t, err)
+	result := latestUserContent(snapshot)
+	require.Nil(t, result.Content)
+	require.Equal(t, "user_content_not_found", result.UnavailableReason)
+}
+
+func TestLatestUserContentUsesTheSharedProtocolExtractors(t *testing.T) {
+	tests := []struct {
+		protocol string
+		body     string
+	}{
+		{"openai_responses", `{"input":[{"role":"user","content":[{"type":"input_text","text":"latest"}]}]}`},
+		{"openai_chat", `{"messages":[{"role":"user","content":"latest"}]}`},
+		{"anthropic_messages", `{"messages":[{"role":"user","content":[{"type":"text","text":"latest"}]}]}`},
+		{"gemini_generate_content", `{"contents":[{"role":"user","parts":[{"text":"latest"}]}]}`},
+		{"responses_websocket", `{"type":"response.create","response":{"input":"latest"}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.protocol, func(t *testing.T) {
+			snapshot, err := CaptureInput(test.protocol, []byte(test.body))
+			require.NoError(t, err)
+			result := latestUserContent(snapshot)
+			require.NotNil(t, result.Content)
+			require.Equal(t, "latest", *result.Content)
+		})
+	}
+}

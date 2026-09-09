@@ -40,7 +40,14 @@ func (s *SMTP) SendEmail(ctx context.Context, to, subject, body string) error {
 		return errors.New("邮件标题不能包含换行")
 	}
 	d := net.Dialer{Timeout: 10 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(c.SMTPHost, c.SMTPPort))
+	address := net.JoinHostPort(c.SMTPHost, c.SMTPPort)
+	tlsConfig := &tls.Config{ServerName: c.SMTPHost, MinVersion: tls.VersionTLS12}
+	var conn net.Conn
+	if c.SMTPPort == "465" {
+		conn, err = (&tls.Dialer{NetDialer: &d, Config: tlsConfig}).DialContext(ctx, "tcp", address)
+	} else {
+		conn, err = d.DialContext(ctx, "tcp", address)
+	}
 	if err != nil {
 		return err
 	}
@@ -53,11 +60,13 @@ func (s *SMTP) SendEmail(ctx context.Context, to, subject, body string) error {
 		return err
 	}
 	defer client.Close()
-	if ok, _ := client.Extension("STARTTLS"); !ok {
-		return errors.New("SMTP 服务必须支持 STARTTLS")
-	}
-	if err := client.StartTLS(&tls.Config{ServerName: c.SMTPHost, MinVersion: tls.VersionTLS12}); err != nil {
-		return err
+	if c.SMTPPort != "465" {
+		if ok, _ := client.Extension("STARTTLS"); !ok {
+			return errors.New("SMTP 服务必须支持 STARTTLS")
+		}
+		if err := client.StartTLS(tlsConfig); err != nil {
+			return err
+		}
 	}
 	if c.SMTPUser != "" {
 		if err := client.Auth(smtp.PlainAuth("", c.SMTPUser, c.SMTPPassword, c.SMTPHost)); err != nil {

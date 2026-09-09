@@ -12,7 +12,7 @@ import (
 
 func TestOutcomeExplanationDoesNotMutateStoredScores(t *testing.T) {
 	outcome := &Outcome{JobID: 4, Evaluation: Evaluation{Decision: DecisionPass, Models: []ModelResult{
-		{ModelID: "a", Basis: "segments_all_pass", Segments: []SegmentUse{{Result: SegmentResult{UserID: 7, SourceAttemptID: 91, Score: Score{Confidence: .92}}}, {Result: SegmentResult{UserID: 7, SourceAttemptID: 92, Score: Score{Confidence: .95}}}}},
+		{ModelID: "a", Basis: "segments_all_pass", Segments: []SegmentUse{{ReuseKind: "history", Result: SegmentResult{UserID: 7, SourceAttemptID: 91, Score: Score{Confidence: .92}}}, {ReuseKind: "fresh", Result: SegmentResult{UserID: 7, SourceAttemptID: 92, Score: Score{Confidence: .95}}}}},
 		{ModelID: "b", Error: &AuditError{Code: "timeout"}},
 	}}}
 	threshold := 1.0
@@ -20,6 +20,8 @@ func TestOutcomeExplanationDoesNotMutateStoredScores(t *testing.T) {
 	require.Equal(t, .95, *view.Models[0].MaxSegmentConfidence)
 	require.Nil(t, view.Models[0].Confidence)
 	require.Nil(t, view.Models[1].MaxSegmentConfidence)
+	require.Equal(t, SegmentReuseView{Reused: 1, Total: 2, Rate: view.SegmentReuse.Rate}, view.SegmentReuse)
+	require.Equal(t, .5, *view.SegmentReuse.Rate)
 	raw, err := json.Marshal(view)
 	require.NoError(t, err)
 	var dto map[string]any
@@ -44,7 +46,7 @@ func TestJobListIncludesLatestOutcomeAndOriginalDecision(t *testing.T) {
 	defer db.Close()
 	mock.ExpectQuery(`SELECT COUNT\(\*\).*LEFT JOIN LATERAL.*third_party_prompt_audit_outcomes`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	now := time.Now()
-	record := `{"id":4,"created_at":"` + now.Format(time.RFC3339Nano) + `","display_username":"当前用户名","display_email":"current@example.invalid","decision_config":{"revision":3,"review_threshold":1,"block_threshold":1},"original_decision":"block","outcome":{"id":11,"job_id":4,"user_id":7,"decision":"review","partial_failure":false,"audit_round":2,"reuse_mode":"allow","duration_ms":125,"models":[{"model_id":"a","basis":"joint","confidence":0.65,"max_segment_confidence":0.95,"reused":true,"joint_attempt_id":8}],"decision_config":{"revision":8,"review_threshold":0.5,"block_threshold":0.8}}}`
+	record := `{"id":4,"created_at":"` + now.Format(time.RFC3339Nano) + `","display_username":"当前用户名","display_email":"current@example.invalid","decision_config":{"revision":3,"review_threshold":1,"block_threshold":1},"original_decision":"block","outcome":{"id":11,"job_id":4,"user_id":7,"decision":"review","partial_failure":false,"audit_round":2,"reuse_mode":"allow","duration_ms":125,"models":[{"model_id":"a","basis":"joint","confidence":0.65,"max_segment_confidence":0.95,"reused":true,"joint_attempt_id":8}],"segment_reuse":{"reused":18,"total":20,"rate":0.9},"decision_config":{"revision":8,"review_threshold":0.5,"block_threshold":0.8}}}`
 	mock.ExpectQuery(`SELECT row_to_json\(record\).*AS outcome.*original_decision`).WithArgs(20, 0).WillReturnRows(sqlmock.NewRows([]string{"record"}).AddRow(record))
 	page, err := NewRepository(db).ListJobs(context.Background(), Filter{}, 1, 20)
 	require.NoError(t, err)
@@ -61,6 +63,8 @@ func TestJobListIncludesLatestOutcomeAndOriginalDecision(t *testing.T) {
 	require.Equal(t, .5, *job.Outcome.DecisionConfig.ReviewThreshold)
 	require.Equal(t, .95, *job.Outcome.Models[0].MaxSegmentConfidence)
 	require.True(t, job.Outcome.Models[0].Reused)
+	require.Equal(t, 18, job.Outcome.SegmentReuse.Reused)
+	require.Equal(t, .9, *job.Outcome.SegmentReuse.Rate)
 	require.Nil(t, job.FullInput)
 	require.Empty(t, job.Config.AuditPrompt)
 	require.Empty(t, job.Outcome.Models[0].Segments)

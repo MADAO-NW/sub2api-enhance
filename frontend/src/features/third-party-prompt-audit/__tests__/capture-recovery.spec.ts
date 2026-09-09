@@ -17,10 +17,17 @@ beforeEach(() => {
  mocks.userKeys.mockResolvedValue([{ id: 3, name: 'key' }])
 })
 describe('capture recovery state', () => {
+ it('reloads the current page when the tab refresh key changes', async () => {
+  const wrapper = mount(CaptureRecords, { ...options, props: { refreshKey: 0 } }); await flushPromises()
+  expect(mocks.get).toHaveBeenCalledTimes(1)
+  await wrapper.setProps({ refreshKey: 1 }); await flushPromises()
+  expect(mocks.get).toHaveBeenCalledTimes(2)
+  wrapper.unmount()
+ })
  it('shows username and email together with a forwarding-specific status label', async () => {
   mocks.get.mockResolvedValue({ data: { items: [{ ...base, display_username: '测试用户', display_email: 'user@example.invalid', forwarding_status: 'complete' }], total: 1 } })
   const wrapper = mount(CaptureRecords, options); await flushPromises()
-  expect(wrapper.text()).toContain('测试用户 (#1)')
+  expect(wrapper.text()).toContain('(#1)测试用户')
   expect(wrapper.text()).toContain('user@example.invalid')
   expect(wrapper.text()).toContain('forwarding_complete')
   wrapper.unmount()

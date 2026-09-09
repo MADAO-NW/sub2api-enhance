@@ -68,3 +68,37 @@ func TestWebSocketCapturesMessagesAndBlocksBeforeForward(t *testing.T) {
 		})
 	}
 }
+
+func TestWebSocketCaptureOnlyModeStoresAndForwardsTheMessage(t *testing.T) {
+	var received atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		kind, body, err := conn.ReadMessage()
+		if err == nil {
+			received.Add(1)
+			_ = conn.WriteMessage(kind, body)
+		}
+	}))
+	defer upstream.Close()
+	store := &testCaptures{}
+	proxy, err := New(upstream.URL, store, testAudit{mode: "off", captureWhenOff: true}, testIdentity{})
+	require.NoError(t, err)
+	ingress := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxy.Serve(w, r, "192.0.2.8") }))
+	defer ingress.Close()
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ingress.URL, "http")+"/v1/responses", nil)
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	raw := []byte(`{"type":"response.create","response":{"input":"capture only"}}`)
+	require.NoError(t, conn.WriteMessage(websocket.TextMessage, raw))
+	_, body, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.Equal(t, raw, body)
+	require.EqualValues(t, 1, received.Load())
+	require.True(t, store.saved)
+	require.Equal(t, "awaiting_review", store.finishedStatus)
+}

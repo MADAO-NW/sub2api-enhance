@@ -9,6 +9,7 @@ import { extractApiErrorMessage } from '@/utils/apiError'
 import { configUpdate, editableConfig, formatTime } from './viewModel'
 import { useAuditLabels } from './labels'
 
+const props = withDefaults(defineProps<{ refreshKey?: number }>(), { refreshKey: 0 })
 const label = useAuditLabels()
 const app = useAppStore()
 const saved = ref<SavedConfig | null>(null)
@@ -103,7 +104,7 @@ function refreshProvidersJSON() {
   if (!draft.value) return
   providersJSON.value = JSON.stringify({ $schemaVersion: 1, providers: draft.value.models.map(model => ({
     id: model.id, type: 'openai-chat-completions', enabled: model.enabled, baseUrl: model.base_url,
-    apiModel: model.model, timeoutMs: model.timeout_ms, parameters: model.parameters ?? {}
+    apiModel: model.model, timeoutMs: model.timeout_ms, maxConcurrency: model.max_concurrency, parameters: model.parameters ?? {}
   })) }, null, 2)
   providersJSONError.value = ''
 }
@@ -130,8 +131,10 @@ function applyProvidersJSON() {
       for (const reserved of ['model', 'messages', 'stream']) if (reserved in (parameters as Record<string, unknown>)) throw new Error(`${label('providersJSONReserved')}: ${reserved}`)
       const timeout = Number(provider.timeoutMs)
       if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new Error(label('providersJSONTimeout'))
+	  const maxConcurrency = Number(provider.maxConcurrency ?? saved.value?.model_defaults.max_concurrency)
+	  if (!Number.isSafeInteger(maxConcurrency) || maxConcurrency <= 0) throw new Error(label('providersJSONConcurrency'))
       return { id, name: '', enabled: provider.enabled !== false, base_url: String(provider.baseUrl ?? ''), model: String(provider.apiModel ?? ''),
-		timeout_ms: timeout, parameters: parameters as Record<string, unknown> }
+		timeout_ms: timeout, max_concurrency: maxConcurrency, parameters: parameters as Record<string, unknown> }
     })
     for (const id of Object.keys(keys)) delete keys[id]
     for (const id of Object.keys(modelOptions)) delete modelOptions[id]
@@ -150,8 +153,8 @@ function applyProvidersJSON() {
 function updateKey(modelID: string, value: string) {
   keys[modelID] = { model_id: modelID, action: value ? 'replace' : 'keep', api_key: value }
 }
-async function load() {
-  const preserveDraft = dirty.value
+async function load(force = false) {
+	const preserveDraft = dirty.value && !force
   loading.value = true
   error.value = ''
   const results = await Promise.allSettled([api.getConfig(), api.getContract(), getAll(), api.users()])
@@ -177,7 +180,7 @@ function syncModelNames() {
 function addModel() {
   if (!draft.value || !saved.value) return
   const id = crypto.randomUUID()
-	  draft.value.models.push({ id, name: '', enabled: true, base_url: '', model: '', timeout_ms: saved.value.model_defaults.timeout_ms, parameters: {} })
+	  draft.value.models.push({ id, name: '', enabled: true, base_url: '', model: '', timeout_ms: saved.value.model_defaults.timeout_ms, max_concurrency: saved.value.model_defaults.max_concurrency, parameters: {} })
   keys[id] = { model_id: id, action: 'keep', api_key: '' }
   modelOptions[id] = []
 }
@@ -286,13 +289,14 @@ async function probe(model: AuditModel) {
   finally { probing.value = probing.value.filter(id => id !== model.id) }
 }
 onMounted(load)
+watch(() => props.refreshKey, () => { void load(true) })
 </script>
 
 <template>
   <div class="space-y-5 pb-6">
     <p v-if="loading" role="status">{{ label('loading') }}</p>
     <div v-if="error" class="rounded-xl bg-red-50 p-4 text-red-700 dark:bg-red-950/30 dark:text-red-300" role="alert">
-      {{ error }} <button type="button" class="btn btn-secondary ml-3" @click="load">{{ label('refresh') }}</button>
+      {{ error }} <button type="button" class="btn btn-secondary ml-3" @click="load()">{{ label('refresh') }}</button>
     </div>
     <form v-if="draft && saved" class="space-y-5" @submit.prevent="save">
       <div v-if="saved.application_error" class="rounded-xl bg-amber-50 p-4 text-amber-800 dark:bg-amber-950/30 dark:text-amber-200" role="alert">
@@ -306,6 +310,7 @@ onMounted(load)
             <label class="space-y-2"><span class="text-sm font-medium">{{ label('mode') }}</span>
               <select v-model="draft.mode" class="input"><option v-for="mode in ['off', 'async', 'blocking']" :key="mode" :value="mode">{{ label(mode) }}</option></select>
             </label>
+            <label class="flex items-center gap-2 self-end pb-3 text-sm"><input v-model="draft.capture_when_audit_off" type="checkbox" />{{ label('captureWhenAuditOff') }}</label>
             <label class="space-y-2"><span class="text-sm font-medium">{{ label('scope') }}</span>
               <select v-model="draft.audit_scope" class="input"><option value="full_request">{{ label('full_request') }}</option><option value="current_turn">{{ label('current_turn') }}</option></select>
             </label>
@@ -338,6 +343,7 @@ onMounted(load)
               <label class="space-y-2"><span class="text-sm">{{ label('baseURL') }}</span><input v-model="model.base_url" class="input" type="url" required /></label>
               <label class="space-y-2"><span class="text-sm">{{ label('model') }}</span><input v-model="model.model" class="input" required :list="`audit-models-${model.id}`" :placeholder="label('chooseOrInputModel')" data-test="model-input" /><datalist :id="`audit-models-${model.id}`"><option v-for="option in modelOptions[model.id] ?? []" :key="option" :value="option" /></datalist></label>
               <label class="space-y-2"><span class="text-sm">{{ label('timeout') }}</span><input v-model.number="model.timeout_ms" class="input" type="number" min="1" step="1" required /></label>
+              <label class="space-y-2"><span class="text-sm">{{ label('nodeMaxConcurrency') }}</span><input v-model.number="model.max_concurrency" class="input" type="number" min="1" step="1" required /></label>
             </div>
             <p class="text-sm"><span class="text-gray-500 dark:text-dark-400">{{ label('name') }}：</span>{{ model.name || label('chooseModel') }}</p>
             <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('timeoutHint') }}</p>

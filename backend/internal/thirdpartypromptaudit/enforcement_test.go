@@ -1,9 +1,20 @@
 package thirdpartypromptaudit
 
 import (
+	"context"
+
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/require"
 	"testing"
+	"time"
 )
+
+type recordingEmailSender struct{ recipients []string }
+
+func (sender *recordingEmailSender) SendEmail(_ context.Context, recipient, _, _ string) error {
+	sender.recipients = append(sender.recipients, recipient)
+	return nil
+}
 
 func TestIneligibleResultsCreateNoActionsAndAdministratorsCanReceiveWarnings(t *testing.T) {
 	config := testConfig()
@@ -55,6 +66,27 @@ func TestBlockingNoticeRecipientsAreIndependentAndDeduplicated(t *testing.T) {
 	require.Contains(t, deliveries[0].Subject, "请求已阻止")
 	require.Len(t, actionDeliveries(action, user, "user@example.invalid"), 1)
 	require.Len(t, actionDeliveries(action, user, ""), 1)
+}
+
+func TestNotificationWorkerSendsAdminAndUserDeliveriesIndependently(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	for range 5 {
+		mock.ExpectExec("UPDATE sub2api_enhance.third_party_prompt_audit_enforcement_actions SET notification_status").WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+	sender := &recordingEmailSender{}
+	service := &Service{repo: NewRepository(db), email: sender, metrics: NewRuntimeMetrics()}
+	outcomeID := int64(9)
+	leaseUntil := time.Now().Add(time.Minute)
+	action := &Action{ID: 3, UserID: 7, OutcomeID: &outcomeID, ActionType: "warning", ExecutionStatus: "succeeded", NotificationStatus: "pending", BusinessSnapshot: map[string]any{}, RuleSnapshot: map[string]any{}, ClaimGeneration: 1, LeaseUntil: &leaseUntil, Deliveries: []Delivery{
+		{Recipient: "admin@example.invalid", Kind: "admin", Status: "pending", Attempts: []DeliveryAttempt{}},
+		{Recipient: "user@example.invalid", Kind: "user", Status: "pending", Attempts: []DeliveryAttempt{}},
+	}}
+	service.processAction(context.Background(), action)
+	require.Equal(t, []string{"admin@example.invalid", "user@example.invalid"}, sender.recipients)
+	require.Equal(t, "sent", action.NotificationStatus)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestDisableContributionFollowsTheLatestTaskDecision(t *testing.T) {

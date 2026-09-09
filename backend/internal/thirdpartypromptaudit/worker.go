@@ -33,6 +33,8 @@ func (s *Service) run() {
 			cancel()
 			if err != nil && s.ctx.Err() == nil {
 				s.noteError("config_load_failed", err)
+			} else if err == nil {
+				s.refreshNodeLimits()
 			}
 			recoverCtx, recoverCancel := context.WithTimeout(s.ctx, persistenceTimeout)
 			if err := s.repo.RecoverExpired(recoverCtx); err != nil && s.ctx.Err() == nil {

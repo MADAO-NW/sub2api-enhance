@@ -64,6 +64,7 @@ func (s *Service) Start(parent context.Context) error {
 	if err == nil {
 		err = s.config.Reload(s.ctx)
 	}
+	s.refreshNodeLimits()
 	if err != nil {
 		s.noteError("config_load_failed", err)
 	}
@@ -92,11 +93,11 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDecision {
 	mode := s.config.EffectiveMode()
-	if mode == "off" {
+	if mode == "off" && !request.Manual {
 		return nil
 	}
 	snapshot, configErr := s.config.Active()
-	if configErr == nil && (slices.Contains(snapshot.ExcludedUserIDs, request.UserID) ||
+	if configErr == nil && !request.Manual && (slices.Contains(snapshot.ExcludedUserIDs, request.UserID) ||
 		(!snapshot.AllGroups && (request.GroupID == nil || !slices.Contains(snapshot.GroupIDs, *request.GroupID))) ||
 		(len(snapshot.Platforms) > 0 && !slices.Contains(snapshot.Platforms, request.Provider))) {
 		return nil
@@ -104,6 +105,10 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 	if configErr == nil {
 		snapshot.Config = effectiveConfigForUser(snapshot.Config, request.UserID)
 		mode = snapshot.Mode
+	}
+	if request.Manual {
+		mode = "async"
+		snapshot.Mode = mode
 	}
 	if request.Background && mode == "blocking" {
 		mode = "async"
@@ -149,6 +154,9 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		Identity: Identity{Username: request.Username, UserEmail: request.UserEmail, APIKeyName: request.APIKeyName, GroupName: request.GroupName, Endpoint: request.Endpoint},
 		Platform: request.Provider, Protocol: request.Protocol, IngressStage: request.Stage, RequestedModel: request.Model, ExecutionMode: mode,
 		Config: snapshot, FullInput: input, SnapshotStatus: "complete", Status: "queued"}
+	if request.Manual && request.ActorUserID > 0 {
+		job.CurrentRequestedBy = &request.ActorUserID
+	}
 	if mode == "blocking" {
 		job.Status = "processing"
 	}
@@ -296,6 +304,7 @@ func (s *Service) processJob(parent context.Context, job *Job, foreground bool) 
 		} else if err != nil {
 			failure = &AuditError{Code: "evaluation_binding_unavailable", Stage: "config", Message: err.Error(), Retryable: true}
 		} else {
+			s.evaluator.updateNodeLimits(binding.Models)
 			// 请求的同步/异步语义在入口确定；重新绑定只更新本轮审核配置。
 			binding.Mode = job.ExecutionMode
 			if err = s.repo.BindEvaluationConfig(ctx, job, binding); err != nil {
@@ -437,6 +446,17 @@ func (s *Service) tryAcquireSlot() bool {
 }
 
 func (s *Service) releaseSlot() { s.active.Add(-1); s.notify() }
+
+// refreshNodeLimits 将最新已应用节点容量发布给进程内调度器。
+func (s *Service) refreshNodeLimits() {
+	if s == nil || s.config == nil || s.evaluator == nil {
+		return
+	}
+	snapshot, err := s.config.Active()
+	if err == nil {
+		s.evaluator.updateNodeLimits(snapshot.Models)
+	}
+}
 
 // finishFailure 区分服务暂停、请求结束和业务重试，防止停机耗尽异步任务的评估预算。
 func (s *Service) finishFailure(ctx context.Context, job *Job, failure *AuditError) *AuditError {

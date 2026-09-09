@@ -10,10 +10,12 @@ export interface AuditModel {
   base_url: string
   model: string
   timeout_ms: number
+  max_concurrency: number
   parameters?: Record<string, unknown>
 }
 export interface AuditConfig {
   mode: AuditMode
+  capture_when_audit_off: boolean
   audit_scope: 'full_request' | 'current_turn'
   platforms: string[]
   all_groups: boolean
@@ -40,7 +42,7 @@ export interface UserRuleConfig {
   disable: { enabled: boolean; limit: number }
 }
 export interface SavedConfig extends AuditConfig {
-  model_defaults: { timeout_ms: number }
+  model_defaults: { timeout_ms: number; max_concurrency: number }
   rule_defaults: { review_threshold: number; block_threshold: number; warning_window: number; warning_limit: number; disable_limit: number }
   applied_revision: number
   instance_id: string
@@ -76,7 +78,9 @@ export interface ModelResult {
   skip_reason?: string
   segments: { order: number; source_path: string; reuse_kind: string; result: Score & { id: number; source_role: string; policy_role: string; turn_scope: string } }[]
 }
-export interface Outcome { id: number; job_id: number; user_id: number; audit_round: number; run_kind: 'request' | 'reaudit'; requested_by: number | null; reuse_mode: 'allow' | 'force'; config_snapshot?: AuditConfig & { revision: number }; decision: AuditDecision; models: ModelResult[]; partial_failure: boolean; enforcement_eligible: boolean; source_outcome_id?: number; started_at: string | null; finished_at: string | null; duration_ms: number | null; created_at: string; decision_config?: DecisionConfig }
+export interface SegmentReuse { reused: number; total: number; rate: number | null }
+export interface Outcome { id: number; job_id: number; user_id: number; audit_round: number; run_kind: 'request' | 'reaudit'; requested_by: number | null; reuse_mode: 'allow' | 'force'; config_snapshot?: AuditConfig & { revision: number }; decision: AuditDecision; models: ModelResult[]; partial_failure: boolean; enforcement_eligible: boolean; source_outcome_id?: number; started_at: string | null; finished_at: string | null; duration_ms: number | null; created_at: string; decision_config?: DecisionConfig; segment_reuse: SegmentReuse }
+export interface LatestUserContent { content: string | null; unavailable_reason: string }
 export interface AuditJob {
   capture_id?: number|null
   id: number
@@ -166,7 +170,7 @@ export interface AuditStats extends StatsQuery {
   received: number; reaudits_created: number; formal: Record<string, number>; reaudit: Record<string, number>; failures: Record<string, number>
   current_decisions: Record<string, number>; gateway: Record<string, number>; gateway_latency: Distribution; task_latency: Distribution
   calls: { model_id: string; call_kind: string; stage: string; total: number; http_success: number; valid_result: number; failed: number; unknown: number; in_flight: number; errors: Record<string, number>; latency: Distribution }[]
-  evaluation_rounds: number; reuse: Reuse; actions: Record<string, number>; notification_stock: Record<string, number>; delivery_stock: Record<string, number>; auth_cache_stock: Record<string, number>
+  evaluation_rounds: number; reuse: Reuse; segment_reuse: SegmentReuse; actions: Record<string, number>; notification_stock: Record<string, number>; delivery_stock: Record<string, number>; auth_cache_stock: Record<string, number>
 }
 
 const base = '/admin/third-party-prompt-audit'
@@ -187,7 +191,9 @@ export const thirdPartyPromptAuditAPI = {
   async stats(params: StatsQuery) { return (await apiClient.get<AuditStats>(`${base}/stats`, { params })).data },
   async jobs(filter: AuditFilter, page = 1, pageSize = 20) { return (await apiClient.get<AuditPage<AuditJob>>(`${base}/jobs`, { params: { ...filter, ids: filter.ids?.join(','), page, page_size: pageSize } })).data },
   async job(id: number) { return (await apiClient.get<JobDetail>(`${base}/jobs/${id}`)).data },
+  async jobLatestUserContent(id: number) { return (await apiClient.get<LatestUserContent>(`${base}/jobs/${id}/latest-user-content`)).data },
   async capture(id: number) { return (await apiClient.get<AuditCapture>(`${base}/captures/${id}`)).data },
+  async captureLatestUserContent(id: number) { return (await apiClient.get<LatestUserContent>(`${base}/captures/${id}/latest-user-content`)).data },
   async users() { return (await apiClient.get<AuditUser[]>(`${base}/users`)).data },
   async preview(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits/preview`, value)).data },
   async reaudit(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits`, value)).data },

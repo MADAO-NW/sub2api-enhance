@@ -52,6 +52,20 @@ func (h *AdminHandler) GetCapture(c *gin.Context) {
 		JobID *int64 `json:"job_id"`
 	}{result, linked})
 }
+
+func (h *AdminHandler) GetCaptureLatestUserContent(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		response.BadRequest(c, "采集 ID 无效")
+		return
+	}
+	result, err := h.captures.Get(c.Request.Context(), id)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, captureLatestUserContent(result))
+}
 func (h *AdminHandler) DownloadCapture(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
@@ -80,6 +94,7 @@ func (h *AdminHandler) ReprocessCapture(c *gin.Context) {
 	var existing int64
 	err = h.repo.db.QueryRowContext(c.Request.Context(), `SELECT id FROM sub2api_enhance.third_party_prompt_audit_jobs WHERE capture_id=$1`, id).Scan(&existing)
 	if err == nil {
+		_, _ = h.repo.db.ExecContext(c.Request.Context(), `UPDATE sub2api_enhance.captures SET processing_status='done',updated_at=clock_timestamp() WHERE id=$1`, id)
 		response.Success(c, gin.H{"job_id": existing})
 		return
 	}
@@ -137,13 +152,17 @@ func (h *AdminHandler) ReprocessCapture(c *gin.Context) {
 		respondError(c, err)
 		return
 	}
-	result, err := h.service.AuditCapture(c.Request.Context(), capture)
+	result, err := h.service.ReviewCapture(c.Request.Context(), capture, adminActor(c))
 	if err != nil {
 		respondError(c, err)
 		return
 	}
-	if result == nil {
-		response.BadRequest(c, "审核未启用或该采集不在当前范围内")
+	if result == nil || result.JobID <= 0 {
+		response.BadRequest(c, "无法创建人工审核任务")
+		return
+	}
+	if _, err := h.repo.db.ExecContext(c.Request.Context(), `UPDATE sub2api_enhance.captures SET processing_status='done',updated_at=clock_timestamp() WHERE id=$1`, id); err != nil {
+		respondError(c, err)
 		return
 	}
 	response.Success(c, result)

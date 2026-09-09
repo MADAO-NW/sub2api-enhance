@@ -15,18 +15,33 @@ var ErrNoText = errors.New("没有可审核的文本输入")
 type Evaluator struct {
 	store          EvaluationStore
 	client         *ModelClient
+	scheduler      *nodeScheduler
 	segmentMu      sync.Mutex
 	segmentFlights map[string]*segmentFlight
 }
 
 func NewEvaluator(repository *Repository, client *ModelClient) *Evaluator {
-	return &Evaluator{store: repository, client: client, segmentFlights: make(map[string]*segmentFlight)}
+	return &Evaluator{store: repository, client: client, scheduler: newNodeScheduler(), segmentFlights: make(map[string]*segmentFlight)}
 }
 
 type segmentFlight struct {
 	done    chan struct{}
 	result  SegmentResult
 	failure *AuditError
+}
+
+// updateNodeLimits 懒初始化测试构造的 Evaluator，并发布最新节点容量。
+func (e *Evaluator) updateNodeLimits(models []ModelConfig) {
+	e.nodeScheduler().updateLimits(models)
+}
+
+func (e *Evaluator) nodeScheduler() *nodeScheduler {
+	e.segmentMu.Lock()
+	defer e.segmentMu.Unlock()
+	if e.scheduler == nil {
+		e.scheduler = newNodeScheduler()
+	}
+	return e.scheduler
 }
 
 type auditTarget struct {
@@ -144,6 +159,7 @@ func segmentKey(snapshot ConfigSnapshot, model ModelConfig, segment Segment) (st
 }
 
 func (e *Evaluator) Evaluate(ctx context.Context, job *Job, keys map[string]string) (*Evaluation, *AuditError) {
+	normalizeModelConcurrency(&job.Config.Config)
 	if job.Config.historicalJSON != nil {
 		return nil, &AuditError{Code: "audit_snapshot_requires_reaudit", Stage: "config", Message: "规则结构已更新，请按当前配置重新审核"}
 	}
@@ -173,19 +189,43 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job, keys map[string]stri
 		}
 	}
 	result := &Evaluation{Models: []ModelResult{}}
+	remaining := make([]ModelConfig, 0)
 	allWhole := whole != nil
 	enabledCount := 0
 	for _, model := range job.Config.Models {
 		if model.Enabled {
 			enabledCount++
+			remaining = append(remaining, model)
 		}
 	}
 	blockThreshold := aggregationBlockThreshold(job.Config.Aggregation, enabledCount)
 	blocks := 0
-	for index, model := range job.Config.Models {
-		if !model.Enabled {
-			continue
+	for len(remaining) > 0 {
+		modelIndex := -1
+		for i, model := range remaining {
+			if prior, exists := cached[model.ID]; exists && reusableModel(prior, job.Config.Config) {
+				modelIndex = i
+				break
+			}
 		}
+		var model ModelConfig
+		var release func()
+		if modelIndex >= 0 {
+			model = remaining[modelIndex]
+		} else {
+			var acquireErr error
+			model, release, acquireErr = e.nodeScheduler().acquire(ctx, remaining)
+			if acquireErr != nil {
+				return nil, requestFailure(acquireErr)
+			}
+			for i := range remaining {
+				if remaining[i].ID == model.ID {
+					modelIndex = i
+					break
+				}
+			}
+		}
+		remaining = append(remaining[:modelIndex], remaining[modelIndex+1:]...)
 		if prior, exists := cached[model.ID]; exists && reusableModel(prior, job.Config.Config) {
 			prior.Segments = append([]SegmentUse(nil), prior.Segments...)
 			prior.ModelName = model.Name
@@ -202,7 +242,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job, keys map[string]stri
 				blocks++
 			}
 			if blocks >= blockThreshold && job.Config.Aggregation != "all_block" {
-				appendAggregationSkips(result, job.Config.Models[index+1:], job)
+				appendAggregationSkips(result, remaining, job)
 				break
 			}
 			continue
@@ -211,6 +251,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job, keys map[string]stri
 		nodeCtx, cancel := context.WithTimeout(ctx, time.Duration(model.TimeoutMS)*time.Millisecond)
 		node := e.evaluateModel(nodeCtx, job, model, target, keys)
 		cancel()
+		release()
 		if node.Error != nil && node.Error.Code == "audit_paused" {
 			return nil, node.Error
 		}
@@ -219,7 +260,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job, keys map[string]stri
 			blocks++
 		}
 		if blocks >= blockThreshold && job.Config.Aggregation != "all_block" {
-			appendAggregationSkips(result, job.Config.Models[index+1:], job)
+			appendAggregationSkips(result, remaining, job)
 			break
 		}
 	}

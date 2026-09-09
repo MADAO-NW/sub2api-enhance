@@ -102,3 +102,13 @@ func TestTaskProjectionMigrationTransfersStateBeforeRemovingLegacyRows(t *testin
 	require.Less(t, strings.Index(sql, "UPDATE sub2api_enhance.third_party_prompt_audit_enforcement_states"), strings.Index(sql, "DELETE FROM sub2api_enhance.third_party_prompt_audit_jobs"))
 	require.Less(t, strings.Index(sql, "SET repair_of_attempt_id = NULL"), strings.Index(sql, "DELETE FROM sub2api_enhance.third_party_prompt_audit_model_attempts"))
 }
+
+func TestCaptureReviewMigrationOnlyExtendsTheProcessingState(t *testing.T) {
+	raw, err := files.ReadFile("005_prompt_audit_capture_review.sql")
+	require.NoError(t, err)
+	sql := string(raw)
+	require.Contains(t, sql, "DROP CONSTRAINT captures_processing_status_check")
+	require.Contains(t, sql, "'awaiting_review'")
+	require.NotContains(t, strings.ToUpper(sql), "DELETE FROM")
+	require.NotContains(t, strings.ToUpper(sql), "UPDATE ")
+}

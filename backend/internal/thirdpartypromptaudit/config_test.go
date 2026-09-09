@@ -18,7 +18,7 @@ func testConfig() Config {
 	review, block := 0.5, 0.8
 	cfg.Mode = "async"
 	cfg.ReviewThreshold, cfg.BlockThreshold = &review, &block
-	cfg.Models = []ModelConfig{{ID: "test-node", Name: "测试节点", Model: "test-model", BaseURL: "https://example.invalid", TimeoutMS: 1000, Enabled: true}}
+	cfg.Models = []ModelConfig{{ID: "test-node", Name: "测试节点", Model: "test-model", BaseURL: "https://example.invalid", TimeoutMS: 1000, MaxConcurrency: DefaultNodeMaxConcurrency, Enabled: true}}
 	return cfg
 }
 
@@ -40,6 +40,13 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 	require.EqualValues(t, 5, publicDefaults.DisableLimit)
 	model := testConfig().Models[0]
 	require.Equal(t, 300000, publicConfig(storedConfig{}).ModelDefaults.TimeoutMS)
+	require.Equal(t, 4, publicConfig(storedConfig{}).ModelDefaults.MaxConcurrency)
+	oldConfig := Config{Models: []ModelConfig{{ID: "old", Name: "old", Model: "old", BaseURL: "https://example.invalid", TimeoutMS: 1000}}}
+	normalizeModelConcurrency(&oldConfig)
+	require.Equal(t, DefaultNodeMaxConcurrency, oldConfig.Models[0].MaxConcurrency)
+	invalidModel := oldConfig.Models[0]
+	invalidModel.MaxConcurrency = 0
+	require.ErrorContains(t, validateModel(invalidModel), "最大并发")
 	for _, timeout := range []int{1, DefaultNodeTimeoutMS, 86400000, int(math.MaxInt64 / int64(time.Millisecond))} {
 		model.TimeoutMS = timeout
 		require.NoError(t, validateModel(model))
@@ -48,6 +55,9 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 		model.TimeoutMS = timeout
 		require.Error(t, validateModel(model))
 	}
+	model.TimeoutMS = 1000
+	model.MaxConcurrency = -1
+	require.ErrorContains(t, validateModel(model), "最大并发")
 }
 
 func TestUserRuleOverridesOnlyTheSelectedUsersDecisionAndActions(t *testing.T) {
@@ -70,6 +80,21 @@ func TestUserRuleOverridesOnlyTheSelectedUsersDecisionAndActions(t *testing.T) {
 	config.UserRules[0].Mode = "async"
 	require.Equal(t, "async", effectiveConfigForUser(config, 7).Mode)
 	require.Equal(t, "blocking", effectiveConfigForUser(config, 8).Mode)
+}
+
+func TestCaptureOnlyAndManualReviewStayIndependentFromAutomaticAuditScope(t *testing.T) {
+	config := testConfig()
+	config.Mode = "off"
+	config.CaptureWhenAuditOff = true
+	config.ExcludedUserIDs = []int64{7}
+	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config}}}
+	service := &Service{config: manager, closing: true, metrics: NewRuntimeMetrics()}
+	require.True(t, manager.CaptureWhenAuditOff())
+	require.False(t, service.RequiresAudit(7, nil, "openai"))
+	decision := service.Check(context.Background(), IntakeRequest{Manual: true, UserID: 7, Provider: "openai"})
+	require.NotNil(t, decision)
+	require.Equal(t, "async", decision.Mode)
+	require.Equal(t, IngressDecisionUnavailable, decision.Kind)
 }
 
 func TestPerUserModeRespectsGlobalOffAndFreezesEvaluationCredentials(t *testing.T) {

@@ -646,6 +646,13 @@ func TestNodeParametersChangeReuseFingerprints(t *testing.T) {
 	previousEvaluation := job.EvaluationHash
 	previousSegment, _, err := segmentKey(job.Config, job.Config.Models[0], target.Messages[0])
 	require.NoError(t, err)
+	job.Config.Models[0].MaxConcurrency++
+	_, err = prepareTarget(job)
+	require.NoError(t, err)
+	concurrencySegment, _, err := segmentKey(job.Config, job.Config.Models[0], target.Messages[0])
+	require.NoError(t, err)
+	require.Equal(t, previousEvaluation, job.EvaluationHash)
+	require.Equal(t, previousSegment, concurrencySegment)
 	job.Config.Models[0].Parameters = map[string]any{"reasoning_effort": "none"}
 	_, err = prepareTarget(job)
 	require.NoError(t, err)
@@ -655,7 +662,7 @@ func TestNodeParametersChangeReuseFingerprints(t *testing.T) {
 	require.NotEqual(t, previousSegment, currentSegment)
 }
 
-func TestNodesRunInOrderAndEachSharesOneDeadlineAcrossStages(t *testing.T) {
+func TestNodesRunOnceInScheduledOrderAndEachSharesOneDeadlineAcrossStages(t *testing.T) {
 	for _, nodeCount := range []int{1, 4} {
 		t.Run(fmt.Sprintf("nodes=%d", nodeCount), func(t *testing.T) {
 			store := &budgetAuditStore{memoryAuditStore: &memoryAuditStore{}, deadlines: map[string][]time.Time{}}
@@ -678,20 +685,26 @@ func TestNodesRunInOrderAndEachSharesOneDeadlineAcrossStages(t *testing.T) {
 			job.Config.Aggregation = "all_block"
 			base := job.Config.Models[0]
 			job.Config.Models = nil
-			var expected []string
 			for i := range nodeCount {
 				model := base
 				model.ID, model.Model = fmt.Sprintf("node-%d", i), fmt.Sprintf("model-%d", i)
 				model.TimeoutMS = DefaultNodeTimeoutMS
 				job.Config.Models = append(job.Config.Models, model)
-				expected = append(expected, model.Model, model.Model, model.Model)
 			}
 			before := time.Now()
 			evaluator := &Evaluator{store: store, client: &ModelClient{attempts: store}}
 			result, failure := evaluator.Evaluate(context.Background(), job, nil)
 			require.Nil(t, failure)
 			require.Equal(t, DecisionBlock, result.Decision)
-			require.Equal(t, expected, order)
+			require.Len(t, order, nodeCount*3)
+			seen := map[string]bool{}
+			for i := 0; i < len(order); i += 3 {
+				require.Equal(t, order[i], order[i+1])
+				require.Equal(t, order[i], order[i+2])
+				require.False(t, seen[order[i]], "同一次执行不能重复选择节点")
+				seen[order[i]] = true
+			}
+			require.Len(t, seen, nodeCount)
 			for _, deadlines := range store.deadlines {
 				require.Len(t, deadlines, 3)
 				require.Equal(t, deadlines[0], deadlines[1])

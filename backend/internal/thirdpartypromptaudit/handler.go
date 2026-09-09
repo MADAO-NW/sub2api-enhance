@@ -93,6 +93,7 @@ func (h *AdminHandler) UpdateConfig(c *gin.Context) {
 	}
 	middleware.SetAuditExtra(c, map[string]any{"result": "success", "previous_revision": before.Revision, "revision": result.Revision})
 	h.service.notify()
+	h.service.refreshNodeLimits()
 	h.config.mu.RLock()
 	if h.config.active != nil {
 		result.AppliedRevision = h.config.active.Stored.Revision
@@ -266,6 +267,19 @@ func (h *AdminHandler) GetJob(c *gin.Context) {
 		return
 	}
 	result, err := h.repo.JobDetail(c.Request.Context(), id)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AdminHandler) GetJobLatestUserContent(c *gin.Context) {
+	id, ok := recordID(c)
+	if !ok {
+		return
+	}
+	result, err := h.repo.JobLatestUserContent(c.Request.Context(), id)
 	if err != nil {
 		respondError(c, err)
 		return

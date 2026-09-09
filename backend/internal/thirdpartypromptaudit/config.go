@@ -27,6 +27,9 @@ const configLockKey int64 = 579147893221901941
 // DefaultNodeTimeoutMS 为新增节点提供默认总审核预算，已有节点必须显式提交超时。
 const DefaultNodeTimeoutMS = 300000
 
+// DefaultNodeMaxConcurrency 保持单个节点相对既有默认 Worker 的安全并发上限。
+const DefaultNodeMaxConcurrency = 4
+
 // defaultReviewThreshold 是新配置默认触发联合审核和待复核的风险分数。
 const defaultReviewThreshold = 0.5
 
@@ -46,13 +49,14 @@ const defaultDisableLimit = 5
 const legacyDefaultPolicySHA256 = "9071cf397aa94bca6982620a56c908a5977fdfc94206c7e198f160c5f65b2e0d"
 
 type ModelConfig struct {
-	ID         string         `json:"id"`
-	Name       string         `json:"name"`
-	Enabled    bool           `json:"enabled"`
-	BaseURL    string         `json:"base_url"`
-	Model      string         `json:"model"`
-	TimeoutMS  int            `json:"timeout_ms"`
-	Parameters map[string]any `json:"parameters,omitempty"`
+	ID             string         `json:"id"`
+	Name           string         `json:"name"`
+	Enabled        bool           `json:"enabled"`
+	BaseURL        string         `json:"base_url"`
+	Model          string         `json:"model"`
+	TimeoutMS      int            `json:"timeout_ms"`
+	MaxConcurrency int            `json:"max_concurrency,omitempty"`
+	Parameters     map[string]any `json:"parameters,omitempty"`
 }
 
 type WarningConfig struct {
@@ -77,22 +81,23 @@ type UserRuleConfig struct {
 }
 
 type Config struct {
-	Mode            string           `json:"mode"`
-	AuditScope      string           `json:"audit_scope"`
-	Platforms       []string         `json:"platforms"`
-	AllGroups       bool             `json:"all_groups"`
-	GroupIDs        []int64          `json:"group_ids"`
-	ExcludedUserIDs []int64          `json:"excluded_user_ids"`
-	AuditPrompt     string           `json:"audit_prompt"`
-	Models          []ModelConfig    `json:"models"`
-	ReviewThreshold *float64         `json:"review_threshold"`
-	BlockThreshold  *float64         `json:"block_threshold"`
-	Aggregation     string           `json:"aggregation"`
-	WorkerCount     int              `json:"worker_count"`
-	Warning         WarningConfig    `json:"warning"`
-	Disable         DisableConfig    `json:"disable"`
-	UserRules       []UserRuleConfig `json:"user_rules"`
-	AdminEmail      string           `json:"admin_email"`
+	Mode                string           `json:"mode"`
+	CaptureWhenAuditOff bool             `json:"capture_when_audit_off"`
+	AuditScope          string           `json:"audit_scope"`
+	Platforms           []string         `json:"platforms"`
+	AllGroups           bool             `json:"all_groups"`
+	GroupIDs            []int64          `json:"group_ids"`
+	ExcludedUserIDs     []int64          `json:"excluded_user_ids"`
+	AuditPrompt         string           `json:"audit_prompt"`
+	Models              []ModelConfig    `json:"models"`
+	ReviewThreshold     *float64         `json:"review_threshold"`
+	BlockThreshold      *float64         `json:"block_threshold"`
+	Aggregation         string           `json:"aggregation"`
+	WorkerCount         int              `json:"worker_count"`
+	Warning             WarningConfig    `json:"warning"`
+	Disable             DisableConfig    `json:"disable"`
+	UserRules           []UserRuleConfig `json:"user_rules"`
+	AdminEmail          string           `json:"admin_email"`
 }
 
 type ConfigSnapshot struct {
@@ -123,6 +128,7 @@ func (snapshot *ConfigSnapshot) UnmarshalJSON(raw []byte) error {
 		return err
 	}
 	*snapshot = ConfigSnapshot(value)
+	normalizeModelConcurrency(&snapshot.Config)
 	if snapshot.AuditScope == "" {
 		snapshot.AuditScope = "full_request"
 	}
@@ -156,7 +162,8 @@ type storedConfig struct {
 
 type PublicConfig struct {
 	ModelDefaults struct {
-		TimeoutMS int `json:"timeout_ms"`
+		TimeoutMS      int `json:"timeout_ms"`
+		MaxConcurrency int `json:"max_concurrency"`
 	} `json:"model_defaults"`
 	RuleDefaults struct {
 		ReviewThreshold float64 `json:"review_threshold"`
@@ -223,6 +230,18 @@ func DefaultConfig() Config {
 		Aggregation: "any_block", WorkerCount: 4,
 		Warning: WarningConfig{Window: defaultWarningWindow, Limit: defaultWarningLimit},
 		Disable: DisableConfig{Limit: defaultDisableLimit}, UserRules: []UserRuleConfig{}}
+}
+
+// normalizeModelConcurrency 为旧配置和旧任务快照补齐节点默认并发。
+func normalizeModelConcurrency(config *Config) {
+	if config == nil {
+		return
+	}
+	for i := range config.Models {
+		if config.Models[i].MaxConcurrency == 0 {
+			config.Models[i].MaxConcurrency = DefaultNodeMaxConcurrency
+		}
+	}
 }
 
 // effectiveConfigForUser 将单个用户覆盖合并到全局默认规则，并移除不再需要的覆盖列表。
@@ -381,6 +400,9 @@ func validateModel(model ModelConfig) error {
 	if model.TimeoutMS <= 0 || int64(model.TimeoutMS) > math.MaxInt64/int64(time.Millisecond) {
 		return errors.New("节点超时必须是有效的正毫秒数")
 	}
+	if model.MaxConcurrency < 1 {
+		return errors.New("节点最大并发数必须大于 0")
+	}
 	if _, err := chatCompletionsURL(model.BaseURL); err != nil {
 		return err
 	}
@@ -455,6 +477,7 @@ func (m *ConfigManager) Reload(ctx context.Context) (loadErr error) {
 	}
 	// 节点名称是模型选择的派生展示值，旧配置加载后也立即使用统一规则。
 	normalizeModelNames(&stored.Config)
+	normalizeModelConcurrency(&stored.Config)
 	normalizeUserRuleModes(&stored.Config)
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -584,6 +607,13 @@ func (m *ConfigManager) EffectiveModeForUser(userID int64) string {
 	return effectiveConfigForUser(m.active.Stored.Config, userID).Mode
 }
 
+// CaptureWhenAuditOff 返回全局关闭时是否仍启用独立原文采集。
+func (m *ConfigManager) CaptureWhenAuditOff() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.active != nil && m.loadError == nil && m.active.Stored.CaptureWhenAuditOff
+}
+
 // EvaluationBinding 在同一配置读锁内冻结当前用户规则、审核节点及节点凭据。
 func (m *ConfigManager) EvaluationBinding(userID int64) (ConfigSnapshot, map[string]string, error) {
 	m.mu.RLock()
@@ -630,11 +660,13 @@ func publicConfig(stored storedConfig) PublicConfig {
 	display := stored.Config
 	display.Models = append([]ModelConfig(nil), stored.Models...)
 	normalizeModelNames(&display)
+	normalizeModelConcurrency(&display)
 	normalizeUserRuleModes(&display)
 	result := PublicConfig{Config: display, Revision: stored.Revision,
 		WarningRuleRevision: stored.WarningRuleRevision, HasAPIKeys: keys,
 		UpdatedAt: stored.UpdatedAt, UpdatedBy: stored.UpdatedBy}
 	result.ModelDefaults.TimeoutMS = DefaultNodeTimeoutMS
+	result.ModelDefaults.MaxConcurrency = DefaultNodeMaxConcurrency
 	result.RuleDefaults.ReviewThreshold = defaultReviewThreshold
 	result.RuleDefaults.BlockThreshold = defaultBlockThreshold
 	result.RuleDefaults.WarningWindow = defaultWarningWindow
