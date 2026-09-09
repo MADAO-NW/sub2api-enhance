@@ -204,7 +204,7 @@ func TestCompleteIsIdempotentAndFencesExpiredOwners(t *testing.T) {
 			mock.ExpectQuery("SELECT status,claim_generation").WithArgs(int64(9)).WillReturnRows(sqlmock.NewRows([]string{"status", "generation", "valid"}).AddRow(status, 2, false))
 			if done {
 				mock.ExpectCommit()
-				mock.ExpectQuery("SELECT id,job_id,user_id,decision").WithArgs(int64(9)).WillReturnRows(sqlmock.NewRows([]string{"id", "job_id", "user_id", "decision", "partial", "eligible", "models", "source", "created"}).AddRow(4, 9, 1, "block", false, true, "[]", nil, time.Now()))
+				mock.ExpectQuery("SELECT id,job_id,user_id,decision").WithArgs(int64(9)).WillReturnRows(sqlmock.NewRows([]string{"id", "job_id", "user_id", "decision", "partial", "eligible", "models", "source", "created", "audit_round", "run_kind", "requested_by", "config", "started", "finished"}).AddRow(4, 9, 1, "block", false, true, "[]", nil, time.Now(), 1, "request", nil, "{}", nil, time.Now()))
 			} else {
 				mock.ExpectRollback()
 			}
@@ -227,7 +227,7 @@ func TestHistoricalCheckpointDoesNotEnterModelEvaluation(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT status,claim_generation").WithArgs(int64(9)).WillReturnRows(sqlmock.NewRows([]string{"status", "generation", "valid"}).AddRow("done", 2, false))
 	mock.ExpectCommit()
-	mock.ExpectQuery("SELECT id,job_id,user_id,decision").WithArgs(int64(9)).WillReturnRows(sqlmock.NewRows([]string{"id", "job_id", "user_id", "decision", "partial", "eligible", "models", "source", "created"}).AddRow(4, 9, 1, "pass", false, false, "[]", nil, time.Now()))
+	mock.ExpectQuery("SELECT id,job_id,user_id,decision").WithArgs(int64(9)).WillReturnRows(sqlmock.NewRows([]string{"id", "job_id", "user_id", "decision", "partial", "eligible", "models", "source", "created", "audit_round", "run_kind", "requested_by", "config", "started", "finished"}).AddRow(4, 9, 1, "pass", false, false, "[]", nil, time.Now(), 1, "request", nil, "{}", nil, time.Now()))
 	var config ConfigSnapshot
 	require.NoError(t, json.Unmarshal([]byte(`{"fixed_roles":"历史规则"}`), &config))
 	job := &Job{ID: 9, Config: config, ExecutionMode: "async", Checkpoint: &Evaluation{Decision: DecisionPass}}

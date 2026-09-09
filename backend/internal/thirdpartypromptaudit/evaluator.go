@@ -107,10 +107,11 @@ func collectApplicationContext(root map[string]any, path string, result map[stri
 func modelSemantics(model ModelConfig) any {
 	return struct {
 		ID, BaseURL, Model string
-	}{model.ID, model.BaseURL, model.Model}
+		Parameters         map[string]any
+	}{model.ID, model.BaseURL, model.Model, model.Parameters}
 }
 
-func segmentKey(snapshot ConfigSnapshot, model ModelConfig, segment Segment) (string, string, error) {
+func segmentKey(snapshot ConfigSnapshot, model ModelConfig, segment Segment, conversationKey string) (string, string, error) {
 	content := make([]struct{ Type, Text string }, 0, len(segment.Content))
 	for _, block := range segment.Content {
 		content = append(content, struct{ Type, Text string }{block.Type, block.Text})
@@ -120,11 +121,11 @@ func segmentKey(snapshot ConfigSnapshot, model ModelConfig, segment Segment) (st
 		return "", "", err
 	}
 	key, err := fingerprint(struct {
-		Model                                                                     any
-		Policy, Contract, Version, SourceRole, PolicyRole, TurnScope, ContentHash string
-		Stage                                                                     string
+		Model                                                                                      any
+		Policy, Contract, Version, SourceRole, PolicyRole, TurnScope, ContentHash, ConversationKey string
+		Stage                                                                                      string
 	}{modelSemantics(model), snapshot.AuditPrompt, snapshot.FixedContract, snapshot.ContractVersion,
-		segment.SourceRole, segment.PolicyRole, segment.TurnScope, contentHash, "segment"})
+		segment.SourceRole, segment.PolicyRole, segment.TurnScope, contentHash, conversationKey, "segment"})
 	return key, contentHash, err
 }
 
@@ -143,7 +144,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job) (*Evaluation, *Audit
 		return nil, &AuditError{Code: "input_parse_failed", Stage: "input_parse", Message: err.Error()}
 	}
 	var whole *Outcome
-	if job.RunKind != "reaudit" {
+	if job.auditRunKind() != "reaudit" && job.ConversationKey != "" {
 		job.Reuse.WholeLookups++
 		// 复用读取失败可回退评估；真实调用仍须先完成调用日志持久化。
 		whole, _ = e.store.FindWholeResult(ctx, job)
@@ -156,7 +157,15 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job) (*Evaluation, *Audit
 	}
 	result := &Evaluation{Models: []ModelResult{}}
 	allWhole := whole != nil
+	enabledCount := 0
 	for _, model := range job.Config.Models {
+		if model.Enabled {
+			enabledCount++
+		}
+	}
+	blockThreshold := aggregationBlockThreshold(job.Config.Aggregation, enabledCount)
+	blocks := 0
+	for index, model := range job.Config.Models {
 		if !model.Enabled {
 			continue
 		}
@@ -171,6 +180,13 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job) (*Evaluation, *Audit
 				prior.Segments[i].ReuseKind = "full_evaluation"
 			}
 			result.Models = append(result.Models, prior)
+			if prior.Decision == DecisionBlock {
+				blocks++
+			}
+			if blocks >= blockThreshold && job.Config.Aggregation != "all_block" {
+				appendAggregationSkips(result, job.Config.Models[index+1:], job)
+				break
+			}
 			continue
 		}
 		allWhole = false
@@ -181,6 +197,13 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job) (*Evaluation, *Audit
 			return nil, node.Error
 		}
 		result.Models = append(result.Models, node)
+		if node.Decision == DecisionBlock {
+			blocks++
+		}
+		if blocks >= blockThreshold && job.Config.Aggregation != "all_block" {
+			appendAggregationSkips(result, job.Config.Models[index+1:], job)
+			break
+		}
 	}
 	decision, partial, failure := AggregateResults(result.Models, job.Config.Config)
 	if failure != nil {
@@ -192,6 +215,27 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job) (*Evaluation, *Audit
 		result.SourceOutcomeID = &whole.ID
 	}
 	return result, nil
+}
+
+func aggregationBlockThreshold(aggregation string, enabled int) int {
+	switch aggregation {
+	case "majority_block":
+		return enabled/2 + 1
+	case "all_block":
+		return enabled
+	default:
+		return 1
+	}
+}
+
+func appendAggregationSkips(result *Evaluation, models []ModelConfig, job *Job) {
+	for _, model := range models {
+		if !model.Enabled {
+			continue
+		}
+		result.Models = append(result.Models, ModelResult{ModelID: model.ID, ModelName: model.Name, Basis: "aggregation_decided", Skipped: true, SkipReason: "aggregation_decided", Segments: []SegmentUse{}})
+		job.Reuse.ShortCircuited++
+	}
 }
 
 func reusableModel(model ModelResult, config Config) bool {
@@ -217,7 +261,7 @@ func (e *Evaluator) evaluateModel(ctx context.Context, job *Job, model ModelConf
 	keys := make([]string, len(target.Messages))
 	hashes := make([]string, len(target.Messages))
 	for i, segment := range target.Messages {
-		key, hash, err := segmentKey(job.Config, model, segment)
+		key, hash, err := segmentKey(job.Config, model, segment, job.ConversationKey)
 		if err != nil {
 			node.Error = &AuditError{Code: "input_hash_failed", Stage: "input_parse", Message: err.Error()}
 			return node
@@ -225,7 +269,7 @@ func (e *Evaluator) evaluateModel(ctx context.Context, job *Job, model ModelConf
 		keys[i], hashes[i] = key, hash
 	}
 	stored := make(map[string]SegmentResult)
-	if job.RunKind != "reaudit" {
+	if job.auditRunKind() != "reaudit" && job.ConversationKey != "" {
 		job.Reuse.SegmentLookups += len(keys)
 		if found, err := e.store.FindSegments(ctx, job.UserID, model.ID, keys); err == nil {
 			stored = found
@@ -306,20 +350,20 @@ func AggregateResults(models []ModelResult, config Config) (Decision, bool, *Aud
 	if len(models) == 0 {
 		return "", false, &AuditError{Code: "no_models", Stage: "config", Message: "没有启用审核节点"}
 	}
-	threshold := 1
+	threshold := aggregationBlockThreshold(config.Aggregation, len(models))
 	switch config.Aggregation {
-	case "majority_block":
-		threshold = len(models)/2 + 1
-	case "all_block":
-		threshold = len(models)
-	case "any_block":
+	case "majority_block", "all_block", "any_block":
 	default:
 		return "", false, &AuditError{Code: "invalid_aggregation", Stage: "config", Message: "聚合规则无效"}
 	}
-	blocks, reviews, failures := 0, 0, 0
+	blocks, reviews, failures, skipped := 0, 0, 0, 0
 	var firstFailure *AuditError
 	var retryAfter time.Duration
 	for _, model := range models {
+		if model.Skipped {
+			skipped++
+			continue
+		}
 		if model.Error != nil {
 			if model.Error.RetryAfter > retryAfter {
 				retryAfter = model.Error.RetryAfter
@@ -343,6 +387,9 @@ func AggregateResults(models []ModelResult, config Config) (Decision, bool, *Aud
 	}
 	if blocks >= threshold {
 		return DecisionBlock, failures > 0, nil
+	}
+	if skipped > 0 {
+		return "", failures > 0, &AuditError{Code: "invalid_model_result", Stage: "aggregate", Message: "聚合尚未确定时不能跳过审核节点"}
 	}
 	if blocks+failures >= threshold {
 		if firstFailure == nil {

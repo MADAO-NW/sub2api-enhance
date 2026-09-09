@@ -21,6 +21,13 @@ type EvaluationStore interface {
 	SaveSegment(context.Context, *Job, *SegmentResult) error
 }
 
+func jobAuditRound(job *Job) int {
+	if job == nil || job.AuditRound < 1 {
+		return 1
+	}
+	return job.AuditRound
+}
+
 func (r *Repository) PrepareAttempt(ctx context.Context, job *Job, attempt *ModelAttempt) error {
 	model, err := json.Marshal(attempt.ModelSnapshot)
 	if err != nil {
@@ -31,10 +38,10 @@ func (r *Repository) PrepareAttempt(ctx context.Context, job *Job, attempt *Mode
 		generation = job.ClaimGeneration
 	}
 	err = r.db.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_model_attempts
- (job_id,call_kind,evaluation_round,model_id,model_snapshot,stage,segment_order,repair_of_attempt_id,request_metadata)
- SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9
- WHERE $1::bigint IS NULL OR EXISTS (SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_jobs WHERE id=$1 AND claim_generation=$10 AND status='processing' AND lease_until>clock_timestamp())
- RETURNING id,created_at`, attempt.JobID, attempt.CallKind, attempt.EvaluationRound, attempt.ModelID,
+	 (job_id,call_kind,evaluation_round,audit_round,model_id,model_snapshot,stage,segment_order,repair_of_attempt_id,request_metadata)
+	 SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10
+	 WHERE $1::bigint IS NULL OR EXISTS (SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_jobs WHERE id=$1 AND claim_generation=$11 AND status='processing' AND lease_until>clock_timestamp())
+	 RETURNING id,created_at`, attempt.JobID, attempt.CallKind, attempt.EvaluationRound, jobAuditRound(job), attempt.ModelID,
 		string(model), attempt.Stage, attempt.SegmentOrder, attempt.RepairOfAttemptID, string(attempt.RequestMetadata), generation,
 	).Scan(&attempt.ID, &attempt.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -129,21 +136,22 @@ func (r *Repository) SaveSegment(ctx context.Context, job *Job, item *SegmentRes
 }
 
 func (r *Repository) FindWholeResult(ctx context.Context, job *Job) (*Outcome, error) {
-	return r.queryOutcome(ctx, `SELECT o.id,o.job_id,o.user_id,o.decision,o.partial_failure,o.enforcement_eligible,o.model_results,o.source_outcome_id,o.created_at
+	return r.queryOutcome(ctx, `SELECT o.id,o.job_id,o.user_id,o.decision,o.partial_failure,o.enforcement_eligible,o.model_results,o.source_outcome_id,o.created_at,o.audit_round,o.run_kind,o.requested_by,o.config_snapshot,o.started_at,o.finished_at
  FROM sub2api_enhance.third_party_prompt_audit_outcomes o JOIN sub2api_enhance.third_party_prompt_audit_jobs j ON j.id=o.job_id
- WHERE j.user_id=$1 AND j.evaluation_hash=$2 AND j.target_hash=$3 AND NOT o.partial_failure AND o.source_outcome_id IS NULL
- ORDER BY o.id DESC LIMIT 1`, job.UserID, job.EvaluationHash, job.TargetHash)
+	 WHERE j.user_id=$1 AND j.conversation_key=$2 AND j.evaluation_hash=$3 AND j.target_hash=$4 AND NOT o.partial_failure AND o.source_outcome_id IS NULL
+	 ORDER BY o.id DESC LIMIT 1`, job.UserID, job.ConversationKey, job.EvaluationHash, job.TargetHash)
 }
 
 func (r *Repository) GetOutcome(ctx context.Context, jobID int64) (*Outcome, error) {
-	return r.queryOutcome(ctx, `SELECT id,job_id,user_id,decision,partial_failure,enforcement_eligible,model_results,source_outcome_id,created_at FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1`, jobID)
+	return r.queryOutcome(ctx, `SELECT id,job_id,user_id,decision,partial_failure,enforcement_eligible,model_results,source_outcome_id,created_at,audit_round,run_kind,requested_by,config_snapshot,started_at,finished_at FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1 ORDER BY audit_round DESC,id DESC LIMIT 1`, jobID)
 }
 
 func (r *Repository) queryOutcome(ctx context.Context, query string, args ...any) (*Outcome, error) {
 	var outcome Outcome
-	var models string
+	var models, config string
 	err := r.db.QueryRowContext(ctx, query, args...).Scan(&outcome.ID, &outcome.JobID, &outcome.UserID, &outcome.Decision,
-		&outcome.PartialFailure, &outcome.EnforcementEligible, &models, &outcome.SourceOutcomeID, &outcome.CreatedAt)
+		&outcome.PartialFailure, &outcome.EnforcementEligible, &models, &outcome.SourceOutcomeID, &outcome.CreatedAt, &outcome.AuditRound,
+		&outcome.RunKind, &outcome.RequestedBy, &config, &outcome.StartedAt, &outcome.FinishedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -152,6 +160,16 @@ func (r *Repository) queryOutcome(ctx context.Context, query string, args ...any
 	}
 	if err := json.Unmarshal([]byte(models), &outcome.Models); err != nil {
 		return nil, err
+	}
+	if err := json.Unmarshal([]byte(config), &outcome.Config); err != nil {
+		return nil, err
+	}
+	if outcome.StartedAt != nil && outcome.FinishedAt != nil {
+		duration := outcome.FinishedAt.Sub(*outcome.StartedAt).Milliseconds()
+		if duration < 0 {
+			duration = 0
+		}
+		outcome.DurationMS = &duration
 	}
 	return &outcome, nil
 }
@@ -164,7 +182,7 @@ func (r *Repository) ListAttempts(ctx context.Context, jobID int64) ([]ModelAtte
 
 // listAttempts 统一解码正式任务及节点测试的持久化调用证据。
 func (r *Repository) listAttempts(ctx context.Context, where string, id int64) ([]ModelAttempt, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT id,job_id,call_kind,evaluation_round,model_id,model_snapshot,stage,segment_order,repair_of_attempt_id,
+	rows, err := r.db.QueryContext(ctx, `SELECT id,job_id,call_kind,evaluation_round,audit_round,model_id,model_snapshot,stage,segment_order,repair_of_attempt_id,
  request_metadata,status,http_status,raw_response,confidence,reason,input_tokens,output_tokens,latency_ms,error_code,error_message,created_at,dispatch_started_at,finished_at
  FROM sub2api_enhance.third_party_prompt_audit_model_attempts WHERE `+where+` ORDER BY id`, id)
 	if err != nil {
@@ -177,7 +195,7 @@ func (r *Repository) listAttempts(ctx context.Context, where string, id int64) (
 		var model, metadata string
 		var confidence *float64
 		var reason, code, message *string
-		if err := rows.Scan(&item.ID, &item.JobID, &item.CallKind, &item.EvaluationRound, &item.ModelID, &model, &item.Stage, &item.SegmentOrder, &item.RepairOfAttemptID,
+		if err := rows.Scan(&item.ID, &item.JobID, &item.CallKind, &item.EvaluationRound, &item.AuditRound, &item.ModelID, &model, &item.Stage, &item.SegmentOrder, &item.RepairOfAttemptID,
 			&metadata, &item.Status, &item.HTTPStatus, &item.RawResponse, &confidence, &reason, &item.InputTokens, &item.OutputTokens, &item.LatencyMS, &code, &message, &item.CreatedAt, &item.DispatchStartedAt, &item.FinishedAt); err != nil {
 			return nil, err
 		}

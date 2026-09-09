@@ -38,6 +38,6 @@ onMounted(async () => {
     <RouterView />
   </div>
   <div v-if="app.message" role="status" class="fixed bottom-6 right-6 z-[100] max-w-lg rounded-xl px-5 py-4 shadow-lg" :class="app.error ? 'bg-red-700 text-white' : 'bg-teal-700 text-white'">
-    {{ app.message }}<button class="ml-4" @click="app.message = ''">×</button>
+    {{ app.message }}<button class="ml-4" @click="app.dismiss">×</button>
   </div>
 </template>

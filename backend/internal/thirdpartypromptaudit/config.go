@@ -2,7 +2,9 @@ package thirdpartypromptaudit
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,13 +42,17 @@ const defaultWarningLimit = 3
 // defaultDisableLimit 是默认触发用户自动停用的累计违规数量。
 const defaultDisableLimit = 5
 
+// legacyDefaultPolicySHA256 仅识别旧内置默认值，不能覆盖管理员自定义政策。
+const legacyDefaultPolicySHA256 = "9071cf397aa94bca6982620a56c908a5977fdfc94206c7e198f160c5f65b2e0d"
+
 type ModelConfig struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Enabled   bool   `json:"enabled"`
-	BaseURL   string `json:"base_url"`
-	Model     string `json:"model"`
-	TimeoutMS int    `json:"timeout_ms"`
+	ID         string         `json:"id"`
+	Name       string         `json:"name"`
+	Enabled    bool           `json:"enabled"`
+	BaseURL    string         `json:"base_url"`
+	Model      string         `json:"model"`
+	TimeoutMS  int            `json:"timeout_ms"`
+	Parameters map[string]any `json:"parameters,omitempty"`
 }
 
 type WarningConfig struct {
@@ -107,6 +113,9 @@ func (snapshot *ConfigSnapshot) UnmarshalJSON(raw []byte) error {
 		return err
 	}
 	*snapshot = ConfigSnapshot(value)
+	if snapshot.AuditScope == "" {
+		snapshot.AuditScope = "full_request"
+	}
 	legacy := len(historical.FixedRoles) > 0
 	for _, model := range historical.Models {
 		legacy = legacy || len(model.Temperature) > 0 || len(model.MaxTokens) > 0
@@ -198,7 +207,7 @@ func NewConfigManager(db *sql.DB, encryptor appconfig.SecretEncryptor, cfg *appc
 
 func DefaultConfig() Config {
 	reviewThreshold, blockThreshold := defaultReviewThreshold, defaultBlockThreshold
-	return Config{Mode: "off", AuditScope: "full_request", Platforms: []string{}, AllGroups: true,
+	return Config{Mode: "off", AuditScope: "current_turn", Platforms: []string{}, AllGroups: true,
 		GroupIDs: []int64{}, ExcludedUserIDs: []int64{}, AuditPrompt: DefaultPolicy, Models: []ModelConfig{},
 		ReviewThreshold: &reviewThreshold, BlockThreshold: &blockThreshold,
 		Aggregation: "any_block", WorkerCount: 4, StorePassEvents: true,
@@ -270,9 +279,9 @@ func validateConfig(config Config, activating bool) error {
 	if config.Disable.Enabled && config.Disable.Limit < 1 {
 		return errors.New("自动停用累计阈值必须大于 0")
 	}
-	if config.Warning.Enabled || config.Disable.Enabled {
+	if config.AdminEmail != "" {
 		if _, err := mail.ParseAddress(config.AdminEmail); err != nil {
-			return errors.New("启用处置前必须填写有效管理员通知邮箱")
+			return errors.New("管理员通知邮箱格式无效")
 		}
 	}
 	return nil
@@ -287,6 +296,11 @@ func validateModel(model ModelConfig) error {
 	}
 	if _, err := chatCompletionsURL(model.BaseURL); err != nil {
 		return err
+	}
+	for _, reserved := range []string{"model", "messages", "stream"} {
+		if _, exists := model.Parameters[reserved]; exists {
+			return fmt.Errorf("节点高级参数不能覆盖 %s", reserved)
+		}
 	}
 	return nil
 }
@@ -349,6 +363,7 @@ func (m *ConfigManager) Reload(ctx context.Context) (loadErr error) {
 	}
 	stored := storedConfig{Config: DefaultConfig(), Revision: 1, EncryptedKeys: map[string]string{}}
 	if values[SettingKey] != "" {
+		stored.AuditScope = "full_request"
 		err = json.Unmarshal([]byte(values[SettingKey]), &stored)
 	}
 	// 节点名称是模型选择的派生展示值，旧配置加载后也立即使用统一规则。
@@ -383,6 +398,48 @@ func (m *ConfigManager) Reload(ctx context.Context) (loadErr error) {
 	}
 	m.active = &activeConfig{Stored: stored, Keys: keys}
 	return nil
+}
+
+// upgradeLegacyDefaultPolicy 只升级字节级匹配旧内置值的配置，并保留自定义政策。
+func (m *ConfigManager) upgradeLegacyDefaultPolicy(ctx context.Context) error {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, configLockKey); err != nil {
+		return err
+	}
+	var raw string
+	err = tx.QueryRowContext(ctx, `SELECT value FROM sub2api_enhance.settings WHERE key=$1 FOR UPDATE`, SettingKey).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return tx.Commit()
+	}
+	if err != nil {
+		return err
+	}
+	current := storedConfig{Config: DefaultConfig(), Revision: 1, EncryptedKeys: map[string]string{}}
+	current.AuditScope = "full_request"
+	if err := json.Unmarshal([]byte(raw), &current); err != nil {
+		return err
+	}
+	digest := sha256.Sum256([]byte(current.AuditPrompt))
+	if hex.EncodeToString(digest[:]) != legacyDefaultPolicySHA256 {
+		return tx.Commit()
+	}
+	current.AuditPrompt = DefaultPolicy
+	current.Revision++
+	current.UpdatedBy = 0
+	current.UpdatedAt = time.Now().UTC()
+	encoded, err := json.Marshal(current)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.settings SET value=$2,updated_at=clock_timestamp() WHERE key=$1`, SettingKey, string(encoded)); err != nil {
+		return err
+	}
+	logger.LegacyPrintf("third_party_prompt_audit", "内置审核政策已升级 revision=%d", current.Revision)
+	return tx.Commit()
 }
 
 func (m *ConfigManager) Active() (ConfigSnapshot, error) {
@@ -489,6 +546,7 @@ func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID in
 		return PublicConfig{}, err
 	}
 	if err == nil {
+		current.AuditScope = "full_request"
 		if err := json.Unmarshal([]byte(raw), &current); err != nil {
 			return PublicConfig{}, err
 		}
@@ -581,6 +639,7 @@ func (m *ConfigManager) ReadSaved(ctx context.Context) (PublicConfig, error) {
 		return PublicConfig{}, err
 	}
 	if err == nil {
+		stored.AuditScope = "full_request"
 		if err = json.Unmarshal([]byte(raw), &stored); err != nil {
 			return PublicConfig{}, err
 		}

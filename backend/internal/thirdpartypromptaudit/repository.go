@@ -30,10 +30,11 @@ func NewRepository(db *sql.DB) *Repository { return &Repository{db: db} }
 
 // jobColumns 仅列举列表需要的字段，全文通过单独投影读取，避免列表展开大字段。
 const jobColumns = `COALESCE(capture.created_at,j.created_at) AS captured_at,COALESCE(j.capture_id,original.capture_id) AS capture_id,j.id,j.capture_key,j.run_kind,j.source_job_id,j.requested_by,j.user_id,j.api_key_id,j.group_id,
-j.request_id,j.identity_snapshot,j.platform,j.protocol,j.ingress_stage,j.requested_model,j.execution_mode,
+j.request_id,j.conversation_key,j.identity_snapshot,j.platform,j.protocol,j.ingress_stage,j.requested_model,j.execution_mode,j.audit_round,j.current_run_kind,j.current_requested_by,
 j.config_revision,j.snapshot_status,j.input_hash,j.target_hash,j.evaluation_hash,j.status,j.attempts,j.max_attempts,
 j.claim_generation,j.lease_until,j.next_attempt_at,j.reuse_metrics,j.failure_stage,j.last_error_code,j.last_error_message,
-j.gateway_result,j.gateway_completed_at,j.gateway_duration_ms,j.started_at,j.finished_at,j.created_at,j.updated_at`
+j.gateway_result,j.gateway_completed_at,j.gateway_duration_ms,j.started_at,j.finished_at,
+CASE WHEN j.started_at IS NULL THEN NULL ELSE GREATEST(0,extract(epoch FROM (COALESCE(j.finished_at,clock_timestamp())-j.started_at))*1000)::bigint END AS duration_ms,j.created_at,j.updated_at`
 
 // jobInputJoins 为任务投影补齐原始任务与唯一采集记录。
 const jobInputJoins = ` LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs original ON original.id=j.source_job_id LEFT JOIN sub2api_enhance.captures capture ON capture.id=COALESCE(j.capture_id,original.capture_id) `
@@ -164,18 +165,18 @@ func (r *Repository) CreateJob(ctx context.Context, job *Job) (*Job, bool, error
 	}
 	err = r.db.QueryRowContext(ctx, `
 INSERT INTO sub2api_enhance.third_party_prompt_audit_jobs
-(capture_key,run_kind,source_job_id,requested_by,user_id,api_key_id,group_id,request_id,identity_snapshot,
+(capture_key,run_kind,source_job_id,requested_by,user_id,api_key_id,group_id,request_id,conversation_key,identity_snapshot,
  platform,protocol,ingress_stage,requested_model,execution_mode,config_revision,config_snapshot,full_input_snapshot,
  snapshot_status,input_manifest,input_hash,target_hash,evaluation_hash,status,attempts,max_attempts,claim_generation,
  lease_until,started_at,finished_at,failure_stage,last_error_code,last_error_message,capture_id)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,
- CASE WHEN $23='processing' THEN clock_timestamp()+$27::interval END,
- CASE WHEN $23='processing' THEN clock_timestamp() END,
- CASE WHEN $23 IN ('failed','skipped') THEN clock_timestamp() END,$28,$29,$30,$31)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,
+ CASE WHEN $24='processing' THEN clock_timestamp()+$28::interval END,
+ CASE WHEN $24='processing' THEN clock_timestamp() END,
+ CASE WHEN $24 IN ('failed','skipped') THEN clock_timestamp() END,$29,$30,$31,$32)
 ON CONFLICT (capture_key) DO NOTHING
 RETURNING id,created_at,updated_at,lease_until,started_at,finished_at,next_attempt_at`,
 		job.CaptureKey, job.RunKind, job.SourceJobID, job.RequestedBy, job.UserID, job.APIKeyID, job.GroupID,
-		job.RequestID, string(identity), job.Platform, job.Protocol, job.IngressStage, encodeStoredText(job.RequestedModel),
+		job.RequestID, nullIfEmpty(job.ConversationKey), string(identity), job.Platform, job.Protocol, job.IngressStage, encodeStoredText(job.RequestedModel),
 		job.ExecutionMode, job.Config.Revision, string(config), input, job.SnapshotStatus, string(manifest),
 		job.InputHash, job.TargetHash, job.EvaluationHash, job.Status, job.Attempts, job.MaxAttempts,
 		job.ClaimGeneration, interval(leaseDuration), job.FailureStage, job.LastErrorCode, encodeStoredText(job.LastErrorMessage), job.CaptureID,
@@ -195,13 +196,20 @@ RETURNING id,created_at,updated_at,lease_until,started_at,finished_at,next_attem
 	return job, true, nil
 }
 
+func nullIfEmpty(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
 func (r *Repository) Claim(ctx context.Context, allowEvaluation bool) (*Job, error) {
 	var id int64
 	err := r.db.QueryRowContext(ctx, `
 WITH candidate AS (
  SELECT id FROM sub2api_enhance.third_party_prompt_audit_jobs
  WHERE status IN ('queued','retry') AND next_attempt_at<=clock_timestamp()
- AND (result_checkpoint IS NOT NULL OR ($1 AND execution_mode='async' AND (attempts<max_attempts OR last_error_code IN ('audit_paused','worker_paused'))))
+	 AND (result_checkpoint IS NOT NULL OR ($1 AND (execution_mode='async' OR current_run_kind='reaudit') AND (attempts<max_attempts OR last_error_code IN ('audit_paused','worker_paused'))))
  ORDER BY next_attempt_at,id FOR UPDATE SKIP LOCKED LIMIT 1
 )
 UPDATE sub2api_enhance.third_party_prompt_audit_jobs j SET status='processing',claim_generation=claim_generation+1,
@@ -299,7 +307,7 @@ func (r *Repository) Fail(ctx context.Context, job *Job, failure *AuditError, re
 	_, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_model_attempts SET
       status=CASE WHEN dispatch_started_at IS NULL THEN 'failed' ELSE 'unknown' END,
       error_code=CASE WHEN dispatch_started_at IS NULL THEN 'not_dispatched' ELSE 'result_unconfirmed' END,
-      error_message=$3,finished_at=clock_timestamp() WHERE job_id=$1 AND evaluation_round=$2 AND status IN ('prepared','started')`, job.ID, job.Attempts, encodeStoredText(failure.Message))
+      error_message=$4,finished_at=clock_timestamp() WHERE job_id=$1 AND evaluation_round=$2 AND audit_round=$3 AND status IN ('prepared','started')`, job.ID, job.Attempts, jobAuditRound(job), encodeStoredText(failure.Message))
 	if err != nil {
 		return err
 	}

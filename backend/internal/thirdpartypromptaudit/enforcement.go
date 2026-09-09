@@ -60,27 +60,13 @@ type Action struct {
 	UpdatedAt          time.Time        `json:"updated_at"`
 }
 
-// decideEnforcement 只计算当前正式事实带来的状态变化，外部调用在事务提交后执行。
-func decideEnforcement(state EnforcementState, user EnforcementUser, job *Job, outcome *Outcome, config Config, window []Decision) (EnforcementState, string) {
-	capturedAt := job.CapturedAt
-	if capturedAt.IsZero() {
-		capturedAt = job.CreatedAt
-	}
+// decideEnforcement 同时返回提醒和停用动作；管理员只保留请求级审核及阻断通知。
+func decideEnforcement(state EnforcementState, user EnforcementUser, eligible, triggerBlock bool, config Config, window []Decision) (EnforcementState, []string) {
 	next := state
-	if !outcome.EnforcementEligible || job.RunKind != "request" {
-		return next, ""
+	if !eligible || user.Role != "user" {
+		return next, nil
 	}
-	if config.Disable.Enabled && user.Role == "user" && outcome.Decision == DecisionBlock &&
-		(state.DisableResetAt == nil || capturedAt.After(*state.DisableResetAt)) {
-		next.DisableViolationCount++
-	}
-	if config.Disable.Enabled && user.Role == "user" && user.Status == "active" && outcome.Decision == DecisionBlock && next.DisableViolationCount >= config.Disable.Limit {
-		// 启用重置前捕获的迟到任务也不能仅凭旧累计触发新的停用。
-		if state.DisableResetAt == nil || capturedAt.After(*state.DisableResetAt) {
-			next.WarningArmed = false
-			return next, "disable"
-		}
-	}
+	actions := make([]string, 0, 2)
 	if config.Warning.Enabled {
 		violations := 0
 		for _, decision := range window {
@@ -90,10 +76,13 @@ func decideEnforcement(state EnforcementState, user EnforcementUser, job *Job, o
 		}
 		if violations < config.Warning.Limit {
 			next.WarningArmed = true
-		} else if next.WarningArmed {
+		} else if next.WarningArmed && triggerBlock {
 			next.WarningArmed = false
-			return next, "warning"
+			actions = append(actions, "warning")
 		}
 	}
-	return next, ""
+	if config.Disable.Enabled && user.Status == "active" && triggerBlock && next.DisableViolationCount >= config.Disable.Limit {
+		actions = append(actions, "disable")
+	}
+	return next, actions
 }

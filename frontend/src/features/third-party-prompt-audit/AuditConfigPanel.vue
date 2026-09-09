@@ -18,6 +18,7 @@ const groups = ref<AdminGroup[]>([])
 const users = ref<AuditUser[]>([])
 const keys = reactive<Record<string, KeyUpdate>>({})
 const modelOptions = reactive<Record<string, string[]>>({})
+const modelListErrors = reactive<Record<string, string>>({})
 const probes = reactive<Record<string, ProbeResult>>({})
 const attemptDetails = ref<ModelAttempt[] | null>(null)
 async function showProbeDetails(id: number) {
@@ -33,6 +34,8 @@ const probeProtocol = ref('openai_responses')
 const probeScenario = ref('coercive_adult_fiction')
 const customProbeInput = ref('')
 const structuredProbeInput = ref('')
+const providersJSON = ref('')
+const providersJSONError = ref('')
 const loading = ref(false)
 const saving = ref(false)
 const error = ref('')
@@ -85,9 +88,60 @@ function restore() {
   draft.value = editableConfig(saved.value)
   for (const id of Object.keys(keys)) delete keys[id]
   for (const id of Object.keys(modelOptions)) delete modelOptions[id]
+  for (const id of Object.keys(modelListErrors)) delete modelListErrors[id]
   for (const model of draft.value.models) {
     keys[model.id] = { model_id: model.id, action: 'keep', api_key: '' }
     modelOptions[model.id] = model.model ? [model.model] : []
+  }
+  refreshProvidersJSON()
+}
+
+function refreshProvidersJSON() {
+  if (!draft.value) return
+  providersJSON.value = JSON.stringify({ $schemaVersion: 1, providers: draft.value.models.map(model => ({
+    id: model.id, type: 'openai-chat-completions', enabled: model.enabled, baseUrl: model.base_url,
+    apiModel: model.model, timeoutMs: model.timeout_ms, parameters: model.parameters ?? {}
+  })) }, null, 2)
+  providersJSONError.value = ''
+}
+
+function applyProvidersJSON() {
+  if (!draft.value) return
+  try {
+    const document = JSON.parse(providersJSON.value) as { $schemaVersion?: number; providers?: unknown[] }
+    if (document.$schemaVersion !== 1 || !Array.isArray(document.providers)) throw new Error(label('providersJSONShape'))
+    const previousKeys = { ...keys }
+    const ids = new Set<string>()
+    const models = document.providers.map(value => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(label('providersJSONShape'))
+      const provider = value as Record<string, unknown>
+      if (provider.type !== 'openai-chat-completions') throw new Error(label('providersJSONType'))
+	  if (provider.enabled !== undefined && typeof provider.enabled !== 'boolean') throw new Error(label('providersJSONShape'))
+	  if (typeof provider.baseUrl !== 'string' || typeof provider.apiModel !== 'string') throw new Error(label('providersJSONShape'))
+	  if (provider.id !== undefined && typeof provider.id !== 'string') throw new Error(label('providersJSONShape'))
+      const id = typeof provider.id === 'string' && provider.id ? provider.id : crypto.randomUUID()
+      if (ids.has(id)) throw new Error(label('providersJSONDuplicate'))
+      ids.add(id)
+      const parameters = provider.parameters ?? {}
+      if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) throw new Error(label('providersJSONParameters'))
+      for (const reserved of ['model', 'messages', 'stream']) if (reserved in (parameters as Record<string, unknown>)) throw new Error(`${label('providersJSONReserved')}: ${reserved}`)
+      const timeout = Number(provider.timeoutMs)
+      if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new Error(label('providersJSONTimeout'))
+      return { id, name: '', enabled: provider.enabled !== false, base_url: String(provider.baseUrl ?? ''), model: String(provider.apiModel ?? ''),
+		timeout_ms: timeout, parameters: parameters as Record<string, unknown> }
+    })
+    for (const id of Object.keys(keys)) delete keys[id]
+    for (const id of Object.keys(modelOptions)) delete modelOptions[id]
+    for (const id of Object.keys(modelListErrors)) delete modelListErrors[id]
+    for (const model of models) {
+      keys[model.id] = previousKeys[model.id] ?? { model_id: model.id, action: 'keep', api_key: '' }
+      modelOptions[model.id] = model.model ? [model.model] : []
+    }
+    draft.value.models = models
+    syncModelNames()
+    refreshProvidersJSON()
+  } catch (err) {
+    providersJSONError.value = err instanceof Error ? err.message : label('providersJSONInvalid')
   }
 }
 function updateKey(modelID: string, value: string) {
@@ -120,21 +174,22 @@ function syncModelNames() {
 function addModel() {
   if (!draft.value || !saved.value) return
   const id = crypto.randomUUID()
-  draft.value.models.push({ id, name: '', enabled: true, base_url: '', model: '', timeout_ms: saved.value.model_defaults.timeout_ms })
+	  draft.value.models.push({ id, name: '', enabled: true, base_url: '', model: '', timeout_ms: saved.value.model_defaults.timeout_ms, parameters: {} })
   keys[id] = { model_id: id, action: 'keep', api_key: '' }
   modelOptions[id] = []
 }
 async function listModels(model: AuditModel) {
   if (!model.base_url || listingModels.value.includes(model.id)) return
   listingModels.value.push(model.id)
+  delete modelListErrors[model.id]
   try {
     const key = keys[model.id]
     const result = await api.listModels({ model_id: model.id, base_url: model.base_url, timeout_ms: model.timeout_ms,
       key_action: key?.action === 'replace' ? 'replace' : 'keep', ...(key?.action === 'replace' ? { api_key: key.api_key } : {}) })
     modelOptions[model.id] = result.models
-    if (!result.models.includes(model.model)) model.model = result.models[0] ?? ''
+	if (!model.model) model.model = result.models[0] ?? ''
     syncModelNames()
-  } catch (err) { app.showError(extractApiErrorMessage(err, label('modelListFailed'))) }
+  } catch (err) { modelListErrors[model.id] = extractApiErrorMessage(err, label('modelListFailed')); app.showError(modelListErrors[model.id]!) }
   finally { listingModels.value = listingModels.value.filter(id => id !== model.id) }
 }
 watch(() => draft.value?.mode, mode => {
@@ -162,6 +217,7 @@ function removeModel(id: string) {
   draft.value.models = draft.value.models.filter(model => model.id !== id)
   delete keys[id]
   delete modelOptions[id]
+  delete modelListErrors[id]
   delete probes[id]
   syncModelNames()
 }
@@ -250,7 +306,7 @@ onMounted(load)
             <div class="flex justify-between gap-3"><label class="flex items-center gap-2"><input v-model="model.enabled" type="checkbox" />#{{ index + 1 }} · {{ label('enabled') }}</label><div class="flex gap-2"><button type="button" class="btn btn-ghost" :disabled="index === 0" @click="moveModel(index, -1)">{{ label('moveUp') }}</button><button type="button" class="btn btn-ghost" :disabled="index === draft.models.length - 1" @click="moveModel(index, 1)">{{ label('moveDown') }}</button><button type="button" class="btn btn-ghost text-red-600" @click="removeModel(model.id)">{{ label('remove') }}</button></div></div>
             <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
               <label class="space-y-2"><span class="text-sm">{{ label('baseURL') }}</span><input v-model="model.base_url" class="input" type="url" required /></label>
-              <label class="space-y-2"><span class="text-sm">{{ label('model') }}</span><select v-model="model.model" class="input" required><option value="" disabled>{{ label('chooseModel') }}</option><option v-if="model.model && !modelOptions[model.id]?.includes(model.model)" :value="model.model">{{ model.model }}</option><option v-for="option in modelOptions[model.id] ?? []" :key="option" :value="option">{{ option }}</option></select></label>
+              <label class="space-y-2"><span class="text-sm">{{ label('model') }}</span><input v-model="model.model" class="input" required :list="`audit-models-${model.id}`" :placeholder="label('chooseOrInputModel')" data-test="model-input" /><datalist :id="`audit-models-${model.id}`"><option v-for="option in modelOptions[model.id] ?? []" :key="option" :value="option" /></datalist></label>
               <label class="space-y-2"><span class="text-sm">{{ label('timeout') }}</span><input v-model.number="model.timeout_ms" class="input" type="number" min="1" step="1" required /></label>
             </div>
             <p class="text-sm"><span class="text-gray-500 dark:text-dark-400">{{ label('name') }}：</span>{{ model.name || label('chooseModel') }}</p>
@@ -259,6 +315,7 @@ onMounted(load)
             <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('keyHint') }} · {{ label('modelID') }}: {{ model.id }}</p>
             <div class="flex flex-wrap gap-3"><button type="button" class="btn btn-secondary" :disabled="!model.base_url || listingModels.includes(model.id)" @click="listModels(model)">{{ label(listingModels.includes(model.id) ? 'loading' : 'loadModels') }}</button><button type="button" class="btn btn-secondary" :disabled="!model.model || probing.includes(model.id)" @click="probe(model)">{{ label(probing.includes(model.id) ? 'loading' : 'probe') }}</button></div>
             <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('modelListHint') }}</p>
+            <p v-if="modelListErrors[model.id]" class="text-sm text-red-600 dark:text-red-400">{{ modelListErrors[model.id] }}</p>
             <div v-if="probes[model.id]" class="rounded-lg bg-gray-50 p-3 text-sm dark:bg-dark-900" role="status">
               <span>{{ formatTime(probes[model.id]!.tested_at) }} · {{ probes[model.id]!.latency_ms }} ms · #{{ probes[model.id]!.attempt_id }}</span>
               <p v-if="probes[model.id]?.result">{{ label('score') }} {{ probes[model.id]!.result!.confidence }} · {{ probes[model.id]!.result!.reason }}</p>
@@ -266,13 +323,20 @@ onMounted(load)
             <button type="button" class="mt-2 block text-primary-600 underline" @click="showProbeDetails(probes[model.id]!.attempt_id)">{{ label('probeDetails') }}</button>
             </div>
           </div>
+          <details class="rounded-xl border border-gray-200 p-4 dark:border-dark-600">
+            <summary class="cursor-pointer font-semibold">{{ label('providersJSON') }}</summary>
+            <p class="my-3 text-sm text-gray-500 dark:text-dark-400">{{ label('providersJSONHint') }}</p>
+            <textarea v-model="providersJSON" class="input min-h-80 font-mono text-xs" spellcheck="false" data-test="providers-json" />
+            <p v-if="providersJSONError" class="mt-2 text-sm text-red-600 dark:text-red-400">{{ providersJSONError }}</p>
+            <div class="mt-3 flex flex-wrap gap-3"><button type="button" class="btn btn-secondary" @click="refreshProvidersJSON">{{ label('refreshProvidersJSON') }}</button><button type="button" class="btn btn-secondary" @click="applyProvidersJSON">{{ label('applyProvidersJSON') }}</button></div>
+          </details>
           <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('probeHint') }}</p>
           <label class="block space-y-2"><span class="text-sm">{{ label('probeInputKind') }}</span><select v-model="probeInputKind" class="input"><option value="text">{{ label('textInput') }}</option><option value="json">{{ label('jsonInput') }}</option></select></label>
           <label v-if="probeInputKind === 'text'" class="block space-y-2"><span class="text-sm">{{ label('probeScenario') }}</span><select v-model="probeScenario" class="input"><option v-for="(sample, index) in probeSamples" :key="sample.id" :value="sample.id">{{ index + 1 }}. {{ sample.text.split('\n')[0] }}</option><option value="custom">{{ label('customInput') }}</option></select></label>
           <label v-if="probeInputKind === 'json'" class="block space-y-2"><span class="text-sm">Protocol</span><select v-model="probeProtocol" class="input" data-test="probe-protocol"><option v-for="protocol in ['openai_responses', 'openai_chat_completions', 'anthropic_messages', 'gemini', 'grok_media']" :key="protocol">{{ protocol }}</option></select></label>
           <p class="text-sm text-gray-500 dark:text-dark-400">{{ label(probeInputKind === 'json' ? 'jsonInputHint' : 'textInputHint') }}</p>
           <pre v-if="probeInputKind === 'json'" class="overflow-auto whitespace-pre-wrap rounded-lg bg-gray-50 p-3 text-xs dark:bg-dark-900">{{ probeExample }}</pre>
-          <label class="block space-y-2"><span class="text-sm">{{ label('probeInput') }}</span><textarea v-model="probeInput" class="input font-mono text-sm" rows="3" :placeholder="label('defaultProbeInput')" /></label>
+          <label class="block space-y-2"><span class="text-sm">{{ label('probeInput') }}</span><textarea v-model="probeInput" class="input font-mono text-sm" rows="3" :placeholder="label('defaultProbeInput')" data-test="probe-input" /></label>
         </section>
 
         <section class="card space-y-4 p-5 sm:p-6">
@@ -297,7 +361,7 @@ onMounted(load)
               <div v-if="draft.warning.enabled" class="space-y-3"><div class="grid grid-cols-2 gap-4"><label class="space-y-2"><span class="text-sm">{{ label('warningWindow') }}</span><input v-model.number="draft.warning.window" class="input" type="number" min="1" step="1" required /></label><label class="space-y-2"><span class="text-sm">{{ label('warningLimit') }}</span><input v-model.number="draft.warning.limit" class="input" type="number" min="1" :max="draft.warning.window" step="1" required /></label></div><p class="text-xs text-gray-500 dark:text-dark-400">{{ label('warningWindowHint') }}</p></div>
             </fieldset>
             <fieldset class="space-y-4"><label class="flex items-center gap-2"><input v-model="draft.disable.enabled" type="checkbox" />{{ label('disable') }}</label><label v-if="draft.disable.enabled" class="block space-y-2"><span class="text-sm">{{ label('disableLimit') }}</span><input v-model.number="draft.disable.limit" class="input" type="number" min="1" step="1" required /></label></fieldset>
-          </div><label class="block space-y-2"><span class="text-sm">{{ label('adminEmail') }}</span><input v-model="draft.admin_email" class="input" type="email" :required="draft.warning.enabled || draft.disable.enabled" /><span class="block text-xs text-gray-500 dark:text-dark-400">{{ label('adminEmailHint') }}</span></label>
+          </div><label class="block space-y-2"><span class="text-sm">{{ label('adminEmail') }}</span><input v-model="draft.admin_email" class="input" type="email" /><span class="block text-xs text-gray-500 dark:text-dark-400">{{ label('adminEmailHint') }}</span></label>
           <div class="border-t border-gray-200 pt-5 dark:border-dark-700"><h3 class="font-semibold">{{ label('counterManagement') }}</h3><p class="mb-4 mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('counterManagementHint') }}</p><div class="grid gap-4 md:grid-cols-[minmax(0,1fr)_auto]"><label class="space-y-2"><span class="text-sm">{{ label('user') }}</span><select v-model="selectedResetUserID" class="input"><option :value="null">{{ label('chooseUser') }}</option><option v-for="user in resetUsers" :key="user.id" :value="user.id">{{ user.username }} (#{{ user.id }}) · {{ userStatusLabel(user.status) }} · {{ label('disableViolationCount') }} {{ user.disable_violation_count }}</option></select></label><button type="button" class="btn btn-secondary self-end" :disabled="!selectedResetUserID || resetting || selectedResetUser?.action_pending" @click="resetCounter">{{ label(resetting ? 'loading' : 'enableAndReset') }}</button></div><p v-if="selectedResetUser" class="mt-3 text-xs text-gray-500 dark:text-dark-400">{{ selectedResetUser.email }} · {{ userRoleLabel(selectedResetUser.role) }} · {{ userStatusLabel(selectedResetUser.status) }} · {{ label('disableViolationCount') }} {{ selectedResetUser.disable_violation_count }} · {{ label('lastCounterReset') }} {{ formatTime(selectedResetUser.disable_reset_at) }}<span v-if="selectedResetUser.action_pending"> · {{ label('actionPending') }}</span></p></div>
         </section>
       </fieldset>

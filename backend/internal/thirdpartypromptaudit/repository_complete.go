@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"slices"
 	"time"
 
 	"sub2api-enhance/internal/pkg/logger"
@@ -42,6 +43,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 		return nil, err
 	}
 	if err == nil {
+		current.AuditScope = "full_request"
 		if err := json.Unmarshal([]byte(configRaw), &current); err != nil {
 			return nil, err
 		}
@@ -91,14 +93,21 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 	if err != nil {
 		return nil, err
 	}
-	cloned.EnforcementEligible = job.IngressStage != "manual_capture_reprocess" && eligible && job.RunKind == "request" && (job.ExecutionMode == "async" || foreground) && current.Mode != "off"
+	runKind := job.auditRunKind()
+	cloned.EnforcementEligible = job.IngressStage != "manual_capture_reprocess" && eligible && job.RunKind == "request" && runKind == "request" && (job.ExecutionMode == "async" || foreground) && current.Mode != "off"
 	outcome := &Outcome{JobID: job.ID, UserID: job.UserID, Evaluation: *cloned}
 	models, err := json.Marshal(cloned.Models)
 	if err != nil {
 		return nil, err
 	}
-	err = tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_outcomes(job_id,user_id,decision,partial_failure,enforcement_eligible,model_results,source_outcome_id)
- VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,created_at`, job.ID, job.UserID, cloned.Decision, cloned.PartialFailure, cloned.EnforcementEligible, string(models), cloned.SourceOutcomeID).Scan(&outcome.ID, &outcome.CreatedAt)
+	configSnapshot, err := json.Marshal(job.Config)
+	if err != nil {
+		return nil, err
+	}
+	outcome.AuditRound, outcome.RunKind, outcome.RequestedBy, outcome.Config, outcome.StartedAt = jobAuditRound(job), runKind, job.CurrentRequestedBy, job.Config, job.StartedAt
+	err = tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_outcomes(job_id,user_id,decision,partial_failure,enforcement_eligible,model_results,source_outcome_id,audit_round,run_kind,requested_by,config_snapshot,started_at,finished_at)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,clock_timestamp()) RETURNING id,created_at,finished_at`, job.ID, job.UserID, cloned.Decision, cloned.PartialFailure, cloned.EnforcementEligible, string(models), cloned.SourceOutcomeID,
+		jobAuditRound(job), runKind, job.CurrentRequestedBy, string(configSnapshot), job.StartedAt).Scan(&outcome.ID, &outcome.CreatedAt, &outcome.FinishedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -131,24 +140,27 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 	}
 
 	var originalOutcomeID *int64
-	err = tx.QueryRowContext(ctx, `SELECT id FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1`, rootID).Scan(&originalOutcomeID)
+	var priorDecision Decision
+	var originalEligible bool
+	var disableCounted bool
+	priorErr := tx.QueryRowContext(ctx, `SELECT latest.decision,original.enforcement_eligible,event.disable_counted FROM sub2api_enhance.third_party_prompt_audit_events event JOIN sub2api_enhance.third_party_prompt_audit_outcomes latest ON latest.id=event.latest_outcome_id LEFT JOIN sub2api_enhance.third_party_prompt_audit_outcomes original ON original.id=event.original_outcome_id WHERE event.job_id=$1`, rootID).Scan(&priorDecision, &originalEligible, &disableCounted)
+	if priorErr != nil && !errors.Is(priorErr, sql.ErrNoRows) {
+		return nil, priorErr
+	}
+	err = tx.QueryRowContext(ctx, `SELECT id,enforcement_eligible FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1 ORDER BY audit_round,id LIMIT 1`, rootID).Scan(&originalOutcomeID, &originalEligible)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
-	if job.RunKind == "reaudit" || job.Config.StorePassEvents || outcome.Decision != DecisionPass {
-		// 较早请求的迟到补写不能覆盖较新成功复核的结论。
-		_, err = tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_events AS event(job_id,original_outcome_id,latest_outcome_id)
- VALUES($1,$2,$3) ON CONFLICT(job_id) DO UPDATE SET
- original_outcome_id=COALESCE(event.original_outcome_id,EXCLUDED.original_outcome_id),
- latest_outcome_id=CASE WHEN (SELECT job_id FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE id=event.latest_outcome_id)<$4 THEN EXCLUDED.latest_outcome_id ELSE event.latest_outcome_id END,
- updated_at=clock_timestamp()`, rootID, originalOutcomeID, outcome.ID, job.ID)
+	if runKind == "reaudit" || job.Config.StorePassEvents || outcome.Decision != DecisionPass {
+		_, err = tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_events AS event(job_id,original_outcome_id,latest_outcome_id) VALUES($1,$2,$3) ON CONFLICT(job_id) DO UPDATE SET original_outcome_id=COALESCE(event.original_outcome_id,EXCLUDED.original_outcome_id),latest_outcome_id=CASE WHEN EXISTS(SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_outcomes current WHERE current.id=event.latest_outcome_id AND (current.audit_round,current.id)<($4,$3)) THEN EXCLUDED.latest_outcome_id ELSE event.latest_outcome_id END,updated_at=clock_timestamp()`, rootID, originalOutcomeID, outcome.ID, outcome.AuditRound)
 		if err != nil {
 			return nil, err
 		}
 	}
 	before := state
 	window := make([]Decision, 0)
-	if outcome.EnforcementEligible {
+	canonicalEligible := outcome.EnforcementEligible || (runKind == "reaudit" && originalEligible)
+	if canonicalEligible && user.Role == "user" {
 		ruleHash, err := fingerprint(struct {
 			Rule     WarningConfig
 			Revision int64
@@ -165,7 +177,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 			state.WarningArmed = true
 		}
 		if current.Warning.Enabled {
-			rows, err := tx.QueryContext(ctx, `SELECT decision FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE user_id=$1 AND enforcement_eligible AND id>$2 ORDER BY id DESC LIMIT $3`, job.UserID, state.WarningWindowAfterOutcomeID, current.Warning.Window)
+			rows, err := tx.QueryContext(ctx, `SELECT latest.decision FROM sub2api_enhance.third_party_prompt_audit_jobs root JOIN sub2api_enhance.third_party_prompt_audit_outcomes original ON original.job_id=root.id AND original.audit_round=1 LEFT JOIN sub2api_enhance.third_party_prompt_audit_events event ON event.job_id=root.id JOIN sub2api_enhance.third_party_prompt_audit_outcomes latest ON latest.id=COALESCE(event.latest_outcome_id,original.id) WHERE root.run_kind='request' AND root.user_id=$1 AND original.enforcement_eligible AND original.id>$2 ORDER BY root.id DESC LIMIT $3`, job.UserID, state.WarningWindowAfterOutcomeID, current.Warning.Window)
 			if err != nil {
 				return nil, err
 			}
@@ -177,52 +189,74 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 				}
 				window = append(window, decision)
 			}
-			readErr := rows.Err()
-			closeErr := rows.Close()
-			if readErr != nil {
-				return nil, readErr
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				return nil, err
 			}
-			if closeErr != nil {
-				return nil, closeErr
+			if err := rows.Close(); err != nil {
+				return nil, err
 			}
 		}
 	}
-	next, actionType := decideEnforcement(state, user, job, outcome, current.Config, window)
-	if actionType == "disable" {
+	capturedAt := job.CapturedAt
+	if capturedAt.IsZero() {
+		capturedAt = job.CreatedAt
+	}
+	if canonicalEligible && user.Role == "user" && current.Disable.Enabled && (state.DisableResetAt == nil || capturedAt.After(*state.DisableResetAt)) {
+		shouldCount := outcome.Decision == DecisionBlock
+		if !disableCounted && shouldCount {
+			state.DisableViolationCount++
+		} else if disableCounted && !shouldCount && state.DisableViolationCount > 0 {
+			state.DisableViolationCount--
+		}
+		disableCounted = shouldCount
+	}
+	triggerBlock := outcome.Decision == DecisionBlock && (runKind == "request" || priorDecision != DecisionBlock)
+	next, actionTypes := decideEnforcement(state, user, canonicalEligible, triggerBlock, current.Config, window)
+	if slices.Contains(actionTypes, "disable") {
 		var active bool
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions WHERE user_id=$1 AND action_type='disable' AND execution_status IN ('pending','processing','unknown'))`, job.UserID).Scan(&active); err != nil {
 			return nil, err
 		}
 		if active {
-			actionType = ""
+			actionTypes = slices.DeleteFunc(actionTypes, func(value string) bool { return value == "disable" })
 		}
 	}
 	oldStatus := user.Status
-	if job.RunKind == "request" {
+	if runKind == "request" && outcome.EnforcementEligible && user.Role == "user" {
 		next.LastOutcomeID = &outcome.ID
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_enforcement_states SET warning_rule_hash=$2,warning_window_after_outcome_id=$3,warning_armed=$4,disable_violation_count=$5,last_outcome_id=$6,updated_at=clock_timestamp() WHERE user_id=$1`,
-		job.UserID, next.WarningRuleHash, next.WarningWindowAfterOutcomeID, next.WarningArmed, next.DisableViolationCount, next.LastOutcomeID)
+	_, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_enforcement_states SET warning_rule_hash=$2,warning_window_after_outcome_id=$3,warning_armed=$4,disable_violation_count=$5,last_outcome_id=$6,updated_at=clock_timestamp() WHERE user_id=$1`, job.UserID, next.WarningRuleHash, next.WarningWindowAfterOutcomeID, next.WarningArmed, next.DisableViolationCount, next.LastOutcomeID)
 	if err != nil {
 		return nil, err
 	}
-	if actionType != "" {
-		action := Action{UserID: job.UserID, OutcomeID: &outcome.ID, ActionType: actionType, NotificationStatus: "pending", AuthCacheStatus: "not_required",
-			RuleSnapshot:     map[string]any{"audit_revision": job.Config.Revision, "enforcement_revision": current.Revision, "warning": current.Warning, "disable": current.Disable, "decision": outcome.Decision},
-			BusinessSnapshot: map[string]any{"user": user, "old_user_status": oldStatus, "new_user_status": user.Status, "before_state": before, "after_state": next, "window": window}}
+	if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_events SET disable_counted=$2 WHERE job_id=$1`, rootID, disableCounted); err != nil {
+		return nil, err
+	}
+	for _, actionType := range actionTypes {
+		action := Action{UserID: job.UserID, OutcomeID: &outcome.ID, ActionType: actionType, NotificationStatus: "pending", AuthCacheStatus: "not_required", RuleSnapshot: map[string]any{"audit_revision": job.Config.Revision, "enforcement_revision": current.Revision, "warning": current.Warning, "disable": current.Disable, "decision": outcome.Decision}, BusinessSnapshot: map[string]any{"user": user, "old_user_status": oldStatus, "new_user_status": user.Status, "before_state": before, "after_state": next, "window": window}}
 		action.ExecutionStatus = "succeeded"
 		now := time.Now().UTC()
-		action.AppliedAt = &now
-		action.CompletedAt = &now
+		action.AppliedAt, action.CompletedAt = &now, &now
 		if actionType == "disable" {
-			action.ExecutionStatus = "pending"
-			action.AppliedAt = nil
-			action.CompletedAt = nil
-			action.AuthCacheStatus = "not_observed"
-			action.NotificationStatus = "not_required"
+			action.ExecutionStatus, action.AppliedAt, action.CompletedAt = "pending", nil, nil
+			action.AuthCacheStatus, action.NotificationStatus = "not_observed", "not_required"
 			action.BusinessSnapshot["requested_user_status"] = "disabled"
 		}
 		action.Deliveries = actionDeliveries(action, user, current.AdminEmail)
+		if err := insertAction(ctx, tx, &action); err != nil {
+			return nil, err
+		}
+	}
+	if foreground && job.ExecutionMode == "blocking" && outcome.EnforcementEligible && outcome.Decision == DecisionBlock {
+		now := time.Now().UTC()
+		action := Action{UserID: job.UserID, OutcomeID: &outcome.ID, ActionType: "blocking_notice", ExecutionStatus: "succeeded", AppliedAt: &now, CompletedAt: &now,
+			NotificationStatus: "pending", AuthCacheStatus: "not_required", RuleSnapshot: map[string]any{"audit_revision": job.Config.Revision, "decision": outcome.Decision},
+			BusinessSnapshot: map[string]any{"user": user, "request_id": job.RequestID, "conversation_key": job.ConversationKey}}
+		action.Deliveries = actionDeliveries(action, user, current.AdminEmail)
+		if len(action.Deliveries) == 0 {
+			action.NotificationStatus = "not_required"
+		}
 		if err := insertAction(ctx, tx, &action); err != nil {
 			return nil, err
 		}
@@ -245,12 +279,17 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 
 func actionDeliveries(action Action, user EnforcementUser, adminEmail string) []Delivery {
 	subject := "第三方提示词审计风险提醒"
-	if action.ActionType == "disable" {
+	if action.ActionType == "blocking_notice" {
+		subject = "第三方提示词审计：请求已阻止"
+	} else if action.ActionType == "disable" {
 		subject = "第三方提示词审计：账号已停用"
 	}
 	body := fmt.Sprintf("<p>%s</p><p>用户：%s</p><p>分类记录：%d</p><p>请在管理后台的第三方模型提示词审计页面查看完整依据。</p>", html.EscapeString(subject), html.EscapeString(user.Username), *action.OutcomeID)
-	deliveries := []Delivery{{Recipient: adminEmail, Kind: "admin", Subject: subject, Body: body, Status: "pending", Attempts: []DeliveryAttempt{}}}
-	if user.Email != adminEmail {
+	deliveries := []Delivery{}
+	if adminEmail != "" {
+		deliveries = append(deliveries, Delivery{Recipient: adminEmail, Kind: "admin", Subject: subject, Body: body, Status: "pending", Attempts: []DeliveryAttempt{}})
+	}
+	if user.Email != "" && user.Email != adminEmail {
 		deliveries = append(deliveries, Delivery{Recipient: user.Email, Kind: "user", Subject: subject, Body: body, Status: "pending", Attempts: []DeliveryAttempt{}})
 	}
 	return deliveries

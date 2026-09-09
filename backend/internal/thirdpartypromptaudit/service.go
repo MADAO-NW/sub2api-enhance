@@ -21,26 +21,35 @@ import (
 const persistenceTimeout = 5 * time.Second
 
 type Service struct {
-	accounts   *sub2api.Client
-	repo       *Repository
-	config     *ConfigManager
-	evaluator  *Evaluator
-	client     *ModelClient
-	email      notify.Sender
-	mu         sync.Mutex
-	ctx        context.Context
-	cancel     context.CancelFunc
-	closing    bool
-	wg         sync.WaitGroup
-	foreground sync.WaitGroup
-	wake       chan struct{}
-	active     atomic.Int64
-	running    atomic.Bool
-	metrics    *RuntimeMetrics
+	accounts      *sub2api.Client
+	repo          *Repository
+	config        *ConfigManager
+	evaluator     *Evaluator
+	client        *ModelClient
+	email         notify.Sender
+	mu            sync.Mutex
+	ctx           context.Context
+	cancel        context.CancelFunc
+	closing       bool
+	wg            sync.WaitGroup
+	foreground    sync.WaitGroup
+	wake          chan struct{}
+	active        atomic.Int64
+	running       atomic.Bool
+	metrics       *RuntimeMetrics
+	flightMu      sync.Mutex
+	flights       map[string]*evaluationFlight
+	flightLeaders map[int64]string
+}
+
+type evaluationFlight struct {
+	done       chan struct{}
+	evaluation *Evaluation
+	failure    *AuditError
 }
 
 func NewService(repo *Repository, config *ConfigManager, evaluator *Evaluator, client *ModelClient, email notify.Sender) *Service {
-	return &Service{repo: repo, config: config, evaluator: evaluator, client: client, email: email, wake: make(chan struct{}, 1), metrics: NewRuntimeMetrics()}
+	return &Service{repo: repo, config: config, evaluator: evaluator, client: client, email: email, wake: make(chan struct{}, 1), metrics: NewRuntimeMetrics(), flights: make(map[string]*evaluationFlight), flightLeaders: make(map[int64]string)}
 }
 
 func (s *Service) Start(parent context.Context) error {
@@ -51,7 +60,10 @@ func (s *Service) Start(parent context.Context) error {
 	}
 	s.ctx, s.cancel = context.WithCancel(parent)
 	s.closing = false
-	err := s.config.Reload(s.ctx)
+	err := s.config.upgradeLegacyDefaultPolicy(s.ctx)
+	if err == nil {
+		err = s.config.Reload(s.ctx)
+	}
 	if err != nil {
 		s.noteError("config_load_failed", err)
 	}
@@ -126,6 +138,7 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 	}
 	apiKeyID := request.APIKeyID
 	job := &Job{CapturedAt: request.CapturedAt, CaptureID: request.CaptureID, CaptureKey: key, RunKind: "request", UserID: request.UserID, APIKeyID: &apiKeyID, GroupID: request.GroupID, RequestID: request.RequestID,
+		ConversationKey: request.ConversationKey, CurrentRunKind: "request", AuditRound: 1,
 		Identity: Identity{Username: request.Username, UserEmail: request.UserEmail, APIKeyName: request.APIKeyName, GroupName: request.GroupName, Endpoint: request.Endpoint},
 		Platform: request.Provider, Protocol: request.Protocol, IngressStage: request.Stage, RequestedModel: request.Model, ExecutionMode: mode,
 		Config: snapshot, FullInput: input, SnapshotStatus: "complete", Status: "queued"}
@@ -240,6 +253,7 @@ func (s *Service) ObserveGateway(ctx context.Context, own *IntakeDecision, final
 }
 
 func (s *Service) processJob(parent context.Context, job *Job, foreground bool) (*Outcome, *AuditError) {
+	defer s.finishEvaluationFlight(job.ID)
 	ctx, cancel := context.WithCancelCause(parent)
 	done := s.heartbeat(ctx, cancel, func(ctx context.Context) error { return s.repo.Renew(ctx, job) })
 	defer func() { cancel(nil); <-done }()
@@ -264,7 +278,7 @@ func (s *Service) processJob(parent context.Context, job *Job, foreground bool) 
 	}
 	evaluation := job.Checkpoint
 	if evaluation == nil {
-		if job.ExecutionMode == "blocking" && !foreground {
+		if job.ExecutionMode == "blocking" && job.auditRunKind() != "reaudit" && !foreground {
 			return nil, &AuditError{Code: "blocking_request_ended", Stage: "worker", Message: "同步请求已经结束，不能在后台重新调用模型"}
 		}
 		started := time.Now()
@@ -275,7 +289,7 @@ func (s *Service) processJob(parent context.Context, job *Job, foreground bool) 
 		} else if err = s.repo.SaveTarget(ctx, job); err != nil {
 			failure = persistenceFailure(err, "target_persist_failed")
 		} else {
-			evaluation, failure = s.evaluator.Evaluate(ctx, job)
+			evaluation, failure = s.evaluateWithInflightReuse(ctx, job)
 		}
 		s.metrics.ObserveEvaluation(started, time.Now())
 		if failure != nil {
@@ -288,7 +302,7 @@ func (s *Service) processJob(parent context.Context, job *Job, foreground bool) 
 			failure := persistenceFailure(err, "result_checkpoint_failed")
 			s.noteError(failure.Code, failure)
 			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
-			if err := s.repo.Fail(persistCtx, job, failure, failure.Retryable && job.ExecutionMode == "async" && job.Attempts < job.MaxAttempts); err != nil {
+			if err := s.repo.Fail(persistCtx, job, failure, failure.Retryable && (job.ExecutionMode == "async" || job.auditRunKind() == "reaudit") && job.Attempts < job.MaxAttempts); err != nil {
 				s.noteError("job_failure_persist_failed", err)
 			}
 			persistCancel()
@@ -311,6 +325,67 @@ func (s *Service) processJob(parent context.Context, job *Job, foreground bool) 
 	s.metrics.Success(time.Now())
 	s.notify()
 	return outcome, nil
+}
+
+// evaluateWithInflightReuse 只在可靠会话内合并完全相同的正式审核，不把不同会话按用户串行化。
+func (s *Service) evaluateWithInflightReuse(ctx context.Context, job *Job) (*Evaluation, *AuditError) {
+	if job.auditRunKind() != "request" || job.ConversationKey == "" {
+		return s.evaluator.Evaluate(ctx, job)
+	}
+	key := fmt.Sprintf("%d\x00%s\x00%s\x00%s", job.UserID, job.ConversationKey, job.TargetHash, job.EvaluationHash)
+	s.flightMu.Lock()
+	if s.flights == nil {
+		s.flights = make(map[string]*evaluationFlight)
+	}
+	if current := s.flights[key]; current != nil {
+		s.flightMu.Unlock()
+		select {
+		case <-current.done:
+			if current.failure != nil {
+				failure := *current.failure
+				return nil, &failure
+			}
+			cloned, err := cloneEvaluation(current.evaluation)
+			if err != nil {
+				return nil, &AuditError{Code: "inflight_result_clone_failed", Stage: "worker", Message: err.Error()}
+			}
+			job.Reuse.InflightHits++
+			for i := range cloned.Models {
+				if cloned.Models[i].Skipped {
+					continue
+				}
+				cloned.Models[i].Reused = true
+				for j := range cloned.Models[i].Segments {
+					cloned.Models[i].Segments[j].ReuseKind = "inflight"
+				}
+			}
+			return cloned, nil
+		case <-ctx.Done():
+			return nil, requestFailure(ctx.Err())
+		}
+	}
+	flight := &evaluationFlight{done: make(chan struct{})}
+	s.flights[key] = flight
+	if s.flightLeaders == nil {
+		s.flightLeaders = make(map[int64]string)
+	}
+	s.flightLeaders[job.ID] = key
+	s.flightMu.Unlock()
+	evaluation, failure := s.evaluator.Evaluate(ctx, job)
+	s.flightMu.Lock()
+	flight.evaluation, flight.failure = evaluation, failure
+	close(flight.done)
+	s.flightMu.Unlock()
+	return evaluation, failure
+}
+
+func (s *Service) finishEvaluationFlight(jobID int64) {
+	s.flightMu.Lock()
+	defer s.flightMu.Unlock()
+	if key := s.flightLeaders[jobID]; key != "" {
+		delete(s.flightLeaders, jobID)
+		delete(s.flights, key)
+	}
 }
 
 func (s *Service) tryAcquireSlot() bool {
@@ -338,10 +413,10 @@ func (s *Service) finishFailure(ctx context.Context, job *Job, failure *AuditErr
 	s.mu.Lock()
 	closing := s.closing
 	s.mu.Unlock()
-	if closing && job.ExecutionMode == "async" {
+	if closing && (job.ExecutionMode == "async" || job.auditRunKind() == "reaudit") {
 		failure = &AuditError{Code: "worker_paused", Stage: "worker", Message: "服务正在停止，任务将在恢复后继续", Retryable: true}
 	}
-	retry := job.ExecutionMode == "async" && failure.Retryable &&
+	retry := (job.ExecutionMode == "async" || job.auditRunKind() == "reaudit") && failure.Retryable &&
 		(job.Attempts < job.MaxAttempts || failure.Code == "audit_paused" || failure.Code == "worker_paused")
 	s.noteError(failure.Code, failure)
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)

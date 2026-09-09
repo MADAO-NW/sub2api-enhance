@@ -3,38 +3,31 @@ package thirdpartypromptaudit
 import (
 	"github.com/stretchr/testify/require"
 	"testing"
-	"time"
 )
 
-func TestReauditAndResultOnlyRecoveryNeverPunish(t *testing.T) {
+func TestIneligibleAndAdministratorResultsDoNotCreateAccountActions(t *testing.T) {
 	config := testConfig()
 	config.Disable = DisableConfig{Enabled: true, Limit: 1}
 	config.Warning = WarningConfig{Enabled: true, Window: 3, Limit: 1}
-	state := EnforcementState{WarningArmed: true}
-	user := EnforcementUser{Role: "user", Status: "active"}
-	for _, job := range []*Job{{RunKind: "reaudit"}, {RunKind: "request", ExecutionMode: "blocking"}} {
-		outcome := &Outcome{Evaluation: Evaluation{Decision: DecisionBlock, EnforcementEligible: false}}
-		next, action := decideEnforcement(state, user, job, outcome, config, []Decision{DecisionBlock})
-		require.Empty(t, action)
+	state := EnforcementState{WarningArmed: true, DisableViolationCount: 1}
+	for _, input := range []struct {
+		eligible bool
+		role     string
+	}{{false, "user"}, {true, "admin"}} {
+		next, actions := decideEnforcement(state, EnforcementUser{Role: input.role, Status: "active"}, input.eligible, true, config, []Decision{DecisionBlock})
+		require.Empty(t, actions)
 		require.Equal(t, state, next)
 	}
 }
 
-func TestManualEnableResetPreventsLateJobFromDisablingAgain(t *testing.T) {
-	now := time.Now()
+func TestOneViolationCanCreateWarningAndDisableActions(t *testing.T) {
 	config := testConfig()
 	config.Disable = DisableConfig{Enabled: true, Limit: 1}
-	state := EnforcementState{DisableResetAt: &now, WarningArmed: true}
-	outcome := &Outcome{Evaluation: Evaluation{Decision: DecisionBlock, EnforcementEligible: true}}
-	user := EnforcementUser{Role: "user", Status: "active"}
-	old := &Job{RunKind: "request", CreatedAt: now.Add(-time.Second)}
-	next, action := decideEnforcement(state, user, old, outcome, config, nil)
-	require.Zero(t, next.DisableViolationCount)
-	require.Empty(t, action)
-	fresh := &Job{RunKind: "request", CreatedAt: now.Add(time.Second)}
-	next, action = decideEnforcement(state, user, fresh, outcome, config, nil)
-	require.Equal(t, int64(1), next.DisableViolationCount)
-	require.Equal(t, "disable", action)
+	config.Warning = WarningConfig{Enabled: true, Window: 3, Limit: 1}
+	state := EnforcementState{WarningArmed: true, DisableViolationCount: 1}
+	next, actions := decideEnforcement(state, EnforcementUser{Role: "user", Status: "active"}, true, true, config, []Decision{DecisionBlock})
+	require.Equal(t, []string{"warning", "disable"}, actions)
+	require.False(t, next.WarningArmed)
 }
 
 func TestWarningRearmsOnlyAfterWindowFallsBelowLimit(t *testing.T) {
@@ -42,28 +35,26 @@ func TestWarningRearmsOnlyAfterWindowFallsBelowLimit(t *testing.T) {
 	config.Warning = WarningConfig{Enabled: true, Window: 3, Limit: 2}
 	state := EnforcementState{WarningArmed: true}
 	user := EnforcementUser{Role: "user", Status: "active"}
-	job := &Job{RunKind: "request"}
-	outcome := &Outcome{Evaluation: Evaluation{Decision: DecisionBlock, EnforcementEligible: true}}
-	state, action := decideEnforcement(state, user, job, outcome, config, []Decision{DecisionBlock, DecisionBlock})
-	require.Equal(t, "warning", action)
-	state, action = decideEnforcement(state, user, job, outcome, config, []Decision{DecisionBlock, DecisionBlock, DecisionBlock})
-	require.Empty(t, action)
-	state, action = decideEnforcement(state, user, job, outcome, config, []Decision{DecisionPass, DecisionPass, DecisionBlock})
-	require.Empty(t, action)
+	state, actions := decideEnforcement(state, user, true, true, config, []Decision{DecisionBlock, DecisionBlock})
+	require.Equal(t, []string{"warning"}, actions)
+	state, actions = decideEnforcement(state, user, true, true, config, []Decision{DecisionBlock, DecisionBlock, DecisionBlock})
+	require.Empty(t, actions)
+	state, actions = decideEnforcement(state, user, true, false, config, []Decision{DecisionPass, DecisionPass, DecisionBlock})
+	require.Empty(t, actions)
 	require.True(t, state.WarningArmed)
-	_, action = decideEnforcement(state, user, job, outcome, config, []Decision{DecisionBlock, DecisionPass, DecisionBlock})
-	require.Equal(t, "warning", action)
+	_, actions = decideEnforcement(state, user, true, true, config, []Decision{DecisionBlock, DecisionPass, DecisionBlock})
+	require.Equal(t, []string{"warning"}, actions)
 }
 
-// TestDelayedCaptureCannotReenterResetCounter 防止原文早已接收、Job 延迟建成的旧请求进入新累计。
-func TestDelayedCaptureCannotReenterResetCounter(t *testing.T) {
-	reset := time.Now()
-	state := EnforcementState{DisableViolationCount: 4, DisableResetAt: &reset}
-	job := &Job{RunKind: "request", CapturedAt: reset.Add(-time.Minute), CreatedAt: reset.Add(time.Minute)}
-	outcome := &Outcome{Evaluation: Evaluation{Decision: DecisionBlock, EnforcementEligible: true}}
-	cfg := Config{Disable: DisableConfig{Enabled: true, Limit: 4}}
-	next, action := decideEnforcement(state, EnforcementUser{Role: "user", Status: "active"}, job, outcome, cfg, nil)
-	if next.DisableViolationCount != 4 || action != "" {
-		t.Fatalf("旧采集不得修改新累计或触发停用：count=%d action=%s", next.DisableViolationCount, action)
-	}
+func TestBlockingNoticeRecipientsAreIndependentAndDeduplicated(t *testing.T) {
+	outcomeID := int64(9)
+	action := Action{ActionType: "blocking_notice", OutcomeID: &outcomeID}
+	user := EnforcementUser{Username: "user", Email: "user@example.invalid"}
+	deliveries := actionDeliveries(action, user, "admin@example.invalid")
+	require.Len(t, deliveries, 2)
+	require.Equal(t, "admin", deliveries[0].Kind)
+	require.Equal(t, "user", deliveries[1].Kind)
+	require.Contains(t, deliveries[0].Subject, "请求已阻止")
+	require.Len(t, actionDeliveries(action, user, "user@example.invalid"), 1)
+	require.Len(t, actionDeliveries(action, user, ""), 1)
 }

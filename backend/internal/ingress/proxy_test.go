@@ -17,11 +17,13 @@ import (
 )
 
 type testCaptures struct {
-	fail         bool
-	saved        bool
-	raw          []byte
-	mu           sync.Mutex
-	observations []string
+	fail            bool
+	saved           bool
+	raw             []byte
+	metadata        map[string]string
+	conversationKey string
+	mu              sync.Mutex
+	observations    []string
 }
 
 func (s *testCaptures) Save(_ context.Context, c *audit.Capture) error {
@@ -30,6 +32,8 @@ func (s *testCaptures) Save(_ context.Context, c *audit.Capture) error {
 	}
 	s.saved = true
 	s.raw = append([]byte(nil), c.Raw...)
+	s.metadata = c.Metadata
+	s.conversationKey = c.ConversationKey
 	c.ID = 1
 	return nil
 }
@@ -69,6 +73,7 @@ func TestProtectedInputMustPersistBeforeForward(t *testing.T) {
 				require.True(t, store.saved)
 				require.Equal(t, "192.0.2.7", r.Header.Get("X-Forwarded-For"))
 				require.Empty(t, r.Header.Get("Forwarded"))
+				require.Empty(t, r.Header.Get("X-Enhance-Conversation-ID"))
 				raw, _ := io.ReadAll(r.Body)
 				require.Equal(t, store.raw, raw)
 				w.Header().Set("Content-Type", "text/event-stream")
@@ -81,6 +86,7 @@ func TestProtectedInputMustPersistBeforeForward(t *testing.T) {
 			req := httptest.NewRequest("POST", "http://enhance/v1/responses?stream=true", strings.NewReader(body))
 			req.Header.Set("Forwarded", "for=evil")
 			req.Header.Set("X-Forwarded-For", "evil")
+			req.Header.Set("X-Enhance-Conversation-ID", "conversation-a")
 			recorder := httptest.NewRecorder()
 			p.Serve(recorder, req, "192.0.2.7")
 			if fail {
@@ -89,6 +95,7 @@ func TestProtectedInputMustPersistBeforeForward(t *testing.T) {
 			} else {
 				require.Equal(t, 200, recorder.Code)
 				require.Equal(t, body, string(store.raw))
+				require.Equal(t, "conversation-a", store.conversationKey)
 				require.Equal(t, 1, calls)
 				require.Equal(t, "data: {\"text\":\"hello\"}\n\n", recorder.Body.String())
 			}

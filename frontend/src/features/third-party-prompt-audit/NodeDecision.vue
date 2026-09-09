@@ -13,7 +13,8 @@ const maxSegment = computed(() => props.model.max_segment_confidence !== undefin
 
 <template>
   <div class="space-y-1 text-sm" data-test="node-decision">
-    <p v-if="model.error" class="text-red-600 dark:text-red-400">{{ label('unclassified') }} · {{ model.error.message }} · {{ model.error.code }}</p>
+    <p v-if="model.skipped" class="text-gray-500">{{ label(model.skip_reason || 'aggregation_decided') }}</p>
+    <p v-else-if="model.error" class="text-red-600 dark:text-red-400">{{ label('unclassified') }} · {{ model.error.message }} · {{ model.error.code }}</p>
     <template v-else-if="model.basis === 'segments_all_pass'">
       <p>{{ label('segments_all_pass') }}</p>
       <p>{{ label('maxSegmentScore') }}: {{ maxSegment ?? label('noValidScore') }} · {{ label('triggerThreshold') }}: {{ config?.review_threshold ?? '—' }}</p>

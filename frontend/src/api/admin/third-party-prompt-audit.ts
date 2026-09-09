@@ -10,6 +10,7 @@ export interface AuditModel {
   base_url: string
   model: string
   timeout_ms: number
+  parameters?: Record<string, unknown>
 }
 export interface AuditConfig {
   mode: AuditMode
@@ -48,7 +49,7 @@ export interface DecisionConfig { revision: number; review_threshold: number | n
 export interface AuditError { code: string; message: string; stage: string; retryable: boolean }
 export interface Score { confidence: number; reason: string }
 export interface ProbeResult { ok: boolean; model_id: string; attempt_id: number; result: Score | null; error: AuditError | null; tested_at: string; latency_ms: number }
-export interface Reuse { whole_lookups: number; whole_hits: number; segment_lookups: number; segment_hits: number; within_job_hits: number }
+export interface Reuse { whole_lookups: number; whole_hits: number; segment_lookups: number; segment_hits: number; within_job_hits: number; inflight_hits?: number; short_circuited_nodes?: number }
 export interface AuditInput { protocol: string; fields?: Record<string, unknown>; non_text: { source_path: string; type: string }[]; raw_body_base64?: string }
 export interface SegmentMeta { order: number; source_path: string; source_role: string; policy_role: string; turn_scope: string; selected: boolean }
 export interface ModelResult {
@@ -62,19 +63,25 @@ export interface ModelResult {
   reused: boolean
   joint_attempt_id?: number
   error?: AuditError
+  skipped?: boolean
+  skip_reason?: string
   segments: { order: number; source_path: string; reuse_kind: string; result: Score & { id: number; source_attempt_id: number; source_role: string; policy_role: string; turn_scope: string } }[]
 }
-export interface Outcome { id: number; job_id: number; user_id: number; decision: AuditDecision; models: ModelResult[]; partial_failure: boolean; enforcement_eligible: boolean; source_outcome_id?: number; created_at: string; decision_config?: DecisionConfig }
+export interface Outcome { id: number; job_id: number; user_id: number; audit_round: number; run_kind: 'request' | 'reaudit'; requested_by: number | null; config_snapshot?: AuditConfig & { revision: number }; decision: AuditDecision; models: ModelResult[]; partial_failure: boolean; enforcement_eligible: boolean; source_outcome_id?: number; started_at: string | null; finished_at: string | null; duration_ms: number | null; created_at: string; decision_config?: DecisionConfig }
 export interface AuditJob {
   capture_id?: number|null
   id: number
   run_kind: 'request' | 'reaudit'
+  current_run_kind: 'request' | 'reaudit'
+  audit_round: number
+  current_requested_by: number | null
   source_job_id: number | null
   requested_by: number | null
   user_id: number
   api_key_id: number | null
   group_id: number | null
   request_id: string
+  conversation_key?: string
   identity: { username: string; user_email: string; api_key_name: string; group_name: string; endpoint: string }
   platform: string
   protocol: string
@@ -101,13 +108,14 @@ export interface AuditJob {
   next_attempt_at: string
   started_at: string | null
   finished_at: string | null
+  duration_ms: number | null
   created_at: string
   updated_at: string
 }
 export interface AuditEvent { id: number; job_id: number; original_outcome_id: number | null; latest_outcome_id: number; job?: AuditJob; latest?: Outcome; original?: Outcome; reaudit_status?: string; created_at: string; updated_at: string }
 export interface AuditCapture {
   job_id?: number | null
-  id: number; capture_key: string; transport: string; protocol: string; body_format: string; raw_body?: string; body_bytes: number; body_sha256: string
+  id: number; capture_key: string; conversation_key?: string; transport: string; protocol: string; body_format: string; raw_body?: string; body_bytes: number; body_sha256: string
   snapshot_status: string; eligibility_status: string; processing_status: string; forwarding_status: string; created_at: string; last_error_message: string
   identity?: { user_id: number }; metadata?: Record<string, string>; forwarding_observations?: unknown
 }
@@ -115,7 +123,7 @@ export interface AuditUser {
   id: number; username: string; email: string; role: string; status: string; disable_violation_count: number; disable_reset_at: string | null; action_pending: boolean
 }
 export interface ModelAttempt {
-  id: number; job_id: number | null; call_kind: string; evaluation_round: number | null; model_id: string; model_snapshot: AuditModel
+  id: number; job_id: number | null; call_kind: string; evaluation_round: number | null; audit_round: number; model_id: string; model_snapshot: AuditModel
   stage: string; segment_order: number | null; repair_of_attempt_id: number | null; request_metadata: unknown; status: string
   http_status: number | null; raw_response: string | null; result: Score | null; input_tokens: number | null; output_tokens: number | null
   latency_ms: number | null; error_code: string; error_message: string; created_at: string; dispatch_started_at: string | null; finished_at: string | null
@@ -126,7 +134,7 @@ export interface AuditAction {
   applied_at: string|null; notification_status: string; auth_cache_status: string; auth_cache_error: string
   deliveries: { recipient: string; kind: string; status: string; last_error: string; attempts: unknown[] }[]
 }
-export interface JobDetail { input_json: string; input_parts: (SegmentMeta & { content: { type: string; text: string; source_path: string }[] })[]; non_text: { type: string; source_path: string }[]; job: AuditJob; outcome: Outcome | null; reaudits: AuditJob[]; attempts: ModelAttempt[]; actions: AuditAction[] }
+export interface JobDetail { input_json: string; input_parts: (SegmentMeta & { content: { type: string; text: string; source_path: string }[] })[]; audit_target?: { protocol: string; messages: unknown[]; tools: Record<string, unknown> }; non_text: { type: string; source_path: string }[]; job: AuditJob; outcome: Outcome | null; rounds: Outcome[]; reaudits: AuditJob[]; attempts: ModelAttempt[]; actions: AuditAction[]; enforcement?: { role: string; user_status: string; warning_reason: string; disable_reason: string; window_violations: number; window_size: number; disable_violation_count: number } }
 export interface EventDetail { event: AuditEvent; detail: JobDetail }
 export interface AuditFilter { ids?: number[]; from?: string; to?: string; user_id?: number; api_key_id?: number; group_id?: number; status?: string; decision?: string; run_kind?: string; mode?: string; platform?: string; request_id?: string; keyword?: string; model_id?: string }
 export interface AuditPage<T> { items: T[]; total: number; page: number; page_size: number }

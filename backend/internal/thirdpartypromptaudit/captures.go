@@ -19,6 +19,7 @@ import (
 type Capture struct {
 	ID               int64             `json:"id"`
 	Key              string            `json:"capture_key"`
+	ConversationKey  string            `json:"conversation_key,omitempty"`
 	Transport        string            `json:"transport"`
 	ConnectionKey    *string           `json:"connection_key"`
 	Sequence         *int64            `json:"message_sequence"`
@@ -74,8 +75,8 @@ func (s *CaptureStore) Save(ctx context.Context, c *Capture) error {
 		c.ProcessingStatus = "skipped"
 	}
 	c.ForwardingStatus = "not_forwarded"
-	err = s.db.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.captures(capture_key,transport,connection_key,message_sequence,protocol,body_format,raw_body,body_sha256,body_bytes,snapshot_status,request_metadata,identity_snapshot,identity_resolved_at,user_id,api_key_id,group_id,eligibility_status,processing_status,last_error_message)
- VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id,created_at`, c.Key, c.Transport, c.ConnectionKey, c.Sequence, c.Protocol, c.Format, c.Raw, c.SHA256, c.Bytes, c.SnapshotStatus, string(metadata), string(identity), resolved, userID, keyID, c.Identity.GroupID, c.Eligibility, c.ProcessingStatus, encodeStoredText(c.Error)).Scan(&c.ID, &c.CreatedAt)
+	err = s.db.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.captures(capture_key,conversation_key,transport,connection_key,message_sequence,protocol,body_format,raw_body,body_sha256,body_bytes,snapshot_status,request_metadata,identity_snapshot,identity_resolved_at,user_id,api_key_id,group_id,eligibility_status,processing_status,last_error_message)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING id,created_at`, c.Key, nullIfEmpty(c.ConversationKey), c.Transport, c.ConnectionKey, c.Sequence, c.Protocol, c.Format, c.Raw, c.SHA256, c.Bytes, c.SnapshotStatus, string(metadata), string(identity), resolved, userID, keyID, c.Identity.GroupID, c.Eligibility, c.ProcessingStatus, encodeStoredText(c.Error)).Scan(&c.ID, &c.CreatedAt)
 	if err != nil {
 		// 提交不确定时按本次服务端键回查，只确认原文，不重放生成请求。
 		verify, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
@@ -108,7 +109,7 @@ func (s *CaptureStore) Get(ctx context.Context, id int64) (*Capture, error) {
 	var c Capture
 	var meta, identity, obs string
 	var message *string
-	err := s.db.QueryRowContext(ctx, `SELECT id,capture_key,transport,connection_key,message_sequence,protocol,body_format,raw_body,body_sha256,body_bytes,snapshot_status,request_metadata,COALESCE(identity_snapshot,'{}'),eligibility_status,processing_status,forwarding_status,forwarding_observations,last_error_message,created_at FROM sub2api_enhance.captures WHERE id=$1`, id).Scan(&c.ID, &c.Key, &c.Transport, &c.ConnectionKey, &c.Sequence, &c.Protocol, &c.Format, &c.Raw, &c.SHA256, &c.Bytes, &c.SnapshotStatus, &meta, &identity, &c.Eligibility, &c.ProcessingStatus, &c.ForwardingStatus, &obs, &message, &c.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT id,capture_key,COALESCE(conversation_key,''),transport,connection_key,message_sequence,protocol,body_format,raw_body,body_sha256,body_bytes,snapshot_status,request_metadata,COALESCE(identity_snapshot,'{}'),eligibility_status,processing_status,forwarding_status,forwarding_observations,last_error_message,created_at FROM sub2api_enhance.captures WHERE id=$1`, id).Scan(&c.ID, &c.Key, &c.ConversationKey, &c.Transport, &c.ConnectionKey, &c.Sequence, &c.Protocol, &c.Format, &c.Raw, &c.SHA256, &c.Bytes, &c.SnapshotStatus, &meta, &identity, &c.Eligibility, &c.ProcessingStatus, &c.ForwardingStatus, &obs, &message, &c.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -133,7 +134,7 @@ func (s *CaptureStore) List(ctx context.Context, page, size int, status string) 
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM sub2api_enhance.captures WHERE ($1='' OR processing_status=$1)`, status).Scan(&out.Total); err != nil {
 		return out, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,capture_key,transport,protocol,body_format,body_sha256,body_bytes,snapshot_status,eligibility_status,processing_status,forwarding_status,last_error_message,created_at FROM sub2api_enhance.captures WHERE ($1='' OR processing_status=$1) ORDER BY id DESC LIMIT $2 OFFSET $3`, status, size, (page-1)*size)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,capture_key,COALESCE(conversation_key,''),transport,protocol,body_format,body_sha256,body_bytes,snapshot_status,eligibility_status,processing_status,forwarding_status,last_error_message,created_at FROM sub2api_enhance.captures WHERE ($1='' OR processing_status=$1) ORDER BY id DESC LIMIT $2 OFFSET $3`, status, size, (page-1)*size)
 	if err != nil {
 		return out, err
 	}
@@ -141,7 +142,7 @@ func (s *CaptureStore) List(ctx context.Context, page, size int, status string) 
 	for rows.Next() {
 		var c Capture
 		var message *string
-		if err := rows.Scan(&c.ID, &c.Key, &c.Transport, &c.Protocol, &c.Format, &c.SHA256, &c.Bytes, &c.SnapshotStatus, &c.Eligibility, &c.ProcessingStatus, &c.ForwardingStatus, &message, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Key, &c.ConversationKey, &c.Transport, &c.Protocol, &c.Format, &c.SHA256, &c.Bytes, &c.SnapshotStatus, &c.Eligibility, &c.ProcessingStatus, &c.ForwardingStatus, &message, &c.CreatedAt); err != nil {
 			return out, err
 		}
 		if message != nil {
@@ -187,7 +188,7 @@ func captureRequest(c *Capture) (IntakeRequest, error) {
 			return IntakeRequest{}, err
 		}
 	}
-	request := IntakeRequest{CapturedAt: c.CreatedAt, CaptureKey: c.Key, CaptureID: &c.ID, RequestID: c.Key, UserID: c.Identity.UserID, APIKeyID: c.Identity.APIKeyID, GroupID: c.Identity.GroupID, Username: c.Identity.Username, UserEmail: c.Identity.UserEmail, APIKeyName: c.Identity.APIKeyName, GroupName: c.Identity.GroupName, Provider: c.Identity.Platform, Endpoint: c.Metadata["path"], Protocol: c.Protocol, Stage: "external_ingress", Body: raw, Background: c.Metadata["background"] == "true", Manual: c.Metadata["manual_reprocess"] == "true"}
+	request := IntakeRequest{CapturedAt: c.CreatedAt, CaptureKey: c.Key, CaptureID: &c.ID, RequestID: c.Key, ConversationKey: c.ConversationKey, UserID: c.Identity.UserID, APIKeyID: c.Identity.APIKeyID, GroupID: c.Identity.GroupID, Username: c.Identity.Username, UserEmail: c.Identity.UserEmail, APIKeyName: c.Identity.APIKeyName, GroupName: c.Identity.GroupName, Provider: c.Identity.Platform, Endpoint: c.Metadata["path"], Protocol: c.Protocol, Stage: "external_ingress", Body: raw, Background: c.Metadata["background"] == "true", Manual: c.Metadata["manual_reprocess"] == "true"}
 	if c.Format == "multipart_text_fields" {
 		var fields []map[string]any
 		if err := json.Unmarshal(raw, &fields); err != nil {

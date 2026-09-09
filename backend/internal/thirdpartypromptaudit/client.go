@@ -36,6 +36,7 @@ type chatMessage struct {
 	Content string `json:"content"`
 }
 
+// chatRequest 保留审核节点固定字段的测试契约；运行时会在同名字段外合并高级参数。
 type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
@@ -71,7 +72,7 @@ func (c *ModelClient) EvaluateTarget(ctx context.Context, job *Job, model ModelC
 		if failure == nil {
 			return result, id, nil
 		}
-		if failure.Code != "invalid_response" || number > 0 || ctx.Err() != nil {
+		if (failure.Code != "invalid_response" && failure.Code != "upstream_protocol_error") || number > 0 || ctx.Err() != nil {
 			return nil, id, failure
 		}
 		repairOf = &id
@@ -99,8 +100,13 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 	if err != nil {
 		return nil, 0, &AuditError{Code: "input_encode_failed", Stage: "input_parse", Message: err.Error()}
 	}
-	request := chatRequest{Model: model.Model, Stream: false,
-		Messages: []chatMessage{{Role: "system", Content: systemPromptSnapshot(snapshot, correction)}, {Role: "user", Content: string(targetJSON)}}}
+	request := make(map[string]any, len(model.Parameters)+3)
+	for name, value := range model.Parameters {
+		request[name] = value
+	}
+	request["model"] = model.Model
+	request["stream"] = false
+	request["messages"] = []chatMessage{{Role: "system", Content: systemPromptSnapshot(snapshot, correction)}, {Role: "user", Content: string(targetJSON)}}
 	body, err := json.Marshal(request)
 	if err != nil {
 		return nil, 0, &AuditError{Code: "request_encode_failed", Stage: "model_request", Message: err.Error()}
@@ -115,6 +121,7 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 	} else {
 		attempt.JobID = &job.ID
 		attempt.EvaluationRound = &job.Attempts
+		attempt.AuditRound = job.AuditRound
 		attempt.CallKind = "audit"
 		metadata["job_id"] = job.ID
 		metadata["target_hash"] = job.TargetHash

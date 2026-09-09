@@ -13,14 +13,14 @@ const (
 )
 
 type IntakeRequest struct {
-	CapturedAt                                                                                                    time.Time
-	Manual                                                                                                        bool
-	CaptureKey, RequestID, Username, UserEmail, APIKeyName, GroupName, Provider, Endpoint, Protocol, Model, Stage string
-	UserID, APIKeyID                                                                                              int64
-	CaptureID                                                                                                     *int64
-	GroupID                                                                                                       *int64
-	Body                                                                                                          []byte
-	Background                                                                                                    bool
+	CapturedAt                                                                                                                     time.Time
+	Manual                                                                                                                         bool
+	CaptureKey, RequestID, ConversationKey, Username, UserEmail, APIKeyName, GroupName, Provider, Endpoint, Protocol, Model, Stage string
+	UserID, APIKeyID                                                                                                               int64
+	CaptureID                                                                                                                      *int64
+	GroupID                                                                                                                        *int64
+	Body                                                                                                                           []byte
+	Background                                                                                                                     bool
 }
 type IntakeDecision struct {
 	JobID     int64               `json:"job_id"`

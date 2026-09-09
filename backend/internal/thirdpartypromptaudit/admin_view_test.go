@@ -38,15 +38,15 @@ func TestEventListExplainsLatestOutcomeWithItsOwnJobRevision(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
-	mock.ExpectQuery(`SELECT COUNT\(\*\).*LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs original ON original.id=j.source_job_id LEFT JOIN sub2api_enhance.captures capture ON capture.id=COALESCE\(j.capture_id,original.capture_id\).*JOIN sub2api_enhance.third_party_prompt_audit_jobs decision_job ON decision_job.id=o.job_id`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT COUNT\(\*\).*LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs original ON original.id=j.source_job_id LEFT JOIN sub2api_enhance.captures capture ON capture.id=COALESCE\(j.capture_id,original.capture_id\).*JOIN sub2api_enhance.third_party_prompt_audit_outcomes o ON o.id=e.latest_outcome_id`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	now := time.Now()
-	columns := []string{"id", "job_id", "original", "latest", "created", "updated", "job", "decision", "partial", "outcome_created", "reaudit_status", "models", "decision_config", "outcome_job_id"}
+	columns := []string{"id", "job_id", "original", "latest", "created", "updated", "job", "decision", "partial", "outcome_created", "reaudit_status", "models", "decision_config", "audit_round", "duration_ms", "outcome_job_id"}
 	rows := sqlmock.NewRows(columns).AddRow(1, 4, 10, 11, now, now,
 		`{"id":4,"decision_config":{"revision":3,"review_threshold":1,"block_threshold":1}}`,
 		"review", false, now, "done",
 		`[{"model_id":"a","basis":"joint","confidence":0.65,"max_segment_confidence":0.95,"reused":true,"joint_attempt_id":8}]`,
-		`{"revision":8,"review_threshold":0.5,"block_threshold":0.8}`, 9)
-	mock.ExpectQuery(`SELECT e.id.*capture.created_at.*original.capture_id.*LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs original ON original.id=j.source_job_id LEFT JOIN sub2api_enhance.captures capture ON capture.id=COALESCE\(j.capture_id,original.capture_id\).*decision_job.id=o.job_id`).WithArgs(20, 0).WillReturnRows(rows)
+		`{"revision":8,"review_threshold":0.5,"block_threshold":0.8}`, 2, int64(125), 9)
+	mock.ExpectQuery(`SELECT e.id.*capture.created_at.*original.capture_id.*LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs original ON original.id=j.source_job_id LEFT JOIN sub2api_enhance.captures capture ON capture.id=COALESCE\(j.capture_id,original.capture_id\).*JOIN sub2api_enhance.third_party_prompt_audit_outcomes o ON o.id=e.latest_outcome_id`).WithArgs(20, 0).WillReturnRows(rows)
 	page, err := NewRepository(db).ListEvents(context.Background(), Filter{}, 1, 20)
 	require.NoError(t, err)
 	require.Len(t, page.Items, 1)
@@ -54,6 +54,8 @@ func TestEventListExplainsLatestOutcomeWithItsOwnJobRevision(t *testing.T) {
 	require.Equal(t, int64(3), event.Job.DecisionConfig.Revision)
 	require.Equal(t, int64(8), event.Latest.DecisionConfig.Revision)
 	require.Equal(t, int64(9), event.Latest.JobID)
+	require.Equal(t, 2, event.Latest.AuditRound)
+	require.EqualValues(t, 125, *event.Latest.DurationMS)
 	require.Equal(t, .5, *event.Latest.DecisionConfig.ReviewThreshold)
 	require.Equal(t, .95, *event.Latest.Models[0].MaxSegmentConfidence)
 	require.True(t, event.Latest.Models[0].Reused)

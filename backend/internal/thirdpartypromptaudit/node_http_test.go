@@ -17,3 +17,17 @@ func TestAuditNodeRequiresHTTPSOutsideLoopback(t *testing.T) {
 		require.ErrorContains(t, err, "必须使用 HTTPS")
 	}
 }
+
+func TestNodeEndpointAcceptsRootTrailingSlashAndVersionPrefix(t *testing.T) {
+	for _, raw := range []string{"https://example.com", "https://example.com/", "https://example.com/v1", "https://example.com/v1/"} {
+		models, err := modelsURL(raw)
+		require.NoError(t, err)
+		require.Equal(t, "https://example.com/v1/models", models)
+		chat, err := chatCompletionsURL(raw)
+		require.NoError(t, err)
+		require.Equal(t, "https://example.com/v1/chat/completions", chat)
+	}
+	models, err := modelsURL("https://example.com/openai/v1/")
+	require.NoError(t, err)
+	require.Equal(t, "https://example.com/openai/v1/models", models)
+}

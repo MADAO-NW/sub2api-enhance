@@ -92,14 +92,14 @@ describe('third-party audit configuration', () => {
     await selector.setValue('json')
     expect(wrapper.find('[data-test="probe-protocol"]').exists()).toBe(true)
     const raw = '  {"input":{"id":9007199254740993,"key":1,"key":2}}'
-    await wrapper.findAll('textarea')[1]!.setValue(raw)
+    await wrapper.get('[data-test="probe-input"]').setValue(raw)
     await wrapper.findAll('button').find(button => button.text() === 'probe')!.trigger('click'); await flushPromises()
     expect(mocks.probe).toHaveBeenCalledWith(expect.objectContaining({ input: raw, input_kind: 'json' }))
     wrapper.unmount()
   })
   it('preserves plain text that happens to begin with a bracket during a probe', async () => {
     const wrapper = mount(AuditConfigPanel); await flushPromises()
-    await wrapper.findAll('textarea')[1]!.setValue('[this is normal text, not JSON]')
+    await wrapper.get('[data-test="probe-input"]').setValue('[this is normal text, not JSON]')
     await wrapper.findAll('button').find(button => button.text() === 'probe')!.trigger('click'); await flushPromises()
     expect(mocks.probe).toHaveBeenCalledWith(expect.objectContaining({ input: '[this is normal text, not JSON]' }))
     wrapper.unmount()
@@ -109,8 +109,7 @@ describe('third-party audit configuration', () => {
     await wrapper.findAll('button').find(button => button.text() === 'loadModels')!.trigger('click')
     await flushPromises()
     expect(mocks.listModels).toHaveBeenCalledWith({ model_id: 'a', base_url: 'https://example.invalid', timeout_ms: 1000, key_action: 'keep' })
-    const modelSelect = wrapper.findAll('select').find(select => select.find('option[value="second-model"]').exists())!
-    await modelSelect.setValue('second-model')
+    await wrapper.get('[data-test="model-input"]').setValue('second-model')
     expect(wrapper.text()).toContain('second-model')
     await wrapper.findAll('button').find(button => button.text() === 'probe')!.trigger('click')
     await flushPromises()
@@ -165,9 +164,24 @@ describe('third-party audit configuration', () => {
     expect(mocks.saveConfig.mock.lastCall?.[0].keys).toContainEqual({ model_id: 'a', action: 'replace', api_key: 'replacement-key' })
     wrapper.unmount()
   })
+  it('applies providers JSON parameters without exposing credentials', async () => {
+    const wrapper = mount(AuditConfigPanel); await flushPromises()
+    const document = { $schemaVersion: 1, providers: [{ id: 'a', type: 'openai-chat-completions', enabled: true, baseUrl: 'https://example.com/v1/', apiModel: 'manual-model', timeoutMs: 1234, parameters: { reasoning_effort: 'none' } }] }
+    await wrapper.get('[data-test="providers-json"]').setValue(JSON.stringify(document))
+    await wrapper.findAll('button').find(button => button.text() === 'applyProvidersJSON')!.trigger('click')
+    await wrapper.get('form').trigger('submit'); await flushPromises()
+    expect(mocks.saveConfig.mock.lastCall?.[0].config.models[0]).toMatchObject({ id: 'a', base_url: 'https://example.com/v1/', model: 'manual-model', timeout_ms: 1234, parameters: { reasoning_effort: 'none' } })
+    expect((wrapper.get('[data-test="providers-json"]').element as HTMLTextAreaElement).value).not.toContain('api_key')
+    wrapper.unmount()
+  })
 })
 
 describe('node decision evidence', () => {
+  it('shows aggregation short-circuiting instead of an invalid score', () => {
+    const wrapper = mount(NodeDecision, { props: { model: { model_id: 'b', model_name: 'Node B', basis: 'aggregation_decided', confidence: null, reason: '', reused: false, skipped: true, skip_reason: 'aggregation_decided', segments: [] } } })
+    expect(wrapper.text()).toContain('aggregation_decided')
+    expect(wrapper.text()).not.toContain('noValidScore')
+  })
   it('shows the actual skipped-joint threshold and high segment score, without a fake joint zero', () => {
     const wrapper = mount(NodeDecision, { props: {
       model: { model_id: 'a', model_name: 'Node', basis: 'segments_all_pass', confidence: null, max_segment_confidence: 0.95, decision: 'pass', reason: '', reused: false, segments: [] },
@@ -243,15 +257,15 @@ describe('lossless full input', () => {
     expect(wrapper.text()).toContain(original)
     wrapper.unmount()
   })
-  it('starts a single-record reaudit and exposes the created job for global refresh', async () => {
+  it('requeues the same job for a new audit round and exposes it for global refresh', async () => {
     mocks.job.mockResolvedValue({ job: { id: 1, capture_id: 2, identity: {}, status: 'done', snapshot_status: 'complete', config_snapshot: {} }, outcome: null, attempts: [], actions: [], reaudits: [], input_json: '{}', input_parts: [], non_text: [] })
-    mocks.reaudit.mockResolvedValue({ matched: 1, ready: 1, items: [{ source_job_id: 1, job_id: 9, status: 'created', reason: '' }] })
+    mocks.reaudit.mockResolvedValue({ matched: 1, ready: 1, items: [{ source_job_id: 1, job_id: 1, status: 'requeued', reason: '' }] })
     const wrapper = mount(AuditDetail, { props: { source: 'jobs', id: 1 }, global: { stubs } })
     await flushPromises()
     await wrapper.findAll('button').find(button => button.text() === 'reaudit')!.trigger('click')
     await flushPromises()
     expect(mocks.reaudit).toHaveBeenCalledWith({ source: 'jobs', filter: { ids: [1] } })
-    expect(wrapper.emitted('reaudit-created')?.[0]).toEqual([[9]])
+    expect(wrapper.emitted('reaudit-created')?.[0]).toEqual([[1]])
     expect(wrapper.text()).not.toContain('enableAndReset')
     expect(wrapper.text()).not.toContain('downloadCapture')
     wrapper.unmount()

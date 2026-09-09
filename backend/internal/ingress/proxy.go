@@ -64,6 +64,7 @@ func New(upstream string, captures captureStore, service auditor, identities ide
 		r.Out.Header.Del("X-Forwarded-For")
 		r.Out.Header.Del("X-Real-IP")
 		r.Out.Header.Del("X-Enhance-Capture")
+		r.Out.Header.Del("X-Enhance-Conversation-ID")
 		if state, ok := r.In.Context().Value(contextKey{}).(*requestContext); ok {
 			r.Out.Header.Set("X-Forwarded-For", state.clientIP)
 			r.Out.Header.Set("X-Real-IP", state.clientIP)
@@ -190,7 +191,7 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 		writeError(w, kind, 503, "capture_unavailable", "无法读取已接收输入")
 		return
 	}
-	c := &audit.Capture{Key: uuid.NewString(), Transport: "http", Protocol: kind, Format: "entity_bytes", Raw: raw, SnapshotStatus: "complete", Metadata: map[string]string{"path": r.URL.Path, "method": r.Method, "content_type": r.Header.Get("Content-Type"), "content_encoding": r.Header.Get("Content-Encoding"), "client_ip": clientIP, "mode": p.audit.Mode()}}
+	c := &audit.Capture{Key: uuid.NewString(), ConversationKey: r.Header.Get("X-Enhance-Conversation-ID"), Transport: "http", Protocol: kind, Format: "entity_bytes", Raw: raw, SnapshotStatus: "complete", Metadata: map[string]string{"path": r.URL.Path, "method": r.Method, "content_type": r.Header.Get("Content-Type"), "content_encoding": r.Header.Get("Content-Encoding"), "client_ip": clientIP, "mode": p.audit.Mode()}}
 	if readErr != nil {
 		c.SnapshotStatus = "incomplete"
 		c.Error = "客户端正文未接收完整"

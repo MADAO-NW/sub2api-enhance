@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 )
 
 type memoryAuditStore struct {
+	mu                       sync.Mutex
 	attempts                 []*ModelAttempt
 	segments                 map[string]SegmentResult
 	whole                    *Outcome
@@ -22,11 +25,15 @@ type memoryAuditStore struct {
 }
 
 func (s *memoryAuditStore) PrepareAttempt(_ context.Context, _ *Job, a *ModelAttempt) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	a.ID = int64(len(s.attempts) + 1)
 	s.attempts = append(s.attempts, a)
 	return nil
 }
 func (s *memoryAuditStore) StartAttempt(_ context.Context, _ *Job, a *ModelAttempt) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.startError != nil {
 		return s.startError
 	}
@@ -36,20 +43,81 @@ func (s *memoryAuditStore) StartAttempt(_ context.Context, _ *Job, a *ModelAttem
 }
 func (s *memoryAuditStore) FinishAttempt(context.Context, *Job, *ModelAttempt) error { return nil }
 func (s *memoryAuditStore) FindWholeResult(context.Context, *Job) (*Outcome, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.wholeReads++
 	return s.whole, nil
 }
 func (s *memoryAuditStore) FindSegments(context.Context, int64, string, []string) (map[string]SegmentResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.segmentReads++
 	return s.segments, nil
 }
 func (s *memoryAuditStore) SaveSegment(_ context.Context, _ *Job, result *SegmentResult) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	result.ID = result.SourceAttemptID
 	if s.segments == nil {
 		s.segments = map[string]SegmentResult{}
 	}
 	s.segments[result.AuditKey] = *result
 	return nil
+}
+
+func TestInflightReuseIsConversationScoped(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		conversations []string
+		wantCalls     int
+	}{{"same conversation", []string{"same", "same"}, 1}, {"different conversations", []string{"first", "second"}, 2}} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &memoryAuditStore{}
+			var calls atomic.Int32
+			started := make(chan struct{}, 2)
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				started <- struct{}{}
+				<-release
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"confidence\":0.1,\"reason\":\"正常\"}"}}]}`))
+			}))
+			defer server.Close()
+			evaluator := &Evaluator{store: store, client: &ModelClient{attempts: store}, keys: noKey{}}
+			service := &Service{evaluator: evaluator, flights: make(map[string]*evaluationFlight)}
+			results := make(chan *Evaluation, 2)
+			for index, conversation := range test.conversations {
+				job := evaluationJob(t, server.URL, `{"input":"相同输入"}`)
+				job.ID = int64(index + 1)
+				job.ConversationKey = conversation
+				_, err := prepareTarget(job)
+				require.NoError(t, err)
+				go func() {
+					result, failure := service.evaluateWithInflightReuse(context.Background(), job)
+					require.Nil(t, failure)
+					results <- result
+				}()
+				if index == 0 {
+					<-started
+				}
+			}
+			if test.wantCalls == 2 {
+				select {
+				case <-started:
+				case <-time.After(time.Second):
+					t.Fatal("不同会话未并行调用审核模型")
+				}
+			} else {
+				time.Sleep(20 * time.Millisecond)
+			}
+			close(release)
+			first, second := <-results, <-results
+			require.EqualValues(t, test.wantCalls, calls.Load())
+			if test.wantCalls == 1 {
+				require.True(t, first.Models[0].Reused || second.Models[0].Reused)
+			}
+		})
+	}
 }
 
 type noKey struct{}
@@ -77,7 +145,7 @@ func evaluationJob(t *testing.T, url, input string) *Job {
 	config.Models[0].TimeoutMS = 5000
 	snapshot, err := CaptureInput("openai_responses", []byte(input))
 	require.NoError(t, err)
-	return &Job{ID: 1, UserID: 7, RunKind: "request", Attempts: 1, Protocol: "openai_responses", FullInput: snapshot, Config: ConfigSnapshot{Config: config, ContractVersion: ContractVersion, FixedContract: OutputContract}}
+	return &Job{ID: 1, UserID: 7, ConversationKey: "conversation-a", RunKind: "request", Attempts: 1, Protocol: "openai_responses", FullInput: snapshot, Config: ConfigSnapshot{Config: config, ContractVersion: ContractVersion, FixedContract: OutputContract}}
 }
 
 func TestRiskyFragmentRequiresUnbiasedWholeTaskEvaluation(t *testing.T) {
@@ -174,6 +242,29 @@ func TestL0ReusesWholeResultAndReauditForcesFreshCalls(t *testing.T) {
 	require.Equal(t, 1, store.segmentReads)
 }
 
+func TestRequestsWithoutConversationIdentityNeverReuseAcrossJobs(t *testing.T) {
+	store := &memoryAuditStore{}
+	count := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		count++
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"confidence\":0.1,\"reason\":\"正常\"}"}}]}`))
+	}))
+	defer server.Close()
+	evaluator := &Evaluator{store: store, client: &ModelClient{attempts: store}, keys: noKey{}}
+	firstJob := evaluationJob(t, server.URL, `{"input":"相同输入"}`)
+	firstJob.ConversationKey = ""
+	first, failure := evaluator.Evaluate(context.Background(), firstJob)
+	require.Nil(t, failure)
+	store.whole = &Outcome{ID: 9, Evaluation: *first}
+	secondJob := evaluationJob(t, server.URL, `{"input":"相同输入"}`)
+	secondJob.ConversationKey = ""
+	_, failure = evaluator.Evaluate(context.Background(), secondJob)
+	require.Nil(t, failure)
+	require.Equal(t, 2, count)
+	require.Zero(t, store.wholeReads)
+	require.Zero(t, store.segmentReads)
+}
+
 func TestChangedThresholdRequiresJointEvaluationOfPreviouslyPassingSegments(t *testing.T) {
 	store := &memoryAuditStore{}
 	count := 0
@@ -235,6 +326,58 @@ func TestAggregationKeepsUnknownVotesInDenominator(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAnyBlockSkipsRemainingNodes(t *testing.T) {
+	store := &memoryAuditStore{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"confidence\":0.95,\"reason\":\"违规\"}"}}]}`))
+	}))
+	defer server.Close()
+	job := evaluationJob(t, server.URL, `{"input":"测试"}`)
+	base := job.Config.Models[0]
+	for i := 1; i < 3; i++ {
+		model := base
+		model.ID, model.Name = fmt.Sprintf("node-%d", i), fmt.Sprintf("node-%d", i)
+		job.Config.Models = append(job.Config.Models, model)
+	}
+	result, failure := (&Evaluator{store: store, client: &ModelClient{attempts: store}, keys: noKey{}}).Evaluate(context.Background(), job)
+	require.Nil(t, failure)
+	require.Equal(t, DecisionBlock, result.Decision)
+	require.Len(t, result.Models, 3)
+	require.False(t, result.Models[0].Skipped)
+	require.True(t, result.Models[1].Skipped)
+	require.Equal(t, "aggregation_decided", result.Models[1].SkipReason)
+	require.Equal(t, 2, job.Reuse.ShortCircuited)
+}
+
+func TestProtocolFailureContinuesToLaterNode(t *testing.T) {
+	failedCalls := 0
+	failedNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		failedCalls++
+		_, _ = w.Write([]byte(`{"choices":[]}`))
+	}))
+	defer failedNode.Close()
+	passedCalls := 0
+	blockNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		passedCalls++
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"confidence\":0.95,\"reason\":\"违规\"}"}}]}`))
+	}))
+	defer blockNode.Close()
+	store := &memoryAuditStore{}
+	job := evaluationJob(t, failedNode.URL, `{"input":"测试"}`)
+	job.Config.Models[0].ID = "failed-node"
+	second := job.Config.Models[0]
+	second.ID, second.Name, second.BaseURL = "block-node", "block-node", blockNode.URL
+	job.Config.Models = append(job.Config.Models, second)
+	result, failure := (&Evaluator{store: store, client: &ModelClient{attempts: store}, keys: noKey{}}).Evaluate(context.Background(), job)
+	require.Nil(t, failure)
+	require.Equal(t, DecisionBlock, result.Decision)
+	require.True(t, result.PartialFailure)
+	require.Equal(t, 2, failedCalls)
+	require.GreaterOrEqual(t, passedCalls, 1)
+	require.Equal(t, "upstream_protocol_error", result.Models[0].Error.Code)
+	require.Equal(t, DecisionBlock, result.Models[1].Decision)
 }
 
 func TestScoresBelowOneSkipJointButNeverBecomeZeroRisk(t *testing.T) {
@@ -306,6 +449,7 @@ func TestAllCallPathsUseEditablePolicyAndFixedOutputOnly(t *testing.T) {
 			defer server.Close()
 			job := evaluationJob(t, server.URL, `{"input":"测试"}`)
 			job.Config.AuditPrompt = "  无固定标题的自定义角色与联合判断政策\n"
+			job.Config.Models[0].Parameters = map[string]any{"reasoning_effort": "none"}
 			client := &ModelClient{attempts: store}
 			var callJob *Job
 			if stage != "probe" {
@@ -318,6 +462,7 @@ func TestAllCallPathsUseEditablePolicyAndFixedOutputOnly(t *testing.T) {
 			for i, request := range requests {
 				require.NotContains(t, request, "temperature")
 				require.NotContains(t, request, "max_tokens")
+				require.JSONEq(t, `"none"`, string(request["reasoning_effort"]))
 				var messages []chatMessage
 				require.NoError(t, json.Unmarshal(request["messages"], &messages))
 				require.Len(t, messages, 2)
@@ -359,15 +504,31 @@ func TestPolicyEditsChangeBothReuseFingerprints(t *testing.T) {
 	target, err := prepareTarget(job)
 	require.NoError(t, err)
 	previous := job.EvaluationHash
-	key, _, err := segmentKey(job.Config, job.Config.Models[0], target.Messages[0])
+	key, _, err := segmentKey(job.Config, job.Config.Models[0], target.Messages[0], job.ConversationKey)
 	require.NoError(t, err)
 	job.Config.AuditPrompt += "\n新的联合规则，没有特定标题。"
 	_, err = prepareTarget(job)
 	require.NoError(t, err)
 	require.NotEqual(t, previous, job.EvaluationHash)
-	newKey, _, err := segmentKey(job.Config, job.Config.Models[0], target.Messages[0])
+	newKey, _, err := segmentKey(job.Config, job.Config.Models[0], target.Messages[0], job.ConversationKey)
 	require.NoError(t, err)
 	require.NotEqual(t, key, newKey)
+}
+
+func TestNodeParametersChangeReuseFingerprints(t *testing.T) {
+	job := evaluationJob(t, "https://example.invalid", `{"input":"相同输入"}`)
+	target, err := prepareTarget(job)
+	require.NoError(t, err)
+	previousEvaluation := job.EvaluationHash
+	previousSegment, _, err := segmentKey(job.Config, job.Config.Models[0], target.Messages[0], job.ConversationKey)
+	require.NoError(t, err)
+	job.Config.Models[0].Parameters = map[string]any{"reasoning_effort": "none"}
+	_, err = prepareTarget(job)
+	require.NoError(t, err)
+	currentSegment, _, err := segmentKey(job.Config, job.Config.Models[0], target.Messages[0], job.ConversationKey)
+	require.NoError(t, err)
+	require.NotEqual(t, previousEvaluation, job.EvaluationHash)
+	require.NotEqual(t, previousSegment, currentSegment)
 }
 
 func TestNodesRunInOrderAndEachSharesOneDeadlineAcrossStages(t *testing.T) {
@@ -390,6 +551,7 @@ func TestNodesRunInOrderAndEachSharesOneDeadlineAcrossStages(t *testing.T) {
 			}))
 			defer server.Close()
 			job := evaluationJob(t, server.URL, `{"input":"测试上下文"}`)
+			job.Config.Aggregation = "all_block"
 			base := job.Config.Models[0]
 			job.Config.Models = nil
 			var expected []string

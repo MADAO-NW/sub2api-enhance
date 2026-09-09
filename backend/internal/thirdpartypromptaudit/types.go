@@ -29,49 +29,64 @@ type Identity struct {
 }
 
 type Job struct {
-	CapturedAt        time.Time       `json:"captured_at"`
-	CaptureID         *int64          `json:"capture_id"`
-	ID                int64           `json:"id"`
-	CaptureKey        string          `json:"-"`
-	RunKind           string          `json:"run_kind"`
-	SourceJobID       *int64          `json:"source_job_id"`
-	RequestedBy       *int64          `json:"requested_by"`
-	UserID            int64           `json:"user_id"`
-	APIKeyID          *int64          `json:"api_key_id"`
-	GroupID           *int64          `json:"group_id"`
-	RequestID         string          `json:"request_id"`
-	Identity          Identity        `json:"identity"`
-	Platform          string          `json:"platform"`
-	Protocol          string          `json:"protocol"`
-	IngressStage      string          `json:"ingress_stage"`
-	RequestedModel    string          `json:"requested_model"`
-	ExecutionMode     string          `json:"execution_mode"`
-	Config            ConfigSnapshot  `json:"config_snapshot,omitempty"`
-	DecisionConfig    *DecisionConfig `json:"decision_config,omitempty"`
-	FullInput         *InputSnapshot  `json:"full_input_snapshot,omitempty"`
-	SnapshotStatus    string          `json:"snapshot_status"`
-	Manifest          []SegmentMeta   `json:"input_manifest,omitempty"`
-	InputHash         string          `json:"input_hash"`
-	TargetHash        string          `json:"target_hash"`
-	EvaluationHash    string          `json:"evaluation_hash"`
-	Status            string          `json:"status"`
-	Attempts          int             `json:"attempts"`
-	MaxAttempts       int             `json:"max_attempts"`
-	ClaimGeneration   int64           `json:"claim_generation"`
-	LeaseUntil        *time.Time      `json:"lease_until"`
-	NextAttemptAt     time.Time       `json:"next_attempt_at"`
-	Checkpoint        *Evaluation     `json:"result_checkpoint,omitempty"`
-	Reuse             ReuseMetrics    `json:"reuse_metrics"`
-	FailureStage      string          `json:"failure_stage"`
-	LastErrorCode     string          `json:"last_error_code"`
-	LastErrorMessage  string          `json:"last_error_message"`
-	GatewayResult     string          `json:"gateway_result"`
-	GatewayCompleted  *time.Time      `json:"gateway_completed_at"`
-	GatewayDurationMS *int64          `json:"gateway_duration_ms"`
-	StartedAt         *time.Time      `json:"started_at"`
-	FinishedAt        *time.Time      `json:"finished_at"`
-	CreatedAt         time.Time       `json:"created_at"`
-	UpdatedAt         time.Time       `json:"updated_at"`
+	CapturedAt         time.Time       `json:"captured_at"`
+	CaptureID          *int64          `json:"capture_id"`
+	ID                 int64           `json:"id"`
+	CaptureKey         string          `json:"-"`
+	RunKind            string          `json:"run_kind"`
+	CurrentRunKind     string          `json:"current_run_kind"`
+	AuditRound         int             `json:"audit_round"`
+	CurrentRequestedBy *int64          `json:"current_requested_by"`
+	SourceJobID        *int64          `json:"source_job_id"`
+	RequestedBy        *int64          `json:"requested_by"`
+	UserID             int64           `json:"user_id"`
+	APIKeyID           *int64          `json:"api_key_id"`
+	GroupID            *int64          `json:"group_id"`
+	RequestID          string          `json:"request_id"`
+	ConversationKey    string          `json:"conversation_key,omitempty"`
+	Identity           Identity        `json:"identity"`
+	Platform           string          `json:"platform"`
+	Protocol           string          `json:"protocol"`
+	IngressStage       string          `json:"ingress_stage"`
+	RequestedModel     string          `json:"requested_model"`
+	ExecutionMode      string          `json:"execution_mode"`
+	Config             ConfigSnapshot  `json:"config_snapshot,omitempty"`
+	DecisionConfig     *DecisionConfig `json:"decision_config,omitempty"`
+	FullInput          *InputSnapshot  `json:"full_input_snapshot,omitempty"`
+	SnapshotStatus     string          `json:"snapshot_status"`
+	Manifest           []SegmentMeta   `json:"input_manifest,omitempty"`
+	InputHash          string          `json:"input_hash"`
+	TargetHash         string          `json:"target_hash"`
+	EvaluationHash     string          `json:"evaluation_hash"`
+	Status             string          `json:"status"`
+	Attempts           int             `json:"attempts"`
+	MaxAttempts        int             `json:"max_attempts"`
+	ClaimGeneration    int64           `json:"claim_generation"`
+	LeaseUntil         *time.Time      `json:"lease_until"`
+	NextAttemptAt      time.Time       `json:"next_attempt_at"`
+	Checkpoint         *Evaluation     `json:"result_checkpoint,omitempty"`
+	Reuse              ReuseMetrics    `json:"reuse_metrics"`
+	FailureStage       string          `json:"failure_stage"`
+	LastErrorCode      string          `json:"last_error_code"`
+	LastErrorMessage   string          `json:"last_error_message"`
+	GatewayResult      string          `json:"gateway_result"`
+	GatewayCompleted   *time.Time      `json:"gateway_completed_at"`
+	GatewayDurationMS  *int64          `json:"gateway_duration_ms"`
+	StartedAt          *time.Time      `json:"started_at"`
+	FinishedAt         *time.Time      `json:"finished_at"`
+	DurationMS         *int64          `json:"duration_ms"`
+	CreatedAt          time.Time       `json:"created_at"`
+	UpdatedAt          time.Time       `json:"updated_at"`
+}
+
+func (j *Job) auditRunKind() string {
+	if j.CurrentRunKind != "" {
+		return j.CurrentRunKind
+	}
+	if j.RunKind == "reaudit" {
+		return "reaudit"
+	}
+	return "request"
 }
 
 type ReuseMetrics struct {
@@ -80,6 +95,8 @@ type ReuseMetrics struct {
 	SegmentLookups int `json:"segment_lookups"`
 	SegmentHits    int `json:"segment_hits"`
 	WithinJobHits  int `json:"within_job_hits"`
+	InflightHits   int `json:"inflight_hits"`
+	ShortCircuited int `json:"short_circuited_nodes"`
 }
 
 type SegmentResult struct {
@@ -113,6 +130,8 @@ type ModelResult struct {
 	JointAttemptID *int64       `json:"joint_attempt_id"`
 	Segments       []SegmentUse `json:"segments"`
 	Error          *AuditError  `json:"error,omitempty"`
+	Skipped        bool         `json:"skipped,omitempty"`
+	SkipReason     string       `json:"skip_reason,omitempty"`
 }
 
 type Evaluation struct {
@@ -124,11 +143,18 @@ type Evaluation struct {
 }
 
 type Outcome struct {
-	ID     int64 `json:"id"`
-	JobID  int64 `json:"job_id"`
-	UserID int64 `json:"user_id"`
+	ID          int64          `json:"id"`
+	JobID       int64          `json:"job_id"`
+	UserID      int64          `json:"user_id"`
+	AuditRound  int            `json:"audit_round"`
+	RunKind     string         `json:"run_kind"`
+	RequestedBy *int64         `json:"requested_by"`
+	Config      ConfigSnapshot `json:"config_snapshot"`
 	Evaluation
-	CreatedAt time.Time `json:"created_at"`
+	StartedAt  *time.Time `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at"`
+	DurationMS *int64     `json:"duration_ms"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
 type Event struct {
@@ -149,6 +175,7 @@ type ModelAttempt struct {
 	JobID             *int64          `json:"job_id"`
 	CallKind          string          `json:"call_kind"`
 	EvaluationRound   *int            `json:"evaluation_round"`
+	AuditRound        int             `json:"audit_round"`
 	ModelID           string          `json:"model_id"`
 	ModelSnapshot     ModelConfig     `json:"model_snapshot"`
 	Stage             string          `json:"stage"`

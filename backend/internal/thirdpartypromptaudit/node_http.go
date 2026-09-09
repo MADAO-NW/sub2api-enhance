@@ -32,8 +32,9 @@ func nodeEndpointURL(raw, endpoint string) (string, error) {
 		}
 	}
 	u.Path = strings.TrimRight(u.Path, "/")
-	if u.Path == "/v1" {
-		u.Path = ""
+	// 地址已经以 /v1 结尾时只追加资源路径，并保留 /openai 等前缀。
+	if strings.HasSuffix(u.Path, "/v1") {
+		endpoint = strings.TrimPrefix(endpoint, "/v1")
 	}
 	u.Path += endpoint
 	return u.String(), nil

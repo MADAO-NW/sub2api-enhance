@@ -31,6 +31,7 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 	require.Equal(t, 0.8, *defaults.BlockThreshold)
 	require.Equal(t, WarningConfig{Window: 10, Limit: 3}, defaults.Warning)
 	require.Equal(t, DisableConfig{Limit: 5}, defaults.Disable)
+	require.Equal(t, "current_turn", defaults.AuditScope)
 	require.Equal(t, 0.5, publicDefaults.ReviewThreshold)
 	require.Equal(t, 0.8, publicDefaults.BlockThreshold)
 	require.Equal(t, 10, publicDefaults.WarningWindow)
@@ -45,6 +46,23 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 	for _, timeout := range []int{0, -1, int(math.MaxInt64/int64(time.Millisecond)) + 1} {
 		model.TimeoutMS = timeout
 		require.Error(t, validateModel(model))
+	}
+}
+
+func TestEmbeddedDefaultPolicyUsesDocumentBodyWithoutCodeFence(t *testing.T) {
+	require.NotContains(t, DefaultPolicy, "```")
+	require.True(t, strings.HasPrefix(DefaultPolicy, "OpenAI / Anthropic 共用输入审核政策"))
+	require.Contains(t, DefaultPolicy, "R14 平台滥用、规避与特殊用途")
+	require.Contains(t, DefaultPolicy, `{"confidence":0.08,"reason":`)
+}
+
+func TestAdvancedParametersCannotOverrideFixedRequestFields(t *testing.T) {
+	model := testConfig().Models[0]
+	model.Parameters = map[string]any{"temperature": 0, "reasoning_effort": "none"}
+	require.NoError(t, validateModel(model))
+	for _, field := range []string{"model", "messages", "stream"} {
+		model.Parameters = map[string]any{field: "override"}
+		require.ErrorContains(t, validateModel(model), field)
 	}
 }
 
@@ -108,6 +126,21 @@ func TestHistoricalSnapshotsAreDisplayOnlyAndNewSnapshotsStayClean(t *testing.T)
 	require.Nil(t, current.historicalJSON)
 }
 
+func TestHistoricalSnapshotWithoutScopeKeepsFullRequestBehavior(t *testing.T) {
+	config := testConfig()
+	snapshot := ConfigSnapshot{Config: config, Revision: 2, ContractVersion: ContractVersion, FixedContract: OutputContract}
+	raw, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+	var fields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &fields))
+	delete(fields, "audit_scope")
+	raw, err = json.Marshal(fields)
+	require.NoError(t, err)
+	var restored ConfigSnapshot
+	require.NoError(t, json.Unmarshal(raw, &restored))
+	require.Equal(t, "full_request", restored.AuditScope)
+}
+
 func TestConfigRequiresCalibratedThresholdsOnlyWhenActivating(t *testing.T) {
 	config := DefaultConfig()
 	require.NoError(t, validateConfig(config, false))
@@ -128,7 +161,7 @@ func TestConfigKeepsEnforcementValidationIndependent(t *testing.T) {
 	config.Warning = WarningConfig{Enabled: true, Window: 3, Limit: 4}
 	require.Error(t, validateConfig(config, true))
 	config.Warning.Limit = 2
-	require.Error(t, validateConfig(config, true))
+	require.NoError(t, validateConfig(config, true))
 	config.AdminEmail = "admin@example.invalid"
 	require.NoError(t, validateConfig(config, true))
 	config.Disable = DisableConfig{Enabled: true}
