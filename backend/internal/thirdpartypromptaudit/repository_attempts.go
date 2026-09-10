@@ -58,7 +58,7 @@ func (r *Repository) StartAttempt(ctx context.Context, job *Job, attempt *ModelA
 	err := r.db.QueryRowContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_model_attempts a SET status='started',dispatch_started_at=clock_timestamp()
  WHERE a.id=$1 AND a.status='prepared' AND (a.job_id IS NULL OR EXISTS
  (SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_jobs j WHERE j.id=a.job_id AND j.claim_generation=$2 AND j.status='processing' AND j.lease_until>clock_timestamp()))
- AND (a.call_kind='probe' OR (SELECT value::json->>'mode' FROM sub2api_enhance.settings WHERE key='third_party_prompt_audit_config') IN ('async','blocking'))
+	AND (a.call_kind='probe' OR (SELECT value::json->>'mode' FROM sub2api_enhance.settings WHERE key='third_party_prompt_audit_config') IN ('async','blocking'))
  RETURNING dispatch_started_at`, attempt.ID, generation).Scan(&attempt.DispatchStartedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		if job != nil {
@@ -102,7 +102,7 @@ func (r *Repository) FindSegments(ctx context.Context, modelID string, keys []st
 	if len(keys) == 0 {
 		return results, nil
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT DISTINCT ON (audit_key) id,user_id,model_id,audit_key,source_attempt_id,source_role,policy_role,turn_scope,content_hash,confidence,reason
+	rows, err := r.db.QueryContext(ctx, `SELECT DISTINCT ON (audit_key) id,user_id,model_id,audit_key,source_attempt_id,source_role,policy_role,turn_scope,content_hash,target_kind,confidence,reason
 	 FROM sub2api_enhance.third_party_prompt_audit_segment_results WHERE model_id=$1 AND audit_key=ANY($2)
 	 ORDER BY audit_key,id DESC`, modelID, pq.Array(keys))
 	if err != nil {
@@ -112,7 +112,7 @@ func (r *Repository) FindSegments(ctx context.Context, modelID string, keys []st
 	for rows.Next() {
 		var item SegmentResult
 		if err := rows.Scan(&item.ID, &item.UserID, &item.ModelID, &item.AuditKey, &item.SourceAttemptID, &item.SourceRole,
-			&item.PolicyRole, &item.TurnScope, &item.ContentHash, &item.Confidence, &item.Reason); err != nil {
+			&item.PolicyRole, &item.TurnScope, &item.ContentHash, &item.TargetKind, &item.Confidence, &item.Reason); err != nil {
 			return nil, err
 		}
 		item.Reason = decodeStoredText(item.Reason)
@@ -123,12 +123,12 @@ func (r *Repository) FindSegments(ctx context.Context, modelID string, keys []st
 
 func (r *Repository) SaveSegment(ctx context.Context, job *Job, item *SegmentResult) error {
 	err := r.db.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_segment_results
- (user_id,model_id,audit_key,source_attempt_id,source_role,policy_role,turn_scope,content_hash,confidence,reason)
- SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10
- WHERE EXISTS (SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_jobs WHERE id=$11 AND claim_generation=$12 AND status='processing' AND lease_until>clock_timestamp())
+	(user_id,model_id,audit_key,source_attempt_id,source_role,policy_role,turn_scope,content_hash,target_kind,confidence,reason)
+ SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
+ WHERE EXISTS (SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_jobs WHERE id=$12 AND claim_generation=$13 AND status='processing' AND lease_until>clock_timestamp())
  ON CONFLICT (source_attempt_id) DO UPDATE SET source_attempt_id=EXCLUDED.source_attempt_id RETURNING id`,
 		item.UserID, item.ModelID, item.AuditKey, item.SourceAttemptID, item.SourceRole, item.PolicyRole, item.TurnScope,
-		item.ContentHash, item.Confidence, encodeStoredText(item.Reason), job.ID, job.ClaimGeneration).Scan(&item.ID)
+		item.ContentHash, item.TargetKind, item.Confidence, encodeStoredText(item.Reason), job.ID, job.ClaimGeneration).Scan(&item.ID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrLeaseLost
 	}

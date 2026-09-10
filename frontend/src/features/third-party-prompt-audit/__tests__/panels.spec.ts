@@ -18,7 +18,7 @@ vi.mock('@/stores/app', () => ({ useAppStore: () => mocks }))
 vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string) => key.split('.').at(-1), te: () => true }) }))
 
 function saved(): SavedConfig {
-  return { mode: 'off', capture_when_audit_off: false, audit_scope: 'full_request', platforms: [], all_groups: true, group_ids: [], excluded_user_ids: [], audit_prompt: 'saved policy',
+  return { mode: 'off', capture_when_audit_off: false, audit_scope: 'current_user', platforms: [], all_groups: true, group_ids: [], excluded_user_ids: [], audit_prompt: 'saved policy',
     models: [{ id: 'a', name: 'Node', base_url: 'https://example.invalid', model: 'test', enabled: true, timeout_ms: 1000, max_concurrency: 4 }],
     review_threshold: null, block_threshold: null, aggregation: 'any_block', worker_count: 4,
     warning: { enabled: false, window: 0, limit: 0 }, disable: { enabled: false, limit: 0 }, user_rules: [], admin_email: '', revision: 1, warning_rule_revision: 0,
@@ -39,7 +39,7 @@ beforeEach(() => {
   mocks.probe.mockResolvedValue({ ok: true, model_id: 'a', result: { confidence: 0.1, reason: 'normal' }, tested_at: '2026-09-06T00:00:00Z' })
   mocks.stats.mockResolvedValue(null)
   mocks.runtime.mockResolvedValue(null)
-  mocks.jobLatestUserContent.mockResolvedValue({ content: 'latest user text', unavailable_reason: '' })
+  mocks.jobLatestUserContent.mockResolvedValue({ content: 'latest user text', items: [{ order: 1, source_path: '$.input', content: 'latest user text' }], combined_count: 1, unavailable_reason: '' })
   mocks.captureLatestUserContent.mockResolvedValue({ content: 'captured user text', unavailable_reason: '' })
 })
 
@@ -297,14 +297,15 @@ describe('third-party audit records', () => {
     expect(mocks.capture).toHaveBeenCalledWith(4)
     wrapper.unmount()
   })
-  it('shows live identity order and the latest outcome segment reuse rate', async () => {
-    const job = { id: 9, user_id: 2, display_username: 'nw', display_email: 'nwjump@163.com', current_run_kind: 'request', identity: { api_key_name: 'nw', group_name: 'openai' }, status: 'done', snapshot_status: 'complete', attempts: 1, max_attempts: 3,
+  it('shows live identity order, merged user count, and the latest outcome target reuse rate', async () => {
+    const job = { id: 9, user_id: 2, display_username: 'nw', display_email: 'nwjump@163.com', current_run_kind: 'request', identity: { api_key_name: 'nw', group_name: 'openai' }, status: 'done', snapshot_status: 'complete', attempts: 1, max_attempts: 3, current_user_count: 2,
       outcome: { decision: 'pass', models: [], segment_reuse: { reused: 18, total: 20, rate: 0.9 } } } as unknown as AuditJob
     mocks.jobs.mockResolvedValue({ items: [job], total: 1 })
     const wrapper = mount(AuditRecords, { global: { stubs: { ...stubs, AuditDetail: true, LatestUserContent: true } } })
     await flushPromises()
     expect(wrapper.text()).toContain('(#2)nw')
     expect(wrapper.text()).toContain('nwjump@163.com')
+    expect(wrapper.text()).toContain('currentUserMessages: 2 userItemsUnit · mergedAudit')
     expect(wrapper.text()).toContain('segmentReuseRate 90% 18 / 20')
     wrapper.unmount()
   })
@@ -435,6 +436,22 @@ describe('audit overview refresh', () => {
     await flushPromises()
     expect(mocks.stats.mock.lastCall?.[0].to).not.toBe('2020-01-01T00:00:00.000Z')
     expect(mocks.runtime).toHaveBeenCalledTimes(2)
+    wrapper.unmount()
+  })
+  it('shows scheduler health, capacity, backpressure, and recovery timing', async () => {
+    mocks.runtime.mockResolvedValue({
+      running: true, mode: 'async', expected_revision: 3, revision: 3, active_workers: 1, worker_capacity: 4, database_ok: true,
+      evaluation_latency: { count: 0, capacity: 1000, from: null, to: null, p50_ms: null, p95_ms: null }, probes: [],
+      scheduler: { backpressured_total: 12, blocking_waiters: 1, nodes: [{ model_id: 'node-a', health: 'cooldown', active: 2, max_concurrency: 4, eligible_waiters: 3, load_ratio: 0.5, latency_ewma_ms: 820, consecutive_failures: 2, cooldown_until: '2026-09-10T00:00:30Z', next_probe_at: '2026-09-10T00:00:30Z', last_error_code: 'rate_limited', last_observed_at: '2026-09-10T00:00:00Z' }] }
+    })
+    const wrapper = mount(AuditOverview)
+    await flushPromises()
+    const health = wrapper.get('[data-test="node-health"]').text()
+    expect(health).toContain('backpressuredTotal: 12')
+    expect(health).toContain('blockingWaiters: 1')
+    expect(health).toContain('node-a')
+    expect(health).toContain('cooldown')
+    expect(health).toContain('2 / 4 · 50%')
     wrapper.unmount()
   })
 })

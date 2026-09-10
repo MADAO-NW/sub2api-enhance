@@ -18,6 +18,14 @@ const (
 	ReuseModeForce = "force"
 )
 
+// 审核目标类型区分新合并目标和只读历史片段。
+const (
+	TargetKindLegacySegment      = "legacy_segment"
+	TargetKindCurrentUser        = "current_user"
+	TargetKindInstructionContext = "instruction_context"
+	TargetKindIntentBinding      = "intent_binding"
+)
+
 type Decision string
 
 const (
@@ -82,10 +90,12 @@ type Job struct {
 	StartedAt          *time.Time      `json:"started_at"`
 	FinishedAt         *time.Time      `json:"finished_at"`
 	DurationMS         *int64          `json:"duration_ms"`
+	CurrentUserCount   int             `json:"current_user_count"`
 	Outcome            *OutcomeView    `json:"outcome,omitempty"`
 	OriginalDecision   *Decision       `json:"original_decision,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
 	UpdatedAt          time.Time       `json:"updated_at"`
+	Dispatched         bool            `json:"-"`
 }
 
 func (j *Job) auditRunKind() string {
@@ -115,29 +125,45 @@ type SegmentResult struct {
 	PolicyRole      string `json:"policy_role"`
 	TurnScope       string `json:"turn_scope"`
 	ContentHash     string `json:"content_hash"`
+	TargetKind      string `json:"target_kind"`
 	Score
 }
 
 type SegmentUse struct {
 	Order      int           `json:"order"`
 	SourcePath string        `json:"source_path"`
+	TargetKind string        `json:"target_kind"`
 	ReuseKind  string        `json:"reuse_kind"`
 	Result     SegmentResult `json:"result"`
 }
 
+type DispatchSnapshot struct {
+	Order          int      `json:"order"`
+	Health         string   `json:"health"`
+	Active         int      `json:"active"`
+	MaxConcurrency int      `json:"max_concurrency"`
+	Waiting        int      `json:"waiting"`
+	LoadRatio      float64  `json:"load_ratio"`
+	LatencyEWMAMS  *float64 `json:"latency_ewma_ms,omitempty"`
+	Reason         string   `json:"reason"`
+}
+
 type ModelResult struct {
-	Reused         bool         `json:"reused"`
-	ModelID        string       `json:"model_id"`
-	ModelName      string       `json:"model_name"`
-	Decision       Decision     `json:"decision,omitempty"`
-	Basis          string       `json:"basis"`
-	Confidence     *float64     `json:"confidence"`
-	Reason         string       `json:"reason"`
-	JointAttemptID *int64       `json:"joint_attempt_id"`
-	Segments       []SegmentUse `json:"segments"`
-	Error          *AuditError  `json:"error,omitempty"`
-	Skipped        bool         `json:"skipped,omitempty"`
-	SkipReason     string       `json:"skip_reason,omitempty"`
+	Reused           bool              `json:"reused"`
+	ModelID          string            `json:"model_id"`
+	ModelName        string            `json:"model_name"`
+	Decision         Decision          `json:"decision,omitempty"`
+	Basis            string            `json:"basis"`
+	Confidence       *float64          `json:"confidence"`
+	Reason           string            `json:"reason"`
+	JointAttemptID   *int64            `json:"joint_attempt_id"`
+	Segments         []SegmentUse      `json:"segments"`
+	TargetUses       []SegmentUse      `json:"target_uses,omitempty"`
+	BindingTriggered bool              `json:"binding_triggered,omitempty"`
+	Dispatch         *DispatchSnapshot `json:"dispatch,omitempty"`
+	Error            *AuditError       `json:"error,omitempty"`
+	Skipped          bool              `json:"skipped,omitempty"`
+	SkipReason       string            `json:"skip_reason,omitempty"`
 }
 
 type Evaluation struct {

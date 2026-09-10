@@ -68,3 +68,102 @@ func TestNodeSchedulerKeepsDeletedNodeUntilItsBoundEvaluationReleasesIt(t *testi
 	release()
 	require.NotContains(t, scheduler.states, model.ID)
 }
+
+func TestNodeSchedulerPrefersHealthyNodeOverDegradedNode(t *testing.T) {
+	scheduler := newNodeScheduler()
+	models := []ModelConfig{{ID: "degraded", Enabled: true, MaxConcurrency: 1}, {ID: "healthy", Enabled: true, MaxConcurrency: 1}}
+	scheduler.updateLimits(models)
+	scheduler.observe("degraded", &AuditError{Code: "timeout", Stage: "model_request", Retryable: true}, time.Second)
+	scheduler.observe("healthy", nil, 2*time.Second)
+
+	chosen, release, _, err := scheduler.acquireWithPolicy(context.Background(), models, false)
+	require.NoError(t, err)
+	require.Equal(t, "healthy", chosen.ID)
+	release()
+}
+
+func TestNodeSchedulerOpensCooldownAfterTwoTransientFailures(t *testing.T) {
+	scheduler := newNodeScheduler()
+	model := ModelConfig{ID: "node", Enabled: true, MaxConcurrency: 1}
+	scheduler.updateLimits([]ModelConfig{model})
+	failure := &AuditError{Code: "timeout", Stage: "model_request", Retryable: true}
+
+	scheduler.observe(model.ID, failure, 100*time.Millisecond)
+	require.Equal(t, nodeHealthDegraded, scheduler.states[model.ID].health)
+	scheduler.observe(model.ID, failure, 200*time.Millisecond)
+	state := scheduler.states[model.ID]
+	require.Equal(t, nodeHealthCooldown, state.health)
+	require.Equal(t, 2, state.consecutiveFailures)
+	require.WithinDuration(t, time.Now().Add(15*time.Second), state.cooldownUntil, time.Second)
+	require.InDelta(t, 120, *state.latencyEWMAMS, 0.1)
+
+	_, _, _, err := scheduler.acquireWithPolicy(context.Background(), []ModelConfig{model}, false)
+	var scheduleErr *nodeScheduleError
+	require.ErrorAs(t, err, &scheduleErr)
+	require.Equal(t, "temporarily_unhealthy", scheduleErr.Code)
+}
+
+func TestNodeSchedulerRateLimitUsesRetryAfterAndProbeRecovers(t *testing.T) {
+	scheduler := newNodeScheduler()
+	model := ModelConfig{ID: "node", Enabled: true, MaxConcurrency: 2}
+	scheduler.updateLimits([]ModelConfig{model})
+	scheduler.observe(model.ID, &AuditError{Code: "rate_limited", Stage: "model_request", RetryAfter: 40 * time.Millisecond}, time.Millisecond)
+	require.Equal(t, nodeHealthCooldown, scheduler.states[model.ID].health)
+
+	time.Sleep(50 * time.Millisecond)
+	selected, release, ok := scheduler.dueProbe([]ModelConfig{model})
+	require.True(t, ok)
+	require.Equal(t, model.ID, selected.ID)
+	require.Equal(t, nodeHealthHalfOpen, scheduler.states[model.ID].health)
+	require.Equal(t, 1, scheduler.states[model.ID].active)
+	_, _, _, err := scheduler.acquireWithPolicy(context.Background(), []ModelConfig{model}, false)
+	var scheduleErr *nodeScheduleError
+	require.ErrorAs(t, err, &scheduleErr)
+	require.Equal(t, "temporarily_unhealthy", scheduleErr.Code)
+
+	scheduler.observe(model.ID, nil, 10*time.Millisecond)
+	release()
+	require.Equal(t, nodeHealthHealthy, scheduler.states[model.ID].health)
+	require.Equal(t, 0, scheduler.states[model.ID].active)
+}
+
+func TestNodeSchedulerMarksStableConfigurationFailureAsMisconfigured(t *testing.T) {
+	scheduler := newNodeScheduler()
+	model := ModelConfig{ID: "node", Enabled: true, MaxConcurrency: 1}
+	scheduler.updateLimits([]ModelConfig{model})
+	scheduler.observe(model.ID, &AuditError{Code: "upstream_http_error", Stage: "model_request", Message: "审核节点返回 HTTP 422"}, time.Millisecond)
+	require.Equal(t, nodeHealthMisconfigured, scheduler.states[model.ID].health)
+
+	_, _, _, err := scheduler.acquireWithPolicy(context.Background(), []ModelConfig{model}, false)
+	var scheduleErr *nodeScheduleError
+	require.ErrorAs(t, err, &scheduleErr)
+	require.Equal(t, "no_healthy_nodes", scheduleErr.Code)
+}
+
+func TestNodeSchedulerIgnoresPersistenceAndPauseFailures(t *testing.T) {
+	scheduler := newNodeScheduler()
+	model := ModelConfig{ID: "node", Enabled: true, MaxConcurrency: 1}
+	scheduler.updateLimits([]ModelConfig{model})
+	for _, failure := range []*AuditError{{Code: "audit_paused", Stage: "result_persist"}, {Code: "attempt_result_persist_failed", Stage: "result_persist"}} {
+		scheduler.observe(model.ID, failure, time.Second)
+	}
+	require.Equal(t, nodeHealthUnknown, scheduler.states[model.ID].health)
+	require.Zero(t, scheduler.states[model.ID].consecutiveFailures)
+}
+
+func TestNodeSchedulerAsyncBackpressureDoesNotWait(t *testing.T) {
+	scheduler := newNodeScheduler()
+	model := ModelConfig{ID: "node", Enabled: true, MaxConcurrency: 1}
+	scheduler.updateLimits([]ModelConfig{model})
+	_, release, _, err := scheduler.acquireWithPolicy(context.Background(), []ModelConfig{model}, false)
+	require.NoError(t, err)
+
+	started := time.Now()
+	_, _, _, err = scheduler.acquireWithPolicy(context.Background(), []ModelConfig{model}, false)
+	var scheduleErr *nodeScheduleError
+	require.ErrorAs(t, err, &scheduleErr)
+	require.Equal(t, "capacity_saturated", scheduleErr.Code)
+	require.Less(t, time.Since(started), 100*time.Millisecond)
+	require.Equal(t, uint64(1), scheduler.runtime([]ModelConfig{model}).BackpressuredTotal)
+	release()
+}

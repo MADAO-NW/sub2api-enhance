@@ -3,7 +3,7 @@ import { configUpdate, editableConfig, timeRange } from '../viewModel'
 import type { SavedConfig } from '@/api/admin/third-party-prompt-audit'
 
 export const savedConfig = (): SavedConfig => ({
-  mode: 'off', capture_when_audit_off: false, audit_scope: 'full_request', platforms: [], all_groups: true, group_ids: [], excluded_user_ids: [], audit_prompt: 'editable policy',
+  mode: 'off', capture_when_audit_off: false, audit_scope: 'current_user', platforms: [], all_groups: true, group_ids: [], excluded_user_ids: [], audit_prompt: 'editable policy',
   models: [{ id: 'node-a', name: 'Node A', base_url: 'https://example.invalid', model: 'model', enabled: true, timeout_ms: 5000, max_concurrency: 4 }],
   review_threshold: null, block_threshold: null, aggregation: 'any_block', worker_count: 4,
   warning: { enabled: false, window: 0, limit: 0 }, disable: { enabled: false, limit: 0 }, user_rules: [], admin_email: '',

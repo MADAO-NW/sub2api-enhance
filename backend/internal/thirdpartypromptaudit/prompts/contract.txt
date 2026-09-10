@@ -1,4 +1,4 @@
-【固定返回协议 third-party-json-v1】
+【固定返回协议 third-party-json-v2-current-user】
 你必须输出一个 JSON 对象，不输出其他文字、Markdown、代码围栏或解释段落。
 
 对象只包含：

@@ -68,9 +68,10 @@ func (s *Service) Start(parent context.Context) error {
 	if err != nil {
 		s.noteError("config_load_failed", err)
 	}
-	s.wg.Add(1)
+	s.wg.Add(2)
 	s.running.Store(true)
 	go s.run()
+	go s.runHealthProbes()
 	return err
 }
 
@@ -137,7 +138,7 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		defer stop()
 	}
 	if configErr != nil {
-		snapshot = ConfigSnapshot{Config: Config{Mode: mode, AuditScope: "full_request", AllGroups: true}}
+		snapshot = ConfigSnapshot{Config: Config{Mode: mode, AuditScope: "current_user", AllGroups: true}}
 	}
 	if request.Manual {
 		request.Stage = "manual_capture_reprocess"
@@ -163,6 +164,9 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 	if inputErr == nil {
 		_, inputErr = prepareTarget(job)
 	}
+	if !request.Manual && errors.Is(inputErr, ErrNoText) {
+		return &IntakeDecision{Mode: mode, Kind: IngressDecisionAllow, ErrorCode: "current_user_not_found"}
+	}
 	if inputErr != nil {
 		if !capturedCompletely {
 			job.SnapshotStatus = "incomplete"
@@ -174,7 +178,7 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		if errors.Is(inputErr, ErrNoText) {
 			job.Status = "skipped"
 			job.SnapshotStatus = "complete"
-			job.LastErrorCode = "no_text"
+			job.LastErrorCode = "current_user_not_found"
 			job.FailureStage = ""
 		}
 	}
@@ -400,8 +404,12 @@ func (s *Service) evaluateWithInflightReuse(ctx context.Context, job *Job, bound
 				}
 				cloned.Models[i].Reused = true
 				cloned.Models[i].JointAttemptID = nil
+				cloned.Models[i].Dispatch = nil
 				for j := range cloned.Models[i].Segments {
 					cloned.Models[i].Segments[j].ReuseKind = "inflight"
+				}
+				for j := range cloned.Models[i].TargetUses {
+					cloned.Models[i].TargetUses[j].ReuseKind = "inflight"
 				}
 			}
 			return cloned, nil
@@ -458,12 +466,69 @@ func (s *Service) refreshNodeLimits() {
 	}
 }
 
+// runHealthProbes 只在异常节点冷却到期后进行低优先级恢复探测。
+func (s *Service) runHealthProbes() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if s.config.EffectiveMode() == "off" {
+			continue
+		}
+		snapshot, err := s.config.Active()
+		if err != nil {
+			continue
+		}
+		model, release, ok := s.evaluator.nodeScheduler().dueProbe(snapshot.Models)
+		if !ok {
+			continue
+		}
+		s.runHealthProbe(snapshot, model)
+		release()
+	}
+}
+
+// runHealthProbe 验证节点连通性和固定 JSON 返回协议，不创建业务任务或缓存。
+func (s *Service) runHealthProbe(snapshot ConfigSnapshot, model ModelConfig) {
+	started := time.Now()
+	key, err := s.config.ResolveKeyByModelID(model.ID)
+	if err != nil {
+		s.evaluator.nodeScheduler().observe(model.ID, &AuditError{Code: "credential_binding_unavailable", Stage: "config", Message: err.Error()}, time.Since(started))
+		return
+	}
+	client, url, err := nodeHTTPClient(model)
+	if err != nil {
+		s.evaluator.nodeScheduler().observe(model.ID, &AuditError{Code: "node_unavailable", Stage: "config", Message: err.Error()}, time.Since(started))
+		return
+	}
+	defer client.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(context.WithValue(s.ctx, healthProbeContext, true), time.Duration(model.TimeoutMS)*time.Millisecond)
+	defer cancel()
+	target := map[string]any{"protocol": "health_probe", "messages": []map[string]any{{"source_role": "user", "content": "节点健康检查，请按固定协议返回评分。"}}}
+	_, _, failure := s.client.EvaluateTarget(ctx, nil, model, key, snapshot, client, url, "health_probe", target, nil)
+	s.evaluator.nodeScheduler().observe(model.ID, failure, time.Since(started))
+}
+
 // finishFailure 区分服务暂停、请求结束和业务重试，防止停机耗尽异步任务的评估预算。
 func (s *Service) finishFailure(ctx context.Context, job *Job, failure *AuditError) *AuditError {
 	if cause := context.Cause(ctx); cause != nil && ctx.Err() == context.Canceled && !errors.Is(cause, context.Canceled) {
 		failure = persistenceFailure(cause, "lease_renew_failed")
 	}
 	if failure.Code == "lease_lost" {
+		return failure
+	}
+	if !job.Dispatched && job.ExecutionMode == "async" && (failure.Code == "capacity_saturated" || failure.Code == "temporarily_unhealthy" || failure.Code == "audit_paused") {
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
+		defer cancel()
+		if err := s.repo.DeferCapacity(persistCtx, job, failure); err != nil {
+			s.noteError("capacity_defer_failed", err)
+		}
+		s.notify()
 		return failure
 	}
 	s.mu.Lock()
@@ -543,10 +608,15 @@ type ProbeResult struct {
 	LatencyMS int64       `json:"latency_ms"`
 }
 
-func (s *Service) Probe(ctx context.Context, input ProbeRequest) ProbeResult {
+func (s *Service) Probe(ctx context.Context, input ProbeRequest) (result ProbeResult) {
 	ctx = context.WithValue(ctx, probeActorContext, input.ActorUserID)
 	started := time.Now()
-	result := ProbeResult{ModelID: input.Model.ID, TestedAt: started.UTC()}
+	result = ProbeResult{ModelID: input.Model.ID, TestedAt: started.UTC()}
+	defer func() {
+		if s.evaluator != nil && result.AttemptID > 0 {
+			s.evaluator.nodeScheduler().observe(input.Model.ID, result.Error, time.Since(started))
+		}
+	}()
 	if err := validateModel(input.Model); err != nil {
 		result.Error = &AuditError{Code: "invalid_model", Stage: "config", Message: err.Error()}
 		return result

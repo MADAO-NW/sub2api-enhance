@@ -35,6 +35,7 @@ COALESCE(NULLIF(display_user.email,''),j.identity_snapshot::json->>'user_email',
 j.reuse_mode,j.disable_counted,j.config_revision,j.snapshot_status,j.input_hash,j.target_hash,j.evaluation_hash,j.status,j.attempts,j.max_attempts,
 j.claim_generation,j.lease_until,j.next_attempt_at,j.reuse_metrics,j.failure_stage,j.last_error_code,j.last_error_message,
 j.gateway_result,j.gateway_completed_at,j.gateway_duration_ms,j.started_at,j.finished_at,
+COALESCE((SELECT count(*) FROM json_array_elements(COALESCE(j.input_manifest,'[]')::json) manifest WHERE manifest->>'selection_kind'='current_user'),0) AS current_user_count,
 CASE WHEN j.started_at IS NULL THEN NULL ELSE GREATEST(0,extract(epoch FROM (COALESCE(j.finished_at,clock_timestamp())-j.started_at))*1000)::bigint END AS duration_ms,j.created_at,j.updated_at`
 
 // jobInputJoins 为任务投影补齐唯一采集记录和当前用户展示信息。
@@ -309,6 +310,20 @@ func (r *Repository) Fail(ctx context.Context, job *Job, failure *AuditError, re
 	}
 	logger.LegacyPrintf("third_party_prompt_audit", "审核任务本轮处理结束 job_id=%d status=%s failure_stage=%s error_code=%s error=%s", job.ID, status, failure.Stage, failure.Code, failure.Message)
 	return nil
+}
+
+// DeferCapacity 释放未发起模型调用的任务租约，并撤销本次仅由领取产生的执行计数。
+func (r *Repository) DeferCapacity(ctx context.Context, job *Job, failure *AuditError) error {
+	wait := failure.RetryAfter
+	if wait <= 0 {
+		wait = time.Second
+	}
+	result, err := r.db.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs SET
+ status='retry',attempts=GREATEST(0,attempts-1),failure_stage=$3,last_error_code=$4,last_error_message=$5,
+ next_attempt_at=clock_timestamp()+$6::interval,lease_until=NULL,updated_at=clock_timestamp()
+ WHERE id=$1 AND claim_generation=$2 AND status='processing' AND lease_until>clock_timestamp()`,
+		job.ID, job.ClaimGeneration, failure.Stage, failure.Code, encodeStoredText(failure.Message), interval(wait))
+	return checkLeaseUpdate(result, err)
 }
 
 func (r *Repository) BeginForegroundEvaluation(ctx context.Context, job *Job) error {

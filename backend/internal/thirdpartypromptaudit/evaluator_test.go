@@ -162,7 +162,7 @@ func TestConcurrentDifferentJobsShareTheSameGlobalSegmentFlight(t *testing.T) {
 	require.Nil(t, first.failure)
 	require.Nil(t, second.failure)
 	require.EqualValues(t, 3, calls.Load())
-	require.Equal(t, 1, first.job.Reuse.InflightHits+second.job.Reuse.InflightHits)
+	require.Equal(t, 1, first.job.Reuse.InflightHits+second.job.Reuse.InflightHits+first.job.Reuse.SegmentHits+second.job.Reuse.SegmentHits)
 }
 
 func TestGlobalInflightReuseKeepsUserThresholdDecisionsIndependent(t *testing.T) {
@@ -199,7 +199,7 @@ func TestGlobalInflightReuseKeepsUserThresholdDecisionsIndependent(t *testing.T)
 	close(release)
 	decisions := []Decision{<-results, <-results}
 	require.ElementsMatch(t, []Decision{DecisionPass, DecisionReview}, decisions)
-	require.EqualValues(t, 2, calls.Load())
+	require.EqualValues(t, 1, calls.Load())
 }
 
 func TestEvaluationFreezesAllNodeCredentialsBeforeFirstCall(t *testing.T) {
@@ -267,7 +267,7 @@ func evaluationJob(t *testing.T, url, input string) *Job {
 	return &Job{ID: 1, UserID: 7, ConversationKey: "conversation-a", ReuseMode: ReuseModeAllow, Attempts: 1, Protocol: "openai_responses", FullInput: snapshot, Config: ConfigSnapshot{Config: config, ContractVersion: ContractVersion, FixedContract: OutputContract}}
 }
 
-func TestRiskyFragmentRequiresUnbiasedWholeTaskEvaluation(t *testing.T) {
+func TestRiskyInstructionRequiresIntentBinding(t *testing.T) {
 	store := &memoryAuditStore{}
 	var requests []chatRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -277,10 +277,9 @@ func TestRiskyFragmentRequiresUnbiasedWholeTaskEvaluation(t *testing.T) {
 			return
 		}
 		requests = append(requests, input)
-		score := 0.98
-		if len(requests) == 3 {
-			score = 0.02
-		}
+		var envelope auditEnvelope
+		require.NoError(t, json.Unmarshal([]byte(input.Messages[1].Content), &envelope))
+		score := map[string]float64{TargetKindCurrentUser: 0.2, TargetKindInstructionContext: 0.98, TargetKindIntentBinding: 0.02}[envelope.Stage]
 		_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}]}`, fmt.Sprintf(`{"confidence":%v,"reason":"按完整用户任务理解，属于正常防御工作"}`, score))
 	}))
 	defer server.Close()
@@ -290,17 +289,8 @@ func TestRiskyFragmentRequiresUnbiasedWholeTaskEvaluation(t *testing.T) {
 	require.Nil(t, failure)
 	require.Equal(t, DecisionPass, result.Decision)
 	require.Len(t, requests, 3)
-	require.Equal(t, "joint", store.attempts[2].Stage)
-	var target auditTarget
-	envelope := struct {
-		Stage  string       `json:"audit_stage"`
-		Target *auditTarget `json:"target"`
-	}{Target: &target}
-	require.NoError(t, json.Unmarshal([]byte(requests[2].Messages[1].Content), &envelope))
-	require.Equal(t, "joint", envelope.Stage)
-	require.Len(t, target.Messages, 2)
-	require.Equal(t, "system", target.Messages[0].SourceRole)
-	require.Equal(t, "user", target.Messages[1].SourceRole)
+	require.Equal(t, TargetKindIntentBinding, store.attempts[2].Stage)
+	require.Equal(t, []string{TargetKindCurrentUser, TargetKindInstructionContext, TargetKindIntentBinding}, []string{store.attempts[0].Stage, store.attempts[1].Stage, store.attempts[2].Stage})
 	require.NotContains(t, requests[2].Messages[1].Content, "confidence")
 	require.NotContains(t, requests[2].Messages[1].Content, "0.98")
 	require.Equal(t, 0.02, *result.Models[0].Confidence)
@@ -417,7 +407,31 @@ func TestRequestsWithoutConversationIdentityReuseAcrossJobs(t *testing.T) {
 	require.Equal(t, 2, store.wholeReads)
 }
 
-func TestChangedThresholdRequiresJointEvaluationOfPreviouslyPassingSegments(t *testing.T) {
+func TestTargetCacheHitDoesNotNeedNodeCapacity(t *testing.T) {
+	store := &memoryAuditStore{}
+	job := evaluationJob(t, "https://example.invalid", `{"input":"相同输入"}`)
+	job.Config.Models[0].MaxConcurrency = 1
+	target, err := prepareTarget(job)
+	require.NoError(t, err)
+	key, hash, err := targetKey(job.Config, job.Config.Models[0], TargetKindCurrentUser, messageBundle{Protocol: target.Protocol, Messages: target.CurrentUser})
+	require.NoError(t, err)
+	store.segments = map[string]SegmentResult{key: {ID: 9, ModelID: job.Config.Models[0].ID, AuditKey: key, ContentHash: hash, TargetKind: TargetKindCurrentUser, Score: Score{Confidence: 0.1, Reason: "缓存通过"}}}
+	evaluator := &Evaluator{store: store, client: &ModelClient{attempts: store}}
+	evaluator.updateNodeLimits(job.Config.Models)
+	_, release, _, err := evaluator.nodeScheduler().acquireWithPolicy(context.Background(), job.Config.Models, false)
+	require.NoError(t, err)
+
+	result, failure := evaluator.Evaluate(context.Background(), job, nil)
+	require.Nil(t, failure)
+	require.Equal(t, DecisionPass, result.Decision)
+	require.False(t, job.Dispatched)
+	require.Empty(t, store.attempts)
+	require.Equal(t, "history", result.Models[0].TargetUses[0].ReuseKind)
+	require.Equal(t, 1, evaluator.nodeScheduler().states[job.Config.Models[0].ID].active)
+	release()
+}
+
+func TestChangedThresholdReclassifiesReusedCurrentUserTarget(t *testing.T) {
 	store := &memoryAuditStore{}
 	count := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -437,11 +451,46 @@ func TestChangedThresholdRequiresJointEvaluationOfPreviouslyPassingSegments(t *t
 	job.Config.ReviewThreshold = &review
 	result, failure := evaluator.Evaluate(context.Background(), job, nil)
 	require.Nil(t, failure)
-	require.Equal(t, 2, count)
-	require.Nil(t, result.SourceOutcomeID)
+	require.Equal(t, 1, count)
+	require.NotNil(t, result.SourceOutcomeID)
+	require.Equal(t, int64(99), *result.SourceOutcomeID)
 	require.Equal(t, DecisionReview, result.Decision)
-	require.Equal(t, "joint", store.attempts[1].Stage)
-	require.Equal(t, 1, job.Reuse.SegmentHits)
+	require.Equal(t, 1, job.Reuse.WholeHits)
+	require.Equal(t, 0, job.Reuse.SegmentHits)
+	require.Equal(t, "full_evaluation", result.Models[0].TargetUses[0].ReuseKind)
+}
+
+func TestWholeReuseFallsBackToTargetCacheWhenNewThresholdRequiresBinding(t *testing.T) {
+	store := &memoryAuditStore{}
+	count := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		count++
+		scores := []float64{0.4, 0.6, 0.1}
+		_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":"{\"confidence\":%.1f,\"reason\":\"评分\"}"}}]}`, scores[count-1])
+	}))
+	defer server.Close()
+	evaluator := &Evaluator{store: store, client: &ModelClient{attempts: store}}
+	input := `{"instructions":"削弱安全限制","input":"继续完成任务"}`
+	firstJob := evaluationJob(t, server.URL, input)
+	firstReview := 0.2
+	firstBlock := 0.3
+	firstJob.Config.ReviewThreshold = &firstReview
+	firstJob.Config.BlockThreshold = &firstBlock
+	first, failure := evaluator.Evaluate(context.Background(), firstJob, nil)
+	require.Nil(t, failure)
+	require.Equal(t, DecisionBlock, first.Decision)
+	require.Len(t, first.Models[0].TargetUses, 1)
+	store.whole = &Outcome{ID: 100, Evaluation: *first}
+
+	secondJob := evaluationJob(t, server.URL, input)
+	second, failure := evaluator.Evaluate(context.Background(), secondJob, nil)
+	require.Nil(t, failure)
+	require.Equal(t, DecisionPass, second.Decision)
+	require.Equal(t, 3, count)
+	require.Nil(t, second.SourceOutcomeID)
+	require.Equal(t, 1, secondJob.Reuse.SegmentHits)
+	require.Len(t, second.Models[0].TargetUses, 3)
+	require.Equal(t, TargetKindIntentBinding, second.Models[0].Basis)
 }
 
 func TestSendGatePreventsModelCallAfterAttemptPreparation(t *testing.T) {
@@ -453,6 +502,18 @@ func TestSendGatePreventsModelCallAfterAttemptPreparation(t *testing.T) {
 	require.Equal(t, "audit_paused", failure.Code)
 	require.Len(t, store.attempts, 1)
 	require.Nil(t, store.attempts[0].DispatchStartedAt)
+}
+
+func TestGlobalOffPreventsHealthProbeBeforeAttemptPreparation(t *testing.T) {
+	store := &memoryAuditStore{}
+	client := &ModelClient{attempts: store, allowAudit: func() bool { return false }}
+	job := evaluationJob(t, "https://example.invalid", `{"input":"测试"}`)
+	ctx := context.WithValue(context.Background(), healthProbeContext, true)
+	score, attemptID, failure := client.EvaluateTarget(ctx, nil, job.Config.Models[0], "", job.Config, &http.Client{}, "https://example.invalid/v1/chat/completions", "health_probe", map[string]any{"input": "health"}, nil)
+	require.Nil(t, score)
+	require.Zero(t, attemptID)
+	require.Equal(t, "audit_paused", failure.Code)
+	require.Empty(t, store.attempts)
 }
 
 func TestAggregationKeepsUnknownVotesInDenominator(t *testing.T) {
@@ -534,52 +595,36 @@ func TestProtocolFailureContinuesToLaterNode(t *testing.T) {
 	require.Equal(t, DecisionBlock, result.Models[1].Decision)
 }
 
-func TestScoresBelowOneSkipJointButNeverBecomeZeroRisk(t *testing.T) {
-	for _, segmentScore := range []float64{0.92, 0.95} {
-		for _, tc := range []struct {
-			trigger, block, joint float64
-			decision              Decision
-			calls                 int
-		}{{1, 1, 0, DecisionPass, 1}, {.5, .8, .2, DecisionPass, 2}, {.5, .8, .65, DecisionReview, 2}, {.5, .8, .9, DecisionBlock, 2}} {
-			t.Run(fmt.Sprintf("segment=%v,trigger=%v,joint=%v", segmentScore, tc.trigger, tc.joint), func(t *testing.T) {
-				store := &memoryAuditStore{}
-				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					var request chatRequest
-					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-						t.Error(err)
-						return
-					}
-					var envelope auditEnvelope
-					if err := json.Unmarshal([]byte(request.Messages[1].Content), &envelope); err != nil {
-						t.Error(err)
-						return
-					}
-					score := segmentScore
-					if envelope.Stage == "joint" {
-						score = tc.joint
-					}
-					_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}]}`, fmt.Sprintf(`{"confidence":%v,"reason":"测试替身分数"}`, score))
-				}))
-				defer server.Close()
-				job := evaluationJob(t, server.URL, `{"instructions":"","input":"分类测试材料"}`)
-				job.Config.ReviewThreshold, job.Config.BlockThreshold = &tc.trigger, &tc.block
-				evaluator := &Evaluator{store: store, client: &ModelClient{attempts: store}}
-				result, failure := evaluator.Evaluate(context.Background(), job, nil)
-				require.Nil(t, failure)
-				require.Equal(t, tc.decision, result.Decision)
-				require.Len(t, store.attempts, tc.calls)
-				require.Len(t, result.Models[0].Segments, 1)
-				require.Equal(t, segmentScore, result.Models[0].Segments[0].Result.Confidence)
-				if tc.calls == 1 {
-					require.Nil(t, result.Models[0].Confidence)
-					require.Equal(t, "segments_all_pass", result.Models[0].Basis)
-				} else {
-					require.Equal(t, tc.joint, *result.Models[0].Confidence)
-				}
-				require.Equal(t, "", job.FullInput.Fields["instructions"])
-			})
+func TestCurrentUserBundleIsOneScoredTarget(t *testing.T) {
+	store := &memoryAuditStore{}
+	var stages []string
+	var bundle messageBundle
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request chatRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		var envelope struct {
+			Stage  string        `json:"audit_stage"`
+			Target messageBundle `json:"target"`
 		}
-	}
+		require.NoError(t, json.Unmarshal([]byte(request.Messages[1].Content), &envelope))
+		stages = append(stages, envelope.Stage)
+		bundle = envelope.Target
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"confidence\":0.65,\"reason\":\"合并目标待复核\"}"}}]}`))
+	}))
+	defer server.Close()
+	job := evaluationJob(t, server.URL, `{"input":[{"role":"user","content":"第一条"},{"role":"user","content":"第二条"}]}`)
+	evaluator := &Evaluator{store: store, client: &ModelClient{attempts: store}}
+	result, failure := evaluator.Evaluate(context.Background(), job, nil)
+	require.Nil(t, failure)
+	require.Equal(t, DecisionReview, result.Decision)
+	require.Equal(t, []string{TargetKindCurrentUser}, stages)
+	require.Equal(t, "openai_responses", bundle.Protocol)
+	require.Len(t, bundle.Messages, 2)
+	require.Equal(t, "第一条", bundle.Messages[0].Content[0].Text)
+	require.Equal(t, "第二条", bundle.Messages[1].Content[0].Text)
+	require.Len(t, result.Models[0].TargetUses, 1)
+	require.Empty(t, result.Models[0].Segments)
+	require.Equal(t, TargetKindCurrentUser, result.Models[0].TargetUses[0].TargetKind)
 }
 
 func TestAllCallPathsUseEditablePolicyAndFixedOutputOnly(t *testing.T) {
@@ -625,13 +670,13 @@ func TestAllCallPathsUseEditablePolicyAndFixedOutputOnly(t *testing.T) {
 				require.True(t, strings.HasPrefix(messages[0].Content, job.Config.AuditPrompt))
 				require.True(t, strings.HasSuffix(messages[0].Content, OutputContract))
 				if i == 0 {
-					require.Equal(t, job.Config.AuditPrompt+"\n\n"+OutputContract, messages[0].Content)
+					require.Contains(t, messages[0].Content, "audit_stage=current_user")
 				}
 				var envelope auditEnvelope
 				require.NoError(t, json.Unmarshal([]byte(messages[1].Content), &envelope))
 				expectedStage := stage
 				if stage == "probe" {
-					expectedStage = "joint"
+					expectedStage = TargetKindCurrentUser
 					require.Equal(t, "probe", store.attempts[i].CallKind)
 				}
 				require.Equal(t, expectedStage, envelope.Stage)
@@ -649,8 +694,8 @@ func TestEmptySegmentsDoNotEraseSnapshotsOrWhitespace(t *testing.T) {
 	job = evaluationJob(t, "https://example.invalid", `{"instructions":"","input":" \n"}`)
 	target, err := prepareTarget(job)
 	require.NoError(t, err)
-	require.Len(t, target.Messages, 1)
-	require.Equal(t, " \n", target.Messages[0].Content[0].Text)
+	require.Len(t, target.CurrentUser, 1)
+	require.Equal(t, " \n", target.CurrentUser[0].Content[0].Text)
 }
 
 func TestPolicyEditsChangeBothReuseFingerprints(t *testing.T) {
@@ -658,13 +703,13 @@ func TestPolicyEditsChangeBothReuseFingerprints(t *testing.T) {
 	target, err := prepareTarget(job)
 	require.NoError(t, err)
 	previous := job.EvaluationHash
-	key, _, err := segmentKey(job.Config, job.Config.Models[0], target.Messages[0])
+	key, _, err := targetKey(job.Config, job.Config.Models[0], TargetKindCurrentUser, messageBundle{Protocol: target.Protocol, Messages: target.CurrentUser})
 	require.NoError(t, err)
-	job.Config.AuditPrompt += "\n新的联合规则，没有特定标题。"
+	job.Config.AuditPrompt += "\n新的业务审核规则，没有特定标题。"
 	_, err = prepareTarget(job)
 	require.NoError(t, err)
 	require.NotEqual(t, previous, job.EvaluationHash)
-	newKey, _, err := segmentKey(job.Config, job.Config.Models[0], target.Messages[0])
+	newKey, _, err := targetKey(job.Config, job.Config.Models[0], TargetKindCurrentUser, messageBundle{Protocol: target.Protocol, Messages: target.CurrentUser})
 	require.NoError(t, err)
 	require.NotEqual(t, key, newKey)
 }
@@ -674,22 +719,37 @@ func TestNodeParametersChangeReuseFingerprints(t *testing.T) {
 	target, err := prepareTarget(job)
 	require.NoError(t, err)
 	previousEvaluation := job.EvaluationHash
-	previousSegment, _, err := segmentKey(job.Config, job.Config.Models[0], target.Messages[0])
+	previousSegment, _, err := targetKey(job.Config, job.Config.Models[0], TargetKindCurrentUser, messageBundle{Protocol: target.Protocol, Messages: target.CurrentUser})
 	require.NoError(t, err)
 	job.Config.Models[0].MaxConcurrency++
 	_, err = prepareTarget(job)
 	require.NoError(t, err)
-	concurrencySegment, _, err := segmentKey(job.Config, job.Config.Models[0], target.Messages[0])
+	concurrencySegment, _, err := targetKey(job.Config, job.Config.Models[0], TargetKindCurrentUser, messageBundle{Protocol: target.Protocol, Messages: target.CurrentUser})
 	require.NoError(t, err)
 	require.Equal(t, previousEvaluation, job.EvaluationHash)
 	require.Equal(t, previousSegment, concurrencySegment)
 	job.Config.Models[0].Parameters = map[string]any{"reasoning_effort": "none"}
 	_, err = prepareTarget(job)
 	require.NoError(t, err)
-	currentSegment, _, err := segmentKey(job.Config, job.Config.Models[0], target.Messages[0])
+	currentSegment, _, err := targetKey(job.Config, job.Config.Models[0], TargetKindCurrentUser, messageBundle{Protocol: target.Protocol, Messages: target.CurrentUser})
 	require.NoError(t, err)
 	require.NotEqual(t, previousEvaluation, job.EvaluationHash)
 	require.NotEqual(t, previousSegment, currentSegment)
+}
+
+func TestCurrentUserBundleOrderChangesReuseFingerprint(t *testing.T) {
+	firstJob := evaluationJob(t, "https://example.invalid", `{"input":[{"role":"user","content":"第一条"},{"role":"user","content":"第二条"}]}`)
+	first, err := prepareTarget(firstJob)
+	require.NoError(t, err)
+	firstKey, _, err := targetKey(firstJob.Config, firstJob.Config.Models[0], TargetKindCurrentUser, messageBundle{Protocol: first.Protocol, Messages: first.CurrentUser})
+	require.NoError(t, err)
+
+	secondJob := evaluationJob(t, "https://example.invalid", `{"input":[{"role":"user","content":"第二条"},{"role":"user","content":"第一条"}]}`)
+	second, err := prepareTarget(secondJob)
+	require.NoError(t, err)
+	secondKey, _, err := targetKey(secondJob.Config, secondJob.Config.Models[0], TargetKindCurrentUser, messageBundle{Protocol: second.Protocol, Messages: second.CurrentUser})
+	require.NoError(t, err)
+	require.NotEqual(t, firstKey, secondKey)
 }
 
 func TestNodesRunOnceInScheduledOrderAndEachSharesOneDeadlineAcrossStages(t *testing.T) {
@@ -705,7 +765,7 @@ func TestNodesRunOnceInScheduledOrderAndEachSharesOneDeadlineAcrossStages(t *tes
 				}
 				order = append(order, request.Model)
 				content := `{"confidence":0.95,"reason":"测试"}`
-				if len(order)%3 == 1 {
+				if len(order)%2 == 1 {
 					content = "需要格式修正"
 				}
 				_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}]}`, content)
@@ -726,19 +786,17 @@ func TestNodesRunOnceInScheduledOrderAndEachSharesOneDeadlineAcrossStages(t *tes
 			result, failure := evaluator.Evaluate(context.Background(), job, nil)
 			require.Nil(t, failure)
 			require.Equal(t, DecisionBlock, result.Decision)
-			require.Len(t, order, nodeCount*3)
+			require.Len(t, order, nodeCount*2)
 			seen := map[string]bool{}
-			for i := 0; i < len(order); i += 3 {
+			for i := 0; i < len(order); i += 2 {
 				require.Equal(t, order[i], order[i+1])
-				require.Equal(t, order[i], order[i+2])
 				require.False(t, seen[order[i]], "同一次执行不能重复选择节点")
 				seen[order[i]] = true
 			}
 			require.Len(t, seen, nodeCount)
 			for _, deadlines := range store.deadlines {
-				require.Len(t, deadlines, 3)
+				require.Len(t, deadlines, 2)
 				require.Equal(t, deadlines[0], deadlines[1])
-				require.Equal(t, deadlines[0], deadlines[2])
 				require.False(t, deadlines[0].Before(before.Add(5*time.Minute)))
 			}
 		})
@@ -769,7 +827,7 @@ func TestProbeRejectsInvalidStructuresAndPreservesRawText(t *testing.T) {
 	require.Empty(t, store.attempts)
 	for _, sample := range []struct{ kind, input, expected string }{
 		{"text", "[ordinary text]", "[ordinary text]"},
-		{"json", `  {"input":[{"type":"function_call_output","call_id":"a","output":{"id":9007199254740993}}]}`, "9007199254740993"},
+		{"json", `  {"input":[{"role":"user","content":[{"type":"input_text","text":"编号 9007199254740993"}]}]}`, "9007199254740993"},
 	} {
 		result := svc.Probe(context.Background(), ProbeRequest{Model: model, KeyAction: "clear", AuditPrompt: DefaultPolicy, InputKind: sample.kind, Input: sample.input})
 		require.True(t, result.OK, "%v", result.Error)

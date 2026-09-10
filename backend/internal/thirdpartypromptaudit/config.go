@@ -30,7 +30,7 @@ const DefaultNodeTimeoutMS = 300000
 // DefaultNodeMaxConcurrency 保持单个节点相对既有默认 Worker 的安全并发上限。
 const DefaultNodeMaxConcurrency = 4
 
-// defaultReviewThreshold 是新配置默认触发联合审核和待复核的风险分数。
+// defaultReviewThreshold 是新配置默认触发指令关联裁决和待复核的风险分数。
 const defaultReviewThreshold = 0.5
 
 // defaultBlockThreshold 是新配置默认判定违规的风险分数。
@@ -45,8 +45,11 @@ const defaultWarningLimit = 2
 // defaultDisableLimit 是默认触发用户自动停用的累计违规数量。
 const defaultDisableLimit = 1
 
-// legacyDefaultPolicySHA256 仅识别旧内置默认值，不能覆盖管理员自定义政策。
-const legacyDefaultPolicySHA256 = "9071cf397aa94bca6982620a56c908a5977fdfc94206c7e198f160c5f65b2e0d"
+// legacyDefaultPolicySHA256 仅识别已发布的旧内置默认值，不能覆盖管理员自定义政策。
+var legacyDefaultPolicySHA256 = map[string]struct{}{
+	"9071cf397aa94bca6982620a56c908a5977fdfc94206c7e198f160c5f65b2e0d": {},
+	"4ebb50f2c9183ab5c20214d094f291ae1571cbbd931a16f6bcca9915043a011c": {},
+}
 
 type ModelConfig struct {
 	ID             string         `json:"id"`
@@ -130,7 +133,7 @@ func (snapshot *ConfigSnapshot) UnmarshalJSON(raw []byte) error {
 	*snapshot = ConfigSnapshot(value)
 	normalizeModelConcurrency(&snapshot.Config)
 	if snapshot.AuditScope == "" {
-		snapshot.AuditScope = "full_request"
+		snapshot.AuditScope = "current_user"
 	}
 	legacy := len(historical.FixedRoles) > 0
 	for _, model := range historical.Models {
@@ -224,7 +227,7 @@ func NewConfigManager(db *sql.DB, encryptor appconfig.SecretEncryptor, cfg *appc
 
 func DefaultConfig() Config {
 	reviewThreshold, blockThreshold := defaultReviewThreshold, defaultBlockThreshold
-	return Config{Mode: "off", AuditScope: "current_turn", Platforms: []string{}, AllGroups: true,
+	return Config{Mode: "off", AuditScope: "current_user", Platforms: []string{}, AllGroups: true,
 		GroupIDs: []int64{}, ExcludedUserIDs: []int64{}, AuditPrompt: DefaultPolicy, Models: []ModelConfig{},
 		ReviewThreshold: &reviewThreshold, BlockThreshold: &blockThreshold,
 		Aggregation: "any_block", WorkerCount: 4,
@@ -242,6 +245,13 @@ func normalizeModelConcurrency(config *Config) {
 		if config.Models[i].MaxConcurrency == 0 {
 			config.Models[i].MaxConcurrency = DefaultNodeMaxConcurrency
 		}
+	}
+}
+
+// normalizeAuditScope 将已发布的范围选项收敛为当前任务 user 固定策略。
+func normalizeAuditScope(config *Config) {
+	if config != nil {
+		config.AuditScope = "current_user"
 	}
 }
 
@@ -303,7 +313,7 @@ func validateConfig(config Config, activating bool) error {
 	if !slices.Contains([]string{"off", "async", "blocking"}, config.Mode) {
 		return errors.New("审核模式无效")
 	}
-	if !slices.Contains([]string{"full_request", "current_turn"}, config.AuditScope) {
+	if config.AuditScope != "current_user" {
 		return errors.New("审核范围无效")
 	}
 	if !slices.Contains([]string{"any_block", "majority_block", "all_block"}, config.Aggregation) {
@@ -473,12 +483,13 @@ func (m *ConfigManager) Reload(ctx context.Context) (loadErr error) {
 	}
 	stored := storedConfig{Config: DefaultConfig(), Revision: 1, EncryptedKeys: map[string]string{}}
 	if values[SettingKey] != "" {
-		stored.AuditScope = "full_request"
+		stored.AuditScope = "current_user"
 		err = json.Unmarshal([]byte(values[SettingKey]), &stored)
 	}
 	// 节点名称是模型选择的派生展示值，旧配置加载后也立即使用统一规则。
 	normalizeModelNames(&stored.Config)
 	normalizeModelConcurrency(&stored.Config)
+	normalizeAuditScope(&stored.Config)
 	normalizeUserRuleModes(&stored.Config)
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -531,12 +542,12 @@ func (m *ConfigManager) upgradeLegacyDefaultPolicy(ctx context.Context) error {
 		return err
 	}
 	current := storedConfig{Config: DefaultConfig(), Revision: 1, EncryptedKeys: map[string]string{}}
-	current.AuditScope = "full_request"
+	current.AuditScope = "current_user"
 	if err := json.Unmarshal([]byte(raw), &current); err != nil {
 		return err
 	}
 	digest := sha256.Sum256([]byte(current.AuditPrompt))
-	if hex.EncodeToString(digest[:]) != legacyDefaultPolicySHA256 {
+	if _, exists := legacyDefaultPolicySHA256[hex.EncodeToString(digest[:])]; !exists {
 		return tx.Commit()
 	}
 	current.AuditPrompt = DefaultPolicy
@@ -679,6 +690,7 @@ func publicConfig(stored storedConfig) PublicConfig {
 func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID int64) (PublicConfig, error) {
 	normalizeModelNames(&input.Config)
 	normalizeUserRuleModes(&input.Config)
+	normalizeAuditScope(&input.Config)
 	if err := validateConfig(input.Config, input.Config.Mode != "off"); err != nil {
 		return PublicConfig{}, infraerrors.BadRequest("third_party_audit_invalid_config", err.Error())
 	}
@@ -702,7 +714,7 @@ func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID in
 		return PublicConfig{}, err
 	}
 	if err == nil {
-		current.AuditScope = "full_request"
+		current.AuditScope = "current_user"
 		if err := json.Unmarshal([]byte(raw), &current); err != nil {
 			return PublicConfig{}, err
 		}
@@ -796,11 +808,12 @@ func (m *ConfigManager) ReadSaved(ctx context.Context) (PublicConfig, error) {
 		return PublicConfig{}, err
 	}
 	if err == nil {
-		stored.AuditScope = "full_request"
+		stored.AuditScope = "current_user"
 		if err = json.Unmarshal([]byte(raw), &stored); err != nil {
 			return PublicConfig{}, err
 		}
 	}
+	normalizeAuditScope(&stored.Config)
 	result := publicConfig(stored)
 	if err = m.Reload(ctx); err != nil {
 		result.ApplicationError = err.Error()

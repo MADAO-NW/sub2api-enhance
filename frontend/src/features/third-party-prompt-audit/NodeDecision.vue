@@ -21,9 +21,12 @@ const maxSegment = computed(() => props.model.max_segment_confidence !== undefin
       <p>{{ label('jointNotRun') }}</p>
     </template>
     <template v-else-if="model.confidence != null">
-      <p>{{ label(model.reused ? 'reusedJoint' : 'jointScore') }}: {{ model.confidence }} · {{ model.decision ? label(model.decision) : '—' }}</p>
+      <p v-if="model.basis === 'joint'">{{ label(model.reused ? 'reusedJoint' : 'jointScore') }}: {{ model.confidence }} · {{ model.decision ? label(model.decision) : '—' }}</p>
+      <p v-else>{{ label(model.basis || 'current_user') }} · {{ label(model.reused ? 'reusedResult' : 'targetScore') }}: {{ model.confidence }} · {{ model.decision ? label(model.decision) : '—' }}</p>
       <p>{{ label('rawThresholds') }}: {{ config?.review_threshold ?? '—' }} / {{ config?.block_threshold ?? '—' }}</p>
       <p v-if="model.joint_attempt_id && !model.reused">{{ label('sourceReference') }} · Attempt #{{ model.joint_attempt_id }}</p>
+      <p v-if="model.binding_triggered">{{ label('bindingTriggered') }}</p>
+      <p v-if="model.dispatch" class="text-xs text-gray-500">{{ label('dispatch') }} #{{ model.dispatch.order }} · {{ label(model.dispatch.health) }} · {{ model.dispatch.active }} / {{ model.dispatch.max_concurrency }} · {{ label(model.dispatch.reason) }}</p>
     </template>
     <p v-else>{{ label('noValidScore') }}</p>
     <p v-if="config">{{ label('decisionRevision') }}: {{ config.revision }}</p>

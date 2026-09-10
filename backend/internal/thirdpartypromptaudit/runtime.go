@@ -76,28 +76,29 @@ func (m *RuntimeMetrics) Probe(result ProbeResult) {
 }
 
 type RuntimeSnapshot struct {
-	CapturePersistFailures uint64          `json:"capture_persist_failures"`
-	IngressPool            sql.DBStats     `json:"ingress_pool"`
-	WorkerPool             sql.DBStats     `json:"worker_pool"`
-	WarningEnabled         bool            `json:"warning_enabled"`
-	DisableEnabled         bool            `json:"disable_enabled"`
-	InstanceID             string          `json:"instance_id"`
-	StartedAt              time.Time       `json:"started_at"`
-	AsOf                   time.Time       `json:"as_of"`
-	Running                bool            `json:"running"`
-	Mode                   string          `json:"mode"`
-	Revision               int64           `json:"revision"`
-	ExpectedRevision       int64           `json:"expected_revision"`
-	WorkerCapacity         int             `json:"worker_capacity"`
-	ActiveWorkers          int64           `json:"active_workers"`
-	DatabaseOK             bool            `json:"database_ok"`
-	DatabaseError          string          `json:"database_error"`
-	ConfigError            string          `json:"config_error"`
-	InputPersistFailures   uint64          `json:"input_persist_failures"`
-	LastSuccess            *time.Time      `json:"last_success"`
-	LastError              *RuntimeProblem `json:"last_error"`
-	EvaluationLatency      LatencySummary  `json:"evaluation_latency"`
-	Probes                 []ProbeResult   `json:"probes"`
+	CapturePersistFailures uint64                   `json:"capture_persist_failures"`
+	IngressPool            sql.DBStats              `json:"ingress_pool"`
+	WorkerPool             sql.DBStats              `json:"worker_pool"`
+	WarningEnabled         bool                     `json:"warning_enabled"`
+	DisableEnabled         bool                     `json:"disable_enabled"`
+	InstanceID             string                   `json:"instance_id"`
+	StartedAt              time.Time                `json:"started_at"`
+	AsOf                   time.Time                `json:"as_of"`
+	Running                bool                     `json:"running"`
+	Mode                   string                   `json:"mode"`
+	Revision               int64                    `json:"revision"`
+	ExpectedRevision       int64                    `json:"expected_revision"`
+	WorkerCapacity         int                      `json:"worker_capacity"`
+	ActiveWorkers          int64                    `json:"active_workers"`
+	DatabaseOK             bool                     `json:"database_ok"`
+	DatabaseError          string                   `json:"database_error"`
+	ConfigError            string                   `json:"config_error"`
+	InputPersistFailures   uint64                   `json:"input_persist_failures"`
+	LastSuccess            *time.Time               `json:"last_success"`
+	LastError              *RuntimeProblem          `json:"last_error"`
+	EvaluationLatency      LatencySummary           `json:"evaluation_latency"`
+	Probes                 []ProbeResult            `json:"probes"`
+	Scheduler              schedulerRuntimeSnapshot `json:"scheduler"`
 }
 
 func (s *Service) Runtime(ctx context.Context) RuntimeSnapshot {
@@ -120,6 +121,11 @@ func (s *Service) Runtime(ctx context.Context) RuntimeSnapshot {
 		result.ConfigError = s.config.loadError.Error()
 	}
 	s.config.mu.RUnlock()
+	if snapshot, err := s.config.Active(); err == nil {
+		result.Scheduler = s.evaluator.nodeScheduler().runtime(snapshot.Models)
+	} else {
+		result.Scheduler = schedulerRuntimeSnapshot{Nodes: []nodeRuntimeSnapshot{}}
+	}
 
 	dbCtx, cancel := context.WithTimeout(ctx, persistenceTimeout)
 	err := s.repo.db.PingContext(dbCtx)

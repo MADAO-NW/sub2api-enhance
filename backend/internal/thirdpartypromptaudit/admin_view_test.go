@@ -40,6 +40,21 @@ func TestOutcomeExplanationDoesNotMutateStoredScores(t *testing.T) {
 	require.NotContains(t, string(segment), "source_attempt_id")
 }
 
+func TestOutcomeTargetReuseIsGroupedByTargetKind(t *testing.T) {
+	outcome := &Outcome{Evaluation: Evaluation{Models: []ModelResult{{ModelID: "a", TargetUses: []SegmentUse{
+		{TargetKind: TargetKindCurrentUser, ReuseKind: "history", Result: SegmentResult{TargetKind: TargetKindCurrentUser, Score: Score{Confidence: 0.1}}},
+		{TargetKind: TargetKindInstructionContext, ReuseKind: "fresh", Result: SegmentResult{TargetKind: TargetKindInstructionContext, Score: Score{Confidence: 0.6}}},
+		{TargetKind: TargetKindIntentBinding, ReuseKind: "inflight", Result: SegmentResult{TargetKind: TargetKindIntentBinding, Score: Score{Confidence: 0.2}}},
+	}}}}}
+	view := outcomeView(outcome, nil)
+	require.Equal(t, 2, view.TargetReuse.Reused)
+	require.Equal(t, 3, view.TargetReuse.Total)
+	require.InDelta(t, 2.0/3.0, *view.TargetReuse.Rate, 0.0001)
+	require.Equal(t, 1, view.TargetReuse.ByKind[TargetKindCurrentUser].Reused)
+	require.Equal(t, 0, view.TargetReuse.ByKind[TargetKindInstructionContext].Reused)
+	require.Equal(t, 1, view.TargetReuse.ByKind[TargetKindIntentBinding].Reused)
+}
+
 func TestJobListIncludesLatestOutcomeAndOriginalDecision(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)

@@ -112,3 +112,20 @@ func TestCaptureReviewMigrationOnlyExtendsTheProcessingState(t *testing.T) {
 	require.NotContains(t, strings.ToUpper(sql), "DELETE FROM")
 	require.NotContains(t, strings.ToUpper(sql), "UPDATE ")
 }
+
+func TestTargetHealthMigrationPreservesLegacyEvidenceAndAddsNewKinds(t *testing.T) {
+	raw, err := files.ReadFile("006_prompt_audit_target_health.sql")
+	require.NoError(t, err)
+	sql := string(raw)
+	for _, required := range []string{
+		"'health_probe'",
+		"'current_user'",
+		"'instruction_context'",
+		"'intent_binding'",
+		"ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'legacy_segment'",
+	} {
+		require.Contains(t, sql, required)
+	}
+	require.NotContains(t, strings.ToUpper(sql), "DELETE FROM")
+	require.NotContains(t, strings.ToUpper(sql), "DROP COLUMN")
+}

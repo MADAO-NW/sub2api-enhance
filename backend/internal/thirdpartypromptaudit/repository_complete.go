@@ -44,7 +44,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 		return nil, err
 	}
 	if err == nil {
-		current.AuditScope = "full_request"
+		current.AuditScope = "current_user"
 		if err := json.Unmarshal([]byte(configRaw), &current); err != nil {
 			return nil, err
 		}
@@ -125,7 +125,11 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 		ReuseKind string `json:"reuse_kind"`
 	}, 0)
 	for _, model := range outcome.Models {
-		for _, segment := range model.Segments {
+		segments := model.TargetUses
+		if len(segments) == 0 {
+			segments = model.Segments
+		}
+		for _, segment := range segments {
 			uses = append(uses, struct {
 				ModelID   string `json:"model_id"`
 				Order     int    `json:"segment_order"`
@@ -139,9 +143,11 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 		if err != nil {
 			return nil, err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_outcome_segments(outcome_id,model_id,segment_order,segment_result_id,reuse_kind)
-          SELECT $1,model_id,segment_order,segment_result_id,reuse_kind FROM json_to_recordset($2::json)
-          AS entry(model_id text,segment_order integer,segment_result_id bigint,reuse_kind text)`, outcome.ID, string(raw)); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_outcome_segments(outcome_id,model_id,segment_order,segment_result_id,reuse_kind,target_kind)
+		  SELECT $1,model_id,segment_order,segment_result_id,reuse_kind,
+		         COALESCE((SELECT target_kind FROM sub2api_enhance.third_party_prompt_audit_segment_results WHERE id=segment_result_id),'legacy_segment')
+		  FROM json_to_recordset($2::json)
+		  AS entry(model_id text,segment_order integer,segment_result_id bigint,reuse_kind text)`, outcome.ID, string(raw)); err != nil {
 			return nil, err
 		}
 	}

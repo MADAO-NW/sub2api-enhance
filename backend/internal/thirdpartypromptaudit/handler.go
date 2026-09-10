@@ -94,6 +94,7 @@ func (h *AdminHandler) UpdateConfig(c *gin.Context) {
 	middleware.SetAuditExtra(c, map[string]any{"result": "success", "previous_revision": before.Revision, "revision": result.Revision})
 	h.service.notify()
 	h.service.refreshNodeLimits()
+	h.service.evaluator.nodeScheduler().resetHealth()
 	h.config.mu.RLock()
 	if h.config.active != nil {
 		result.AppliedRevision = h.config.active.Stored.Revision
@@ -169,7 +170,7 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 		response.BadRequest(c, "运行模式筛选无效")
 		return
 	}
-	if query.Stage != "" && !slices.Contains([]string{"segment", "joint", "format_repair", "probe"}, query.Stage) {
+	if query.Stage != "" && !slices.Contains([]string{"segment", "joint", "format_repair", "probe", "current_user", "instruction_context", "intent_binding", "health_probe"}, query.Stage) {
 		response.BadRequest(c, "调用阶段筛选无效")
 		return
 	}

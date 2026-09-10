@@ -31,12 +31,14 @@ type NonTextInput struct {
 }
 
 type SegmentMeta struct {
-	Order      int    `json:"order"`
-	SourcePath string `json:"source_path"`
-	SourceRole string `json:"source_role"`
-	PolicyRole string `json:"policy_role"`
-	TurnScope  string `json:"turn_scope"`
-	Selected   bool   `json:"selected"`
+	Order           int    `json:"order"`
+	SourcePath      string `json:"source_path"`
+	SourceRole      string `json:"source_role"`
+	PolicyRole      string `json:"policy_role"`
+	TurnScope       string `json:"turn_scope"`
+	Selected        bool   `json:"selected"`
+	SelectionKind   string `json:"selection_kind,omitempty"`
+	SelectionReason string `json:"selection_reason,omitempty"`
 }
 
 type TextBlock struct {

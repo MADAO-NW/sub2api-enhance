@@ -150,16 +150,21 @@ func TestProtocolSpecificMediaNeverDeletesToolBusinessFields(t *testing.T) {
 	require.Equal(t, "$.input[0].output[1]", snapshot.NonText[0].SourcePath)
 }
 
-func TestResponsesAdditionalToolsAreApplicationContext(t *testing.T) {
+func TestResponsesAdditionalToolsArePreservedButExcludedFromAutomaticTarget(t *testing.T) {
 	input := `{"input":[{"id":"tools-1","role":"developer","type":"additional_tools","tools":[{"type":"namespace","name":"workspace","tools":[{"type":"function","name":"read"}]}]},{"role":"user","content":[{"type":"input_text","text":"检查项目"}]}]}`
 	snapshot, err := CaptureInput("openai_responses", []byte(input))
 	require.NoError(t, err)
 	job := &Job{Config: ConfigSnapshot{Config: DefaultConfig()}, Protocol: "openai_responses", FullInput: snapshot}
 	target, err := prepareTarget(job)
 	require.NoError(t, err)
-	require.Len(t, target.Messages, 1)
-	require.Equal(t, "检查项目", target.Messages[0].Content[0].Text)
-	require.Contains(t, target.Tools, "$.input[0].tools")
+	require.Len(t, target.CurrentUser, 1)
+	require.Equal(t, "检查项目", target.CurrentUser[0].Content[0].Text)
+	raw, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "workspace")
+	targetRaw, err := json.Marshal(target)
+	require.NoError(t, err)
+	require.NotContains(t, string(targetRaw), "workspace")
 }
 
 func TestResponsesCompactionAndAgentItemsKeepOnlyVisibleText(t *testing.T) {
@@ -167,17 +172,12 @@ func TestResponsesCompactionAndAgentItemsKeepOnlyVisibleText(t *testing.T) {
 	snapshot, err := CaptureInput("openai_responses", []byte(input))
 	require.NoError(t, err)
 	config := DefaultConfig()
-	config.AuditScope = "full_request"
+	config.AuditScope = "current_user"
 	target, err := prepareTarget(&Job{Config: ConfigSnapshot{Config: config}, Protocol: "openai_responses", FullInput: snapshot})
 	require.NoError(t, err)
-	require.Len(t, target.Messages, 5)
-	require.Equal(t, "assistant", target.Messages[0].SourceRole)
-	require.Equal(t, "可见助手内容", target.Messages[0].Content[0].Text)
-	require.Equal(t, "assistant", target.Messages[1].SourceRole)
-	require.Equal(t, "可见摘要", target.Messages[1].Content[0].Text)
-	require.Equal(t, "tool", target.Messages[3].SourceRole)
-	require.Equal(t, "user", target.Messages[4].SourceRole)
-	require.Equal(t, "最新用户内容", target.Messages[4].Content[0].Text)
+	require.Len(t, target.CurrentUser, 1)
+	require.Equal(t, "user", target.CurrentUser[0].SourceRole)
+	require.Equal(t, "最新用户内容", target.CurrentUser[0].Content[0].Text)
 	raw, err := json.Marshal(snapshot)
 	require.NoError(t, err)
 	require.NotContains(t, string(raw), "opaque-history")
@@ -221,7 +221,7 @@ func TestCurrentTurnRetainsTextOnBothSidesOfToolResult(t *testing.T) {
 	require.Equal(t, "$.messages[0].content[2].text", segments[2].Content[0].SourcePath)
 }
 
-func TestLatestUserContentReturnsOnlyTheLastRealUserSegment(t *testing.T) {
+func TestLatestUserContentReturnsTheCurrentUserTurn(t *testing.T) {
 	snapshot, err := CaptureInput("openai_chat_completions", []byte(`{"messages":[{"role":"user","content":"first"},{"role":"assistant","content":"answer"},{"role":"user","content":[{"type":"text","text":"latest-a"},{"type":"text","text":"latest-b"}]},{"role":"assistant","content":"tail"}]}`))
 	require.NoError(t, err)
 	result := latestUserContent(snapshot)
@@ -230,12 +230,22 @@ func TestLatestUserContentReturnsOnlyTheLastRealUserSegment(t *testing.T) {
 	require.Empty(t, result.UnavailableReason)
 }
 
+func TestLatestUserContentKeepsAllCurrentTaskUserItemsInOrder(t *testing.T) {
+	snapshot, err := CaptureInput("openai_responses", []byte(`{"input":[{"role":"user","content":"history"},{"role":"assistant","content":"answer"},{"role":"user","content":"current-a"},{"role":"user","content":[{"type":"input_text","text":"current-b"}]}]}`))
+	require.NoError(t, err)
+	result := latestUserContent(snapshot)
+	require.Equal(t, 2, result.CombinedCount)
+	require.Len(t, result.Items, 2)
+	require.Equal(t, "current-a\n\ncurrent-b", *result.Content)
+	require.Less(t, result.Items[0].Order, result.Items[1].Order)
+}
+
 func TestLatestUserContentDoesNotFallBackToAnotherRole(t *testing.T) {
 	snapshot, err := CaptureInput("openai_chat_completions", []byte(`{"messages":[{"role":"system","content":"policy"},{"role":"assistant","content":"answer"}]}`))
 	require.NoError(t, err)
 	result := latestUserContent(snapshot)
 	require.Nil(t, result.Content)
-	require.Equal(t, "user_content_not_found", result.UnavailableReason)
+	require.Equal(t, "current_user_not_found", result.UnavailableReason)
 }
 
 func TestLatestUserContentUsesTheSharedProtocolExtractors(t *testing.T) {

@@ -334,6 +334,9 @@ func (p *Proxy) evaluate(ctx context.Context, c *audit.Capture) *audit.IntakeDec
 	} else if result == nil {
 		status = "awaiting_review"
 		message = "仅采集原文，等待管理员审核"
+	} else if result.ErrorCode == "current_user_not_found" {
+		status = "skipped"
+		message = "当前任务没有可审核的 user 文本"
 	} else if result.JobID == 0 {
 		status = "retry"
 	}

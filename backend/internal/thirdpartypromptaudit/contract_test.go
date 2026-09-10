@@ -50,6 +50,8 @@ func TestFixedContractAlwaysFollowsEditablePolicy(t *testing.T) {
 	require.True(t, strings.HasSuffix(text, OutputContract))
 	require.NotContains(t, text, "【联合审核】")
 	require.NotContains(t, text, "【片段审核】")
+	require.Contains(t, text, "audit_stage=current_user")
+	require.Contains(t, text, "audit_stage=instruction_context")
+	require.Contains(t, text, "audit_stage=intent_binding")
 	require.Less(t, strings.Index(text, "修正格式"), strings.Index(text, "【固定返回协议"))
-	require.Equal(t, "管理员测试政策\n\n修正格式\n\n"+OutputContract, text)
 }

@@ -360,6 +360,8 @@ func (s *Service) captureLoop(ctx context.Context) {
 			if err != nil {
 				state = "failed"
 				message = err.Error()
+			} else if result != nil && result.ErrorCode == "current_user_not_found" {
+				state, message = "skipped", "当前任务没有可审核的 user 文本"
 			} else if result == nil || result.JobID == 0 {
 				state = "retry"
 			}

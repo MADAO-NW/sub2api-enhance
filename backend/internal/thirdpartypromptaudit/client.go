@@ -21,6 +21,9 @@ type probeContextKey int
 // probeActorContext 将管理员身份绑定到节点测试调用记录。
 const probeActorContext probeContextKey = 0
 
+// healthProbeContext 标识服务自动发起的低频节点恢复探测。
+const healthProbeContext probeContextKey = 1
+
 type ModelClient struct {
 	publicOrigin string
 	attempts     AttemptStore
@@ -72,7 +75,7 @@ func (c *ModelClient) EvaluateTarget(ctx context.Context, job *Job, model ModelC
 		if failure == nil {
 			return result, id, nil
 		}
-		if (failure.Code != "invalid_response" && failure.Code != "upstream_protocol_error") || number > 0 || ctx.Err() != nil {
+		if stage == "health_probe" || (failure.Code != "invalid_response" && failure.Code != "upstream_protocol_error") || number > 0 || ctx.Err() != nil {
 			return nil, id, failure
 		}
 		repairOf = &id
@@ -89,12 +92,13 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 	if err := ctx.Err(); err != nil {
 		return nil, 0, requestFailure(err)
 	}
-	if job != nil && c.allowAudit != nil && !c.allowAudit() {
+	automaticHealthProbe, _ := ctx.Value(healthProbeContext).(bool)
+	if (job != nil || automaticHealthProbe) && c.allowAudit != nil && !c.allowAudit() {
 		return nil, 0, persistenceFailure(ErrAuditPaused, "audit_paused")
 	}
 	auditStage := ruleStage
-	if auditStage == "probe" {
-		auditStage = "joint"
+	if auditStage == "probe" || auditStage == "health_probe" {
+		auditStage = TargetKindCurrentUser
 	}
 	targetJSON, err := json.Marshal(auditEnvelope{Stage: auditStage, Target: target})
 	if err != nil {
@@ -116,6 +120,9 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 	attempt := &ModelAttempt{ModelID: model.ID, ModelSnapshot: model, Stage: callStage, SegmentOrder: order, RepairOfAttemptID: repairOf, Status: "prepared"}
 	if job == nil {
 		attempt.CallKind = "probe"
+		if automatic, _ := ctx.Value(healthProbeContext).(bool); automatic {
+			attempt.CallKind = "health_probe"
+		}
 		metadata["request_body"] = request
 		metadata["actor_user_id"] = ctx.Value(probeActorContext)
 	} else {

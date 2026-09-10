@@ -138,7 +138,7 @@ func (r *Repository) Stats(ctx context.Context, q StatsQuery) (*Stats, error) {
 	}
 	rows, err := tx.QueryContext(ctx, `WITH calls AS (
  SELECT a.* FROM sub2api_enhance.third_party_prompt_audit_model_attempts a LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs j ON j.id=a.job_id
- WHERE a.dispatch_started_at>=$1 AND a.dispatch_started_at<$2 AND ($3='' OR j.execution_mode=$3 OR a.call_kind='probe') AND ($4='' OR a.model_id=$4) AND ($5='' OR a.stage=$5)
+ WHERE a.dispatch_started_at>=$1 AND a.dispatch_started_at<$2 AND ($3='' OR j.execution_mode=$3 OR a.call_kind IN ('probe','health_probe')) AND ($4='' OR a.model_id=$4) AND ($5='' OR a.stage=$5)
  ) SELECT row_to_json(x) FROM (
  SELECT model_id,call_kind,stage,count(*) total,
  count(*) FILTER(WHERE http_status BETWEEN 200 AND 299 AND (status='succeeded' OR error_code='invalid_response')) http_success,

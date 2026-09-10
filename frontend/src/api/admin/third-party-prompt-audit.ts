@@ -16,7 +16,7 @@ export interface AuditModel {
 export interface AuditConfig {
   mode: AuditMode
   capture_when_audit_off: boolean
-  audit_scope: 'full_request' | 'current_turn'
+  audit_scope: 'current_user'
   platforms: string[]
   all_groups: boolean
   group_ids: number[]
@@ -62,7 +62,8 @@ export interface Score { confidence: number; reason: string }
 export interface ProbeResult { ok: boolean; model_id: string; attempt_id: number; result: Score | null; error: AuditError | null; tested_at: string; latency_ms: number }
 export interface Reuse { whole_lookups: number; whole_hits: number; segment_lookups: number; segment_hits: number; within_job_hits: number; inflight_hits?: number; short_circuited_nodes?: number }
 export interface AuditInput { protocol: string; fields?: Record<string, unknown>; non_text: { source_path: string; type: string }[]; raw_body_base64?: string }
-export interface SegmentMeta { order: number; source_path: string; source_role: string; policy_role: string; turn_scope: string; selected: boolean }
+export interface SegmentMeta { order: number; source_path: string; source_role: string; policy_role: string; turn_scope: string; selected: boolean; selection_kind?: string; selection_reason?: string }
+export interface TargetUse { order: number; source_path: string; target_kind: 'legacy_segment' | 'current_user' | 'instruction_context' | 'intent_binding'; reuse_kind: string; result: Score & { id: number; source_role: string; policy_role: string; turn_scope: string; target_kind: string } }
 export interface ModelResult {
   model_id: string
   model_name: string
@@ -76,12 +77,16 @@ export interface ModelResult {
   error?: AuditError
   skipped?: boolean
   skip_reason?: string
-  segments: { order: number; source_path: string; reuse_kind: string; result: Score & { id: number; source_role: string; policy_role: string; turn_scope: string } }[]
+  segments: { order: number; source_path: string; target_kind?: string; reuse_kind: string; result: Score & { id: number; source_role: string; policy_role: string; turn_scope: string } }[]
+  target_uses?: TargetUse[]
+  binding_triggered?: boolean
+  dispatch?: { order: number; health: string; active: number; max_concurrency: number; waiting: number; load_ratio: number; latency_ewma_ms?: number; reason: string }
 }
 export interface SegmentReuse { reused: number; total: number; rate: number | null }
+export interface TargetReuse extends SegmentReuse { by_kind?: Record<string, SegmentReuse> }
 export interface UserSegmentReuse extends SegmentReuse { user_id: number; username: string; email: string }
-export interface Outcome { id: number; job_id: number; user_id: number; audit_round: number; run_kind: 'request' | 'reaudit'; requested_by: number | null; reuse_mode: 'allow' | 'force'; config_snapshot?: AuditConfig & { revision: number }; decision: AuditDecision; models: ModelResult[]; partial_failure: boolean; enforcement_eligible: boolean; source_outcome_id?: number; started_at: string | null; finished_at: string | null; duration_ms: number | null; created_at: string; decision_config?: DecisionConfig; segment_reuse: SegmentReuse }
-export interface LatestUserContent { content: string | null; unavailable_reason: string }
+export interface Outcome { id: number; job_id: number; user_id: number; audit_round: number; run_kind: 'request' | 'reaudit'; requested_by: number | null; reuse_mode: 'allow' | 'force'; config_snapshot?: AuditConfig & { revision: number }; decision: AuditDecision; models: ModelResult[]; partial_failure: boolean; enforcement_eligible: boolean; source_outcome_id?: number; started_at: string | null; finished_at: string | null; duration_ms: number | null; created_at: string; decision_config?: DecisionConfig; segment_reuse: SegmentReuse; target_reuse?: TargetReuse }
+export interface LatestUserContent { content: string | null; items: { order: number; source_path: string; content: string }[]; combined_count: number; unavailable_reason: string }
 export interface AuditJob {
   capture_id?: number|null
   id: number
@@ -124,6 +129,7 @@ export interface AuditJob {
   started_at: string | null
   finished_at: string | null
   duration_ms: number | null
+  current_user_count: number
   outcome?: Outcome | null
   original_decision?: AuditDecision | null
   created_at: string
@@ -165,6 +171,7 @@ export interface AuditRuntime {
   worker_capacity: number; active_workers: number; database_ok: boolean; database_error: string; config_error: string; input_persist_failures: number
   last_success: string | null; last_error: { code: string; message: string; at: string } | null
   evaluation_latency: Distribution & { capacity: number; from: string | null; to: string | null }; probes: ProbeResult[]
+  scheduler?: { backpressured_total: number; blocking_waiters: number; nodes: { model_id: string; health: string; active: number; max_concurrency: number; eligible_waiters: number; load_ratio: number; latency_ewma_ms: number | null; consecutive_failures: number; cooldown_until: string | null; next_probe_at: string | null; last_error_code: string; last_observed_at: string | null }[] }
 }
 export interface StatsQuery { from: string; to: string; timezone: string; mode?: string; model_id?: string; stage?: string }
 export interface AuditStats extends StatsQuery {

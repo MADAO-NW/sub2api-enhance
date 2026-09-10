@@ -238,3 +238,16 @@ func TestHistoricalCheckpointDoesNotEnterModelEvaluation(t *testing.T) {
 	require.Equal(t, int64(4), outcome.ID)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestCapacityDeferralReleasesLeaseAndRollsBackExecutionCount(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	mock.ExpectExec(`status='retry',attempts=GREATEST\(0,attempts-1\)`).
+		WithArgs(int64(7), int64(3), "scheduler", "capacity_saturated", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	repo := &Repository{db: db}
+	err = repo.DeferCapacity(context.Background(), &Job{ID: 7, ClaimGeneration: 3}, &AuditError{Code: "capacity_saturated", Stage: "scheduler", Message: "节点满载"})
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}

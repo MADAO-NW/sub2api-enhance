@@ -311,9 +311,7 @@ watch(() => props.refreshKey, () => { void load(true) })
               <select v-model="draft.mode" class="input"><option v-for="mode in ['off', 'async', 'blocking']" :key="mode" :value="mode">{{ label(mode) }}</option></select>
             </label>
             <label class="flex items-center gap-2 self-end pb-3 text-sm"><input v-model="draft.capture_when_audit_off" type="checkbox" />{{ label('captureWhenAuditOff') }}</label>
-            <label class="space-y-2"><span class="text-sm font-medium">{{ label('scope') }}</span>
-              <select v-model="draft.audit_scope" class="input"><option value="full_request">{{ label('full_request') }}</option><option value="current_turn">{{ label('current_turn') }}</option></select>
-            </label>
+            <div class="space-y-2"><span class="text-sm font-medium">{{ label('scope') }}</span><p class="input flex items-center">{{ label('current_user') }}</p></div>
             <label class="space-y-2"><span class="text-sm font-medium">{{ label('worker') }}</span><input v-model.number="draft.worker_count" class="input" type="number" min="1" step="1" required /></label>
           </div>
           <p class="mt-3 text-sm text-gray-500 dark:text-dark-400">{{ label('scopeHint') }}</p>
@@ -347,6 +345,7 @@ watch(() => props.refreshKey, () => { void load(true) })
             </div>
             <p class="text-sm"><span class="text-gray-500 dark:text-dark-400">{{ label('name') }}：</span>{{ model.name || label('chooseModel') }}</p>
             <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('timeoutHint') }}</p>
+            <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('nodeConcurrencyHint') }}</p>
             <label v-if="keys[model.id]" class="block space-y-2"><span class="text-sm">{{ label('credential') }} · {{ label(saved.has_api_keys[model.id] ? 'keyPresent' : 'keyAbsent') }}</span><input :value="keys[model.id]?.api_key" class="input" type="password" autocomplete="new-password" :placeholder="label(saved.has_api_keys[model.id] ? 'keyKeepHint' : 'keyInputHint')" @input="updateKey(model.id, ($event.target as HTMLInputElement).value)" /></label>
             <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('keyHint') }} · {{ label('modelID') }}: {{ model.id }}</p>
             <div class="flex flex-wrap gap-3"><button type="button" class="btn btn-secondary" :disabled="!model.base_url || listingModels.includes(model.id)" @click="listModels(model)">{{ label(listingModels.includes(model.id) ? 'loading' : 'loadModels') }}</button><button type="button" class="btn btn-secondary" :disabled="!model.model || probing.includes(model.id)" @click="probe(model)">{{ label(probing.includes(model.id) ? 'loading' : 'probe') }}</button></div>
@@ -384,7 +383,7 @@ watch(() => props.refreshKey, () => { void load(true) })
           </div><p class="text-sm text-gray-500 dark:text-dark-400">{{ label('aggregationHint') }}</p>
           <div v-if="draft.review_threshold !== null && draft.block_threshold !== null" class="rounded-lg bg-gray-50 p-4 text-sm dark:bg-dark-900" data-test="threshold-ranges">
             <p>{{ label('rawThresholds') }}: {{ draft.review_threshold }} / {{ draft.block_threshold }}</p>
-            <p>{{ label('joint') }}: {{ label('pass') }} &lt; {{ draft.review_threshold }} · {{ label('review') }} [{{ draft.review_threshold }}, {{ draft.block_threshold }}) · {{ label('block') }} ≥ {{ draft.block_threshold }}</p>
+            <p>{{ label('current_user') }}: {{ label('pass') }} &lt; {{ draft.review_threshold }} · {{ label('review') }} [{{ draft.review_threshold }}, {{ draft.block_threshold }}) · {{ label('block') }} ≥ {{ draft.block_threshold }}</p>
             <p v-if="draft.review_threshold === draft.block_threshold" class="mt-2 text-amber-700 dark:text-amber-400">{{ label('emptyReviewRange') }}</p>
             <p v-if="draft.review_threshold === 1 && draft.block_threshold === 1" class="mt-2 text-amber-700 dark:text-amber-400">{{ label('fullScoreOnly') }}</p>
           </div>

@@ -28,12 +28,18 @@ type OutcomeView struct {
 	Models         []ModelResultView `json:"models"`
 	DecisionConfig *DecisionConfig   `json:"decision_config,omitempty"`
 	SegmentReuse   SegmentReuseView  `json:"segment_reuse"`
+	TargetReuse    TargetReuseView   `json:"target_reuse"`
 }
 
 type SegmentReuseView struct {
 	Reused int      `json:"reused"`
 	Total  int      `json:"total"`
 	Rate   *float64 `json:"rate"`
+}
+
+type TargetReuseView struct {
+	SegmentReuseView
+	ByKind map[string]SegmentReuseView `json:"by_kind"`
 }
 
 // outcomeView 派生解释字段，不向持久化结果复制片段最大值或当前配置。
@@ -44,14 +50,28 @@ func outcomeView(outcome *Outcome, config *DecisionConfig) *OutcomeView {
 	if config == nil && outcome.Config.Revision > 0 {
 		config = &DecisionConfig{Revision: outcome.Config.Revision, ReviewThreshold: outcome.Config.ReviewThreshold, BlockThreshold: outcome.Config.BlockThreshold}
 	}
-	view := &OutcomeView{Outcome: outcome, DecisionConfig: config, Models: make([]ModelResultView, 0, len(outcome.Models))}
+	view := &OutcomeView{Outcome: outcome, DecisionConfig: config, Models: make([]ModelResultView, 0, len(outcome.Models)), TargetReuse: TargetReuseView{ByKind: map[string]SegmentReuseView{}}}
 	for _, model := range outcome.Models {
 		item := ModelResultView{ModelResult: model}
-		for _, segment := range model.Segments {
+		uses := model.TargetUses
+		if len(uses) == 0 {
+			uses = model.Segments
+		}
+		for _, segment := range uses {
 			view.SegmentReuse.Total++
+			view.TargetReuse.Total++
+			kind := segment.TargetKind
+			if kind == "" {
+				kind = TargetKindLegacySegment
+			}
+			byKind := view.TargetReuse.ByKind[kind]
+			byKind.Total++
 			if slices.Contains([]string{"history", "within_job", "inflight", "full_evaluation"}, segment.ReuseKind) {
 				view.SegmentReuse.Reused++
+				view.TargetReuse.Reused++
+				byKind.Reused++
 			}
+			view.TargetReuse.ByKind[kind] = byKind
 			if item.MaxSegmentConfidence == nil || segment.Result.Confidence > *item.MaxSegmentConfidence {
 				score := segment.Result.Confidence
 				item.MaxSegmentConfidence = &score
@@ -62,6 +82,17 @@ func outcomeView(outcome *Outcome, config *DecisionConfig) *OutcomeView {
 	if view.SegmentReuse.Total > 0 {
 		rate := float64(view.SegmentReuse.Reused) / float64(view.SegmentReuse.Total)
 		view.SegmentReuse.Rate = &rate
+	}
+	if view.TargetReuse.Total > 0 {
+		rate := float64(view.TargetReuse.Reused) / float64(view.TargetReuse.Total)
+		view.TargetReuse.Rate = &rate
+	}
+	for kind, item := range view.TargetReuse.ByKind {
+		if item.Total > 0 {
+			rate := float64(item.Reused) / float64(item.Total)
+			item.Rate = &rate
+			view.TargetReuse.ByKind[kind] = item
+		}
 	}
 	return view
 }
@@ -81,11 +112,21 @@ const jobOutcomeSummary = `CASE WHEN o.id IS NULL THEN NULL ELSE json_build_obje
  'duration_ms',CASE WHEN o.started_at IS NULL OR o.finished_at IS NULL THEN NULL ELSE GREATEST(0,extract(epoch FROM (o.finished_at-o.started_at))*1000)::bigint END,
  'models',(SELECT COALESCE(json_agg(json_build_object('model_id',m->>'model_id','model_name',m->>'model_name','decision',m->>'decision','basis',m->>'basis','confidence',m->'confidence',
    'reused',m->'reused','joint_attempt_id',CASE WHEN COALESCE((m->>'reused')::boolean,false) THEN NULL ELSE m->'joint_attempt_id' END,'error',m->'error','skipped',m->'skipped','skip_reason',m->'skip_reason',
-   'max_segment_confidence',(SELECT MAX((s->'result'->>'confidence')::double precision) FROM json_array_elements(m->'segments') s))),'[]') FROM json_array_elements(o.model_results::json) m),
+   'target_uses',COALESCE(m->'target_uses','[]'::json),'binding_triggered',m->'binding_triggered','dispatch',m->'dispatch',
+   'max_segment_confidence',(SELECT MAX((s->'result'->>'confidence')::double precision) FROM json_array_elements(COALESCE(m->'target_uses',m->'segments','[]'::json)) s))),'[]') FROM json_array_elements(o.model_results::json) m),
  'decision_config',json_build_object('revision',(o.config_snapshot::json->>'revision')::bigint,'review_threshold',o.config_snapshot::json->'review_threshold','block_threshold',o.config_snapshot::json->'block_threshold'),
  'segment_reuse',(SELECT json_build_object('reused',count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')),'total',count(*),
    'rate',CASE WHEN count(*)=0 THEN NULL ELSE (count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')))::double precision/count(*) END)
-   FROM json_array_elements(o.model_results::json) m CROSS JOIN LATERAL json_array_elements(COALESCE(m->'segments','[]'::json)) s)
+   FROM json_array_elements(o.model_results::json) m CROSS JOIN LATERAL json_array_elements(COALESCE(m->'target_uses',m->'segments','[]'::json)) s),
+ 'target_reuse',(SELECT json_build_object('reused',count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')),'total',count(*),
+   'rate',CASE WHEN count(*)=0 THEN NULL ELSE (count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')))::double precision/count(*) END,
+   'by_kind',COALESCE((SELECT json_object_agg(grouped.target_kind,json_build_object('reused',grouped.reused,'total',grouped.total,
+     'rate',CASE WHEN grouped.total=0 THEN NULL ELSE grouped.reused::double precision/grouped.total END)) FROM (
+       SELECT COALESCE(target->>'target_kind','legacy_segment') target_kind,
+         count(*) FILTER(WHERE target->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')) reused,count(*) total
+       FROM json_array_elements(o.model_results::json) model CROSS JOIN LATERAL json_array_elements(COALESCE(model->'target_uses',model->'segments','[]'::json)) target
+       GROUP BY COALESCE(target->>'target_kind','legacy_segment')) grouped),'{}'::json))
+   FROM json_array_elements(o.model_results::json) m CROSS JOIN LATERAL json_array_elements(COALESCE(m->'target_uses',m->'segments','[]'::json)) s)
 ) END`
 
 func validateFilter(filter Filter) error {
@@ -325,7 +366,7 @@ func (r *Repository) enforcementExplanation(ctx context.Context, detail *JobDeta
 	if err := r.db.QueryRowContext(ctx, `SELECT value FROM sub2api_enhance.settings WHERE key=$1`, SettingKey).Scan(&raw); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	} else if err == nil {
-		current.AuditScope = "full_request"
+		current.AuditScope = "current_user"
 		if err := json.Unmarshal([]byte(raw), &current); err != nil {
 			return nil, err
 		}

@@ -33,7 +33,7 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 	require.Equal(t, DisableConfig{Limit: 1}, defaults.Disable)
 	require.True(t, defaults.CaptureWhenAuditOff)
 	require.Empty(t, defaults.UserRules)
-	require.Equal(t, "current_turn", defaults.AuditScope)
+	require.Equal(t, "current_user", defaults.AuditScope)
 	require.Equal(t, 0.5, publicDefaults.ReviewThreshold)
 	require.Equal(t, 0.8, publicDefaults.BlockThreshold)
 	require.Equal(t, 10, publicDefaults.WarningWindow)
@@ -195,6 +195,17 @@ func TestExcludedUserBypassesAudit(t *testing.T) {
 	require.Nil(t, service.Check(context.Background(), IntakeRequest{UserID: 7, Provider: "openai"}))
 }
 
+func TestAutomaticRequestWithoutCurrentUserDoesNotCreateJob(t *testing.T) {
+	config := testConfig()
+	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config}}}
+	service := &Service{config: manager, metrics: NewRuntimeMetrics()}
+	decision := service.Check(context.Background(), IntakeRequest{UserID: 7, Provider: "openai", Protocol: "openai_chat_completions", Body: []byte(`{"messages":[{"role":"assistant","content":"模型续写"}]}`)})
+	require.NotNil(t, decision)
+	require.Equal(t, IngressDecisionAllow, decision.Kind)
+	require.Equal(t, int64(0), decision.JobID)
+	require.Equal(t, "current_user_not_found", decision.ErrorCode)
+}
+
 func TestUserModeIsChosenAtIntakeAndExclusionStillWins(t *testing.T) {
 	config := testConfig()
 	config.UserRules = []UserRuleConfig{{UserID: 7, Mode: "blocking", ReviewThreshold: 0.5, BlockThreshold: 0.8, Aggregation: "any_block", Warning: WarningConfig{Window: 10, Limit: 3}, Disable: DisableConfig{Limit: 5}}}
@@ -258,7 +269,7 @@ func TestHistoricalSnapshotsAreDisplayOnlyAndNewSnapshotsStayClean(t *testing.T)
 	require.Nil(t, current.historicalJSON)
 }
 
-func TestHistoricalSnapshotWithoutScopeKeepsFullRequestBehavior(t *testing.T) {
+func TestSnapshotWithoutScopeUsesCurrentUserBehavior(t *testing.T) {
 	config := testConfig()
 	snapshot := ConfigSnapshot{Config: config, Revision: 2, ContractVersion: ContractVersion, FixedContract: OutputContract}
 	raw, err := json.Marshal(snapshot)
@@ -270,7 +281,7 @@ func TestHistoricalSnapshotWithoutScopeKeepsFullRequestBehavior(t *testing.T) {
 	require.NoError(t, err)
 	var restored ConfigSnapshot
 	require.NoError(t, json.Unmarshal(raw, &restored))
-	require.Equal(t, "full_request", restored.AuditScope)
+	require.Equal(t, "current_user", restored.AuditScope)
 }
 
 func TestConfigRequiresCalibratedThresholdsOnlyWhenActivating(t *testing.T) {
