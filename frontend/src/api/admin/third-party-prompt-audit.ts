@@ -152,10 +152,12 @@ export interface AuditAction {
   deliveries: { recipient: string; kind: string; status: string; last_error: string; attempts: unknown[] }[]
 }
 export interface JobDetail { input_json: string; input_parts: (SegmentMeta & { content: { type: string; text: string; source_path: string }[] })[]; audit_target?: { protocol: string; messages: unknown[]; tools: Record<string, unknown> }; non_text: { type: string; source_path: string }[]; job: AuditJob; outcome: Outcome | null; rounds: Outcome[]; attempts: ModelAttempt[]; actions: AuditAction[]; enforcement?: { role: string; user_status: string; warning_reason: string; disable_reason: string; window_violations: number; window_size: number; disable_violation_count: number } }
-export interface AuditFilter { ids?: number[]; from?: string; to?: string; user_id?: number; api_key_id?: number; group_id?: number; status?: string; decision?: string; run_kind?: string; mode?: string; platform?: string; request_id?: string; keyword?: string; model_id?: string }
+export interface AuditFilter { ids?: number[]; from?: string; to?: string; user_id?: number; api_key_id?: number; group_id?: number; status?: string; decision?: string; run_kind?: string; mode?: string; platform?: string; request_id?: string; keyword?: string; model_id?: string; model_name?: string }
+export interface CaptureFilter { from?: string; to?: string; user_id?: number; api_key_id?: number; group_id?: number; keyword?: string; protocol?: string; snapshot_status?: string; eligibility_status?: string; status?: string; forwarding_status?: string }
 export interface AuditPage<T> { items: T[]; total: number; page: number; page_size: number }
 export interface ReauditRequest { reuse_mode?: 'allow' | 'force'; filter: AuditFilter }
 export interface ReauditResult { matched: number; ready: number; items: { job_id: number; status: string; reason: string }[] }
+export interface RecoveryResult { matched: number; ready: number; items: { capture_id: number; job_id?: number; action: 'resume_checkpoint' | 'requeue_job' | 'create_job'; status: string; reason?: string }[] }
 export interface Distribution { count: number; p50_ms: number | null; p95_ms: number | null }
 export interface AuditRuntime {
   warning_enabled: boolean; disable_enabled: boolean
@@ -194,10 +196,13 @@ export const thirdPartyPromptAuditAPI = {
   async job(id: number) { return (await apiClient.get<JobDetail>(`${base}/jobs/${id}`)).data },
   async jobLatestUserContent(id: number) { return (await apiClient.get<LatestUserContent>(`${base}/jobs/${id}/latest-user-content`)).data },
   async capture(id: number) { return (await apiClient.get<AuditCapture>(`${base}/captures/${id}`)).data },
+  async captures(filter: CaptureFilter, page = 1, pageSize = 20) { return (await apiClient.get<AuditPage<AuditCapture>>(`${base}/captures`, { params: { ...filter, page, page_size: pageSize } })).data },
   async captureLatestUserContent(id: number) { return (await apiClient.get<LatestUserContent>(`${base}/captures/${id}/latest-user-content`)).data },
   async users() { return (await apiClient.get<AuditUser[]>(`${base}/users`)).data },
   async preview(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits/preview`, value)).data },
   async reaudit(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits`, value)).data },
+  async previewRecoveries() { return (await apiClient.post<RecoveryResult>(`${base}/recoveries/preview`)).data },
+  async createRecoveries() { return (await apiClient.post<RecoveryResult>(`${base}/recoveries`)).data },
   async resume(id: number) { return (await apiClient.post(`${base}/jobs/${id}/resume`)).data },
   async enableAndReset(id: number) { return (await apiClient.post<{ action_id: number; execution_status: string }>(`${base}/users/${id}/enable-and-reset`)).data },
   async retryAction(id: number) { return (await apiClient.post(`${base}/actions/${id}/retry`)).data }

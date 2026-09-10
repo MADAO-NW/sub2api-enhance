@@ -162,6 +162,30 @@ func TestResponsesAdditionalToolsAreApplicationContext(t *testing.T) {
 	require.Contains(t, target.Tools, "$.input[0].tools")
 }
 
+func TestResponsesCompactionAndAgentItemsKeepOnlyVisibleText(t *testing.T) {
+	input := `{"input":[{"type":"compaction","encrypted_content":"opaque-history"},{"type":"agent_message","author":"/root","content":[{"type":"input_text","text":"可见助手内容"},{"type":"encrypted_content","encrypted_content":"opaque-agent"}]},{"type":"reasoning","summary":[{"type":"input_text","text":"可见摘要"}],"encrypted_content":"opaque-reasoning"},{"type":"custom_tool_call","name":"inspect","input":"{\"id\":1}"},{"type":"custom_tool_call_output","output":[{"type":"input_text","text":"工具输出"}]},{"role":"user","content":[{"type":"input_text","text":"最新用户内容"}]}]}`
+	snapshot, err := CaptureInput("openai_responses", []byte(input))
+	require.NoError(t, err)
+	config := DefaultConfig()
+	config.AuditScope = "full_request"
+	target, err := prepareTarget(&Job{Config: ConfigSnapshot{Config: config}, Protocol: "openai_responses", FullInput: snapshot})
+	require.NoError(t, err)
+	require.Len(t, target.Messages, 5)
+	require.Equal(t, "assistant", target.Messages[0].SourceRole)
+	require.Equal(t, "可见助手内容", target.Messages[0].Content[0].Text)
+	require.Equal(t, "assistant", target.Messages[1].SourceRole)
+	require.Equal(t, "可见摘要", target.Messages[1].Content[0].Text)
+	require.Equal(t, "tool", target.Messages[3].SourceRole)
+	require.Equal(t, "user", target.Messages[4].SourceRole)
+	require.Equal(t, "最新用户内容", target.Messages[4].Content[0].Text)
+	raw, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), "opaque-history")
+	require.NotContains(t, string(raw), "opaque-agent")
+	require.Contains(t, string(raw), `"type":"compaction"`)
+	require.Contains(t, string(raw), `"type":"encrypted_content"`)
+}
+
 func TestMediaRootExcludesBinaryWhileKeepingPrompt(t *testing.T) {
 	snapshot, err := CaptureInput("openai_images", []byte(`{"prompt":"原样的绘图说明","image":"data:image/png;base64,AAAA","mask":{"b64_json":"BBBB","mime_type":"image/png"}}`))
 	require.NoError(t, err)

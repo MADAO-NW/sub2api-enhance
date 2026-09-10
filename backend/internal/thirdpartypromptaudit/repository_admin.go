@@ -169,6 +169,11 @@ func filterSQL(filter Filter, includeTime bool) (string, []any) {
 	if filter.ModelID != "" {
 		add("EXISTS(SELECT 1 FROM json_array_elements(o.model_results::json) model WHERE model->>'model_id'=$%d)", filter.ModelID)
 	}
+	if filter.ModelName != "" {
+		add(`((j.status<>'failed' AND EXISTS(SELECT 1 FROM json_array_elements(COALESCE(o.model_results,'[]')::json) model WHERE model->>'model_name' ILIKE '%%'||$%[1]d||'%%'))
+		 OR (j.status='failed' AND EXISTS(SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_model_attempts attempt
+		 WHERE attempt.job_id=j.id AND attempt.audit_round=j.audit_round AND attempt.model_snapshot::json->>'name' ILIKE '%%'||$%[1]d||'%%')))`, filter.ModelName)
+	}
 	if len(clauses) == 0 {
 		return "TRUE", args
 	}
@@ -186,7 +191,7 @@ func (r *Repository) ListJobs(ctx context.Context, filter Filter, page, pageSize
 		return nil, err
 	}
 	query := `SELECT row_to_json(record) FROM(SELECT ` + jobProjection(false) + `,` + jobOutcomeSummary + ` AS outcome,
- (SELECT initial.decision FROM sub2api_enhance.third_party_prompt_audit_outcomes initial WHERE initial.job_id=j.id AND initial.audit_round=1 ORDER BY initial.id LIMIT 1) AS original_decision` + from + `WHERE ` + where + ` ORDER BY j.created_at DESC,j.id DESC`
+ (SELECT initial.decision FROM sub2api_enhance.third_party_prompt_audit_outcomes initial WHERE initial.job_id=j.id ORDER BY initial.audit_round,initial.id LIMIT 1) AS original_decision` + from + `WHERE ` + where + ` ORDER BY j.created_at DESC,j.id DESC`
 	if pageSize > 0 {
 		args = append(args, pageSize, (page-1)*pageSize)
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)-1, len(args))
@@ -362,7 +367,7 @@ func (r *Repository) enforcementExplanation(ctx context.Context, detail *JobDeta
 		} else if triggered("warning") {
 			view.WarningReason = "triggered"
 		} else {
-			rows, err := r.db.QueryContext(ctx, `SELECT latest.decision FROM sub2api_enhance.third_party_prompt_audit_jobs root JOIN sub2api_enhance.third_party_prompt_audit_outcomes original ON original.job_id=root.id AND original.audit_round=1 JOIN LATERAL (SELECT current.decision FROM sub2api_enhance.third_party_prompt_audit_outcomes current WHERE current.job_id=root.id ORDER BY current.audit_round DESC,current.id DESC LIMIT 1) latest ON true WHERE root.user_id=$1 AND original.enforcement_eligible AND original.id>$2 ORDER BY root.id DESC LIMIT $3`, detail.Job.UserID, windowAfter, current.Warning.Window)
+			rows, err := r.db.QueryContext(ctx, `SELECT latest.decision FROM sub2api_enhance.third_party_prompt_audit_jobs root JOIN LATERAL (SELECT first.id,first.enforcement_eligible FROM sub2api_enhance.third_party_prompt_audit_outcomes first WHERE first.job_id=root.id ORDER BY first.audit_round,first.id LIMIT 1) original ON original.enforcement_eligible JOIN LATERAL (SELECT current.decision FROM sub2api_enhance.third_party_prompt_audit_outcomes current WHERE current.job_id=root.id ORDER BY current.audit_round DESC,current.id DESC LIMIT 1) latest ON true WHERE root.user_id=$1 AND original.id>$2 ORDER BY root.id DESC LIMIT $3`, detail.Job.UserID, windowAfter, current.Warning.Window)
 			if err != nil {
 				return nil, err
 			}

@@ -8,6 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/google/wire v0.7.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/klauspost/compress v1.20.0
 	github.com/lib/pq v1.10.9
 	github.com/redis/go-redis/v9 v9.17.2
 	github.com/stretchr/testify v1.8.3

@@ -40,10 +40,10 @@ const defaultBlockThreshold = 0.8
 const defaultWarningWindow = 10
 
 // defaultWarningLimit 是默认统计窗口内触发提醒的违规数量。
-const defaultWarningLimit = 3
+const defaultWarningLimit = 2
 
 // defaultDisableLimit 是默认触发用户自动停用的累计违规数量。
-const defaultDisableLimit = 5
+const defaultDisableLimit = 1
 
 // legacyDefaultPolicySHA256 仅识别旧内置默认值，不能覆盖管理员自定义政策。
 const legacyDefaultPolicySHA256 = "9071cf397aa94bca6982620a56c908a5977fdfc94206c7e198f160c5f65b2e0d"
@@ -228,8 +228,9 @@ func DefaultConfig() Config {
 		GroupIDs: []int64{}, ExcludedUserIDs: []int64{}, AuditPrompt: DefaultPolicy, Models: []ModelConfig{},
 		ReviewThreshold: &reviewThreshold, BlockThreshold: &blockThreshold,
 		Aggregation: "any_block", WorkerCount: 4,
-		Warning: WarningConfig{Window: defaultWarningWindow, Limit: defaultWarningLimit},
-		Disable: DisableConfig{Limit: defaultDisableLimit}, UserRules: []UserRuleConfig{}}
+		CaptureWhenAuditOff: true,
+		Warning:             WarningConfig{Window: defaultWarningWindow, Limit: defaultWarningLimit},
+		Disable:             DisableConfig{Limit: defaultDisableLimit}, UserRules: []UserRuleConfig{}}
 }
 
 // normalizeModelConcurrency 为旧配置和旧任务快照补齐节点默认并发。

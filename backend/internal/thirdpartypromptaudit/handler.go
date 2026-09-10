@@ -182,7 +182,7 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 }
 
 func filterFromQuery(c *gin.Context) (Filter, error) {
-	filter := Filter{Status: c.Query("status"), Decision: Decision(c.Query("decision")), RunKind: c.Query("run_kind"), Mode: c.Query("mode"), Platform: c.Query("platform"), RequestID: c.Query("request_id"), Keyword: c.Query("keyword"), ModelID: c.Query("model_id")}
+	filter := Filter{Status: c.Query("status"), Decision: Decision(c.Query("decision")), RunKind: c.Query("run_kind"), Mode: c.Query("mode"), Platform: c.Query("platform"), RequestID: c.Query("request_id"), Keyword: c.Query("keyword"), ModelID: c.Query("model_id"), ModelName: c.Query("model_name")}
 	for _, field := range []struct {
 		name   string
 		target **int64
@@ -224,18 +224,23 @@ func listQuery(c *gin.Context) (Filter, int, int, error) {
 	if err != nil {
 		return filter, 0, 0, err
 	}
+	page, size, err := paginationQuery(c)
+	return filter, page, size, err
+}
+
+func paginationQuery(c *gin.Context) (int, int, error) {
 	page, err := strconv.Atoi(c.DefaultQuery("page", "1"))
 	if err != nil || page <= 0 {
-		return filter, 0, 0, errors.New("页码无效")
+		return 0, 0, errors.New("页码无效")
 	}
 	size, err := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-	if err != nil || size <= 0 || size > 100 {
-		return filter, 0, 0, errors.New("每页数量必须为 1 至 100")
+	if err != nil || size <= 0 || size > 200 {
+		return 0, 0, errors.New("每页数量必须为 1 至 200")
 	}
 	if page > (int(^uint(0)>>1) / size) {
-		return filter, 0, 0, errors.New("分页位置超出范围")
+		return 0, 0, errors.New("分页位置超出范围")
 	}
-	return filter, page, size, nil
+	return page, size, nil
 }
 
 func (h *AdminHandler) ListJobs(c *gin.Context) {

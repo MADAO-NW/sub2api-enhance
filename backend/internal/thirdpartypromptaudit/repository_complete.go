@@ -13,7 +13,7 @@ import (
 	"sub2api-enhance/internal/pkg/logger"
 )
 
-// Complete 原子提交分类、任务当前状态、计数与动作；同步补写和复核不能获得处罚资格。
+// Complete 原子提交分类、任务当前状态、计数与动作；自动来源首次恢复可建立处罚资格，人工补写不能。
 func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluation, foreground bool) (*Outcome, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -60,7 +60,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 		return nil, priorErr
 	}
 	var originalEligible bool
-	originalErr := tx.QueryRowContext(ctx, `SELECT enforcement_eligible FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1 AND audit_round=1 ORDER BY id LIMIT 1`, job.ID).Scan(&originalEligible)
+	originalErr := tx.QueryRowContext(ctx, `SELECT enforcement_eligible FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1 ORDER BY audit_round,id LIMIT 1`, job.ID).Scan(&originalEligible)
 	if originalErr != nil && !errors.Is(originalErr, sql.ErrNoRows) {
 		return nil, originalErr
 	}
@@ -87,7 +87,10 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 	}
 	eligible := false
 	if job.CaptureID != nil {
-		if err := tx.QueryRowContext(ctx, `SELECT eligibility_status='passed' AND snapshot_status='complete' FROM sub2api_enhance.captures WHERE id=$1 AND user_id=$2`, *job.CaptureID, job.UserID).Scan(&eligible); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT eligibility_status='passed' AND snapshot_status='complete'
+		 AND COALESCE(request_metadata::json->>'audit_required','false')='true'
+		 AND COALESCE(request_metadata::json->>'manual_reprocess','false')<>'true'
+		 FROM sub2api_enhance.captures WHERE id=$1 AND user_id=$2`, *job.CaptureID, job.UserID).Scan(&eligible); err != nil {
 			return nil, err
 		}
 	}
@@ -96,7 +99,9 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 		return nil, err
 	}
 	runKind := job.auditRunKind()
-	cloned.EnforcementEligible = job.IngressStage != "manual_capture_reprocess" && eligible && runKind == "request" && (job.ExecutionMode == "async" || foreground) && current.Mode != "off"
+	firstRecoveryOutcome := runKind == "reaudit" && errors.Is(priorErr, sql.ErrNoRows)
+	cloned.EnforcementEligible = job.IngressStage != "manual_capture_reprocess" && eligible &&
+		((runKind == "request" && (job.ExecutionMode == "async" || foreground)) || firstRecoveryOutcome) && current.Mode != "off"
 	outcome := &Outcome{JobID: job.ID, UserID: job.UserID, ReuseMode: job.ReuseMode, Evaluation: *cloned}
 	models, err := json.Marshal(cloned.Models)
 	if err != nil {
@@ -158,7 +163,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 			state.WarningArmed = true
 		}
 		if current.Warning.Enabled {
-			rows, err := tx.QueryContext(ctx, `SELECT latest.decision FROM sub2api_enhance.third_party_prompt_audit_jobs root JOIN sub2api_enhance.third_party_prompt_audit_outcomes original ON original.job_id=root.id AND original.audit_round=1 JOIN LATERAL (SELECT current.decision FROM sub2api_enhance.third_party_prompt_audit_outcomes current WHERE current.job_id=root.id ORDER BY current.audit_round DESC,current.id DESC LIMIT 1) latest ON true WHERE root.user_id=$1 AND original.enforcement_eligible AND original.id>$2 ORDER BY root.id DESC LIMIT $3`, job.UserID, state.WarningWindowAfterOutcomeID, current.Warning.Window)
+			rows, err := tx.QueryContext(ctx, `SELECT latest.decision FROM sub2api_enhance.third_party_prompt_audit_jobs root JOIN LATERAL (SELECT first.id,first.enforcement_eligible FROM sub2api_enhance.third_party_prompt_audit_outcomes first WHERE first.job_id=root.id ORDER BY first.audit_round,first.id LIMIT 1) original ON original.enforcement_eligible JOIN LATERAL (SELECT current.decision FROM sub2api_enhance.third_party_prompt_audit_outcomes current WHERE current.job_id=root.id ORDER BY current.audit_round DESC,current.id DESC LIMIT 1) latest ON true WHERE root.user_id=$1 AND original.id>$2 ORDER BY root.id DESC LIMIT $3`, job.UserID, state.WarningWindowAfterOutcomeID, current.Warning.Window)
 			if err != nil {
 				return nil, err
 			}
@@ -198,7 +203,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 		}
 	}
 	oldStatus := user.Status
-	if runKind == "request" && outcome.EnforcementEligible {
+	if outcome.EnforcementEligible {
 		next.LastOutcomeID = &outcome.ID
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_enforcement_states SET warning_rule_hash=$2,warning_window_after_outcome_id=$3,warning_armed=$4,disable_violation_count=$5,last_outcome_id=$6,updated_at=clock_timestamp() WHERE user_id=$1`, job.UserID, next.WarningRuleHash, next.WarningWindowAfterOutcomeID, next.WarningArmed, next.DisableViolationCount, next.LastOutcomeID)

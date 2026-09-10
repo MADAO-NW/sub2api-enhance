@@ -365,6 +365,36 @@ func TestL0ReusesWholeResultAndReauditForcesFreshCalls(t *testing.T) {
 	require.Equal(t, 2, store.segmentReads)
 }
 
+func TestSuccessfulSegmentRemainsReusableAfterTaskFailure(t *testing.T) {
+	store := &memoryAuditStore{}
+	var calls atomic.Int32
+	failSecond := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		call := calls.Add(1)
+		if failSecond && call == 2 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`upstream failed`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"confidence\":0.1,\"reason\":\"正常\"}"}}]}`))
+	}))
+	defer server.Close()
+	evaluator := &Evaluator{store: store, client: &ModelClient{attempts: store}}
+	first := evaluationJob(t, server.URL, `{"instructions":"共享规则","input":"用户任务"}`)
+	_, failure := evaluator.Evaluate(context.Background(), first, nil)
+	require.NotNil(t, failure)
+	require.Len(t, store.segments, 1)
+
+	failSecond = false
+	second := evaluationJob(t, server.URL, `{"instructions":"共享规则","input":"用户任务"}`)
+	second.ID, second.UserID = 2, 99
+	result, failure := evaluator.Evaluate(context.Background(), second, nil)
+	require.Nil(t, failure)
+	require.Equal(t, DecisionPass, result.Decision)
+	require.EqualValues(t, 3, calls.Load())
+	require.Equal(t, 1, second.Reuse.SegmentHits)
+}
+
 func TestRequestsWithoutConversationIdentityReuseAcrossJobs(t *testing.T) {
 	store := &memoryAuditStore{}
 	count := 0

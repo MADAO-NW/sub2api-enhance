@@ -215,6 +215,7 @@ type Filter struct {
 	RequestID string     `json:"request_id,omitempty"`
 	Keyword   string     `json:"keyword,omitempty"`
 	ModelID   string     `json:"model_id,omitempty"`
+	ModelName string     `json:"model_name,omitempty"`
 }
 
 type Page[T any] struct {
@@ -240,4 +241,20 @@ type ReauditResult struct {
 	Matched int64         `json:"matched"`
 	Ready   int64         `json:"ready"`
 	Items   []ReauditItem `json:"items"`
+}
+
+type RecoveryItem struct {
+	CaptureID  int64  `json:"capture_id"`
+	JobID      *int64 `json:"job_id,omitempty"`
+	Action     string `json:"action"`
+	Status     string `json:"status"`
+	Reason     string `json:"reason,omitempty"`
+	userID     int64
+	checkpoint bool
+}
+
+type RecoveryResult struct {
+	Matched int64          `json:"matched"`
+	Ready   int64          `json:"ready"`
+	Items   []RecoveryItem `json:"items"`
 }

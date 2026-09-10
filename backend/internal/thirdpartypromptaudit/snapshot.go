@@ -143,6 +143,19 @@ func scrubContentBinary(value any, path string, nonText *[]NonTextInput) {
 		}
 	case map[string]any:
 		kind, _ := content["type"].(string)
+		if kind == "compaction" || kind == "encrypted_content" {
+			*nonText = append(*nonText, NonTextInput{SourcePath: path, Type: kind})
+			content["encrypted_content"] = nil
+			return
+		}
+		if kind == "reasoning" {
+			if _, exists := content["encrypted_content"]; exists {
+				*nonText = append(*nonText, NonTextInput{SourcePath: path + ".encrypted_content", Type: "encrypted_content"})
+				content["encrypted_content"] = nil
+			}
+			scrubContentBinary(content["summary"], path+".summary", nonText)
+			return
+		}
 		if kind == "tool_result" {
 			scrubContentBinary(content["content"], path+".content", nonText)
 			return
@@ -258,15 +271,20 @@ func protocolMessages(protocol string, root map[string]any, prefix string) ([]pr
 					return nil, fmt.Errorf("Responses additional_tools 缺少工具数组: %s", path)
 				}
 				continue
-			case "function_call_output", "tool_result":
+			case "compaction":
+				role, content = "assistant", entry
+				contentPath = path
+			case "agent_message":
+				role = "assistant"
+			case "function_call_output", "tool_result", "custom_tool_call_output":
 				role, content, toolData = "tool", nil, entry
 				contentPath = path
-			case "function_call", "tool_call":
+			case "function_call", "tool_call", "custom_tool_call":
 				role, content, toolData = "assistant", nil, entry
 				contentPath = path
 			case "reasoning":
-				role, content = "assistant", entry["summary"]
-				contentPath = path + ".summary"
+				role, content = "assistant", entry
+				contentPath = path
 			default:
 				if role == "" {
 					role = "user"
@@ -591,10 +609,10 @@ func extractTextBlocks(value any, path string) ([]TextBlock, error) {
 			}
 			return blocks, nil
 		}
-		if slices.Contains([]string{"image", "image_url", "input_image", "input_audio", "audio", "video", "input_video", "file", "input_file", "redacted_thinking", "item_reference"}, kind) {
+		if slices.Contains([]string{"image", "image_url", "input_image", "input_audio", "audio", "video", "input_video", "file", "input_file", "redacted_thinking", "item_reference", "compaction", "encrypted_content"}, kind) {
 			return blocks, nil
 		}
-		for _, key := range []string{"text", "thinking", "refusal", "content", "parts"} {
+		for _, key := range []string{"text", "thinking", "refusal", "content", "parts", "summary"} {
 			if child, exists := content[key]; exists {
 				return extractTextBlocks(child, path+"."+key)
 			}

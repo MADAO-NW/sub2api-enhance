@@ -21,6 +21,7 @@ let tracking = false
 let disposed = false
 function select(tab: string, refresh = true) { active.value = tab; if (!visited.value.includes(tab)) visited.value.push(tab); if (refresh) tabRefresh[tab] = (tabRefresh[tab] ?? 0) + 1 }
 function inspectJobs(filter: AuditFilter) { jobFilter.value = filter; select('jobs', false) }
+function refreshAfterRecovery() { refreshKey.value++ }
 async function trackReaudits(ids: number[]) {
   for (const id of ids) if (!trackedReaudits.has(id)) trackedReaudits.set(id, '')
   refreshKey.value++
@@ -58,7 +59,7 @@ onUnmounted(() => { disposed = true })
       <nav class="flex flex-wrap gap-2" :aria-label="label('title')"><button v-for="tab in ['overview', 'jobs', 'captures', 'config']" :key="tab" class="rounded-xl px-5 py-3 text-sm font-medium transition" :class="active === tab ? 'bg-primary-600 text-white' : 'bg-white text-gray-600 hover:bg-primary-50 dark:bg-dark-800 dark:text-dark-300'" :aria-current="active === tab ? 'page' : undefined" @click="select(tab)">{{ label(tab) }}</button></nav>
       <AuditOverview v-show="active === 'overview'" :refresh-key="tabRefresh.overview + refreshKey" @inspect-jobs="inspectJobs" />
       <AuditRecords v-if="visited.includes('jobs')" v-show="active === 'jobs'" :initial-filter="jobFilter" :refresh-key="tabRefresh.jobs + refreshKey" @reaudit-created="trackReaudits" />
-      <CaptureRecords v-if="visited.includes('captures')" v-show="active === 'captures'" :refresh-key="tabRefresh.captures" />
+      <CaptureRecords v-if="visited.includes('captures')" v-show="active === 'captures'" :refresh-key="tabRefresh.captures" @recovery-created="refreshAfterRecovery" />
       <AuditConfigPanel v-if="visited.includes('config')" v-show="active === 'config'" :refresh-key="tabRefresh.config" />
     </div>
   </main>

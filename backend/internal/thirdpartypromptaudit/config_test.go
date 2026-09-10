@@ -29,15 +29,16 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 	require.NotNil(t, defaults.BlockThreshold)
 	require.Equal(t, 0.5, *defaults.ReviewThreshold)
 	require.Equal(t, 0.8, *defaults.BlockThreshold)
-	require.Equal(t, WarningConfig{Window: 10, Limit: 3}, defaults.Warning)
-	require.Equal(t, DisableConfig{Limit: 5}, defaults.Disable)
+	require.Equal(t, WarningConfig{Window: 10, Limit: 2}, defaults.Warning)
+	require.Equal(t, DisableConfig{Limit: 1}, defaults.Disable)
+	require.True(t, defaults.CaptureWhenAuditOff)
 	require.Empty(t, defaults.UserRules)
 	require.Equal(t, "current_turn", defaults.AuditScope)
 	require.Equal(t, 0.5, publicDefaults.ReviewThreshold)
 	require.Equal(t, 0.8, publicDefaults.BlockThreshold)
 	require.Equal(t, 10, publicDefaults.WarningWindow)
-	require.Equal(t, 3, publicDefaults.WarningLimit)
-	require.EqualValues(t, 5, publicDefaults.DisableLimit)
+	require.Equal(t, 2, publicDefaults.WarningLimit)
+	require.EqualValues(t, 1, publicDefaults.DisableLimit)
 	model := testConfig().Models[0]
 	require.Equal(t, 300000, publicConfig(storedConfig{}).ModelDefaults.TimeoutMS)
 	require.Equal(t, 4, publicConfig(storedConfig{}).ModelDefaults.MaxConcurrency)
@@ -58,6 +59,15 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 	model.TimeoutMS = 1000
 	model.MaxConcurrency = -1
 	require.ErrorContains(t, validateModel(model), "最大并发")
+}
+
+func TestCaptureWhenAuditOffDefaultDoesNotOverrideExplicitFalse(t *testing.T) {
+	missing := storedConfig{Config: DefaultConfig()}
+	require.NoError(t, json.Unmarshal([]byte(`{"mode":"off"}`), &missing))
+	require.True(t, missing.CaptureWhenAuditOff)
+	explicit := storedConfig{Config: DefaultConfig()}
+	require.NoError(t, json.Unmarshal([]byte(`{"mode":"off","capture_when_audit_off":false}`), &explicit))
+	require.False(t, explicit.CaptureWhenAuditOff)
 }
 
 func TestUserRuleOverridesOnlyTheSelectedUsersDecisionAndActions(t *testing.T) {

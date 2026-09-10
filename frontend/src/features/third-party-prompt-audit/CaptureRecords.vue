@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { apiClient } from '@/api/client'
-import { thirdPartyPromptAuditAPI as api, type AuditCapture, type AuditUser } from '@/api/admin/third-party-prompt-audit'
+import { thirdPartyPromptAuditAPI as api, type AuditCapture, type AuditUser, type CaptureFilter, type RecoveryResult } from '@/api/admin/third-party-prompt-audit'
 import AuditDetail from './AuditDetail.vue'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import { useAppStore } from '@/stores/app'
@@ -10,11 +10,17 @@ import CaptureBody from './CaptureBody.vue'
 import { useAuditLabels } from './labels'
 import { formatTime } from './viewModel'
 import LatestUserContent from './LatestUserContent.vue'
+import Pagination from '@/components/common/Pagination.vue'
 
 const props = withDefaults(defineProps<{ refreshKey?: number }>(), { refreshKey: 0 })
+const emit = defineEmits<{ (event: 'recovery-created', ids: number[]): void }>()
 const items = ref<AuditCapture[]>([])
 const total = ref(0)
 const page = ref(1)
+const pageSize = ref(20)
+const filters = reactive<CaptureFilter>({})
+const applied = ref<CaptureFilter>({})
+const from = ref(''), to = ref(''), advancedOpen = ref(false)
 const selected = ref<AuditCapture | null>(null)
 const error = ref('')
 const app = useAppStore()
@@ -28,6 +34,9 @@ const recovering = ref(false)
 const jobID = ref<number | null>(null)
 const recoveryBlocked = computed(() => !selected.value || selected.value.snapshot_status !== 'complete')
 const processing = computed(() => !!selected.value && (selected.value.processing_status === 'processing' || (['queued', 'retry'].includes(selected.value.processing_status) && selected.value.metadata?.mode === 'async' && selected.value.eligibility_status === 'passed')))
+const batchOpen = ref(false), batchLoading = ref(false), batchSubmitted = ref(false)
+const batchResult = ref<RecoveryResult | null>(null), batchPage = ref(1)
+const batchItems = computed(() => batchResult.value?.items.slice((batchPage.value - 1) * 20, batchPage.value * 20) ?? [])
 watch(userID, async id => {
   manualKeyID.value = undefined
   keyOptions.value = []
@@ -42,13 +51,59 @@ const base = '/admin/third-party-prompt-audit/captures'
 
 async function load() {
   try {
-    const { data } = await apiClient.get(base, { params: { page: page.value, page_size: 20 } })
-    items.value = data.items
-    total.value = data.total
+    const result = await api.captures(applied.value, page.value, pageSize.value)
+    items.value = result.items
+    total.value = result.total
     error.value = ''
   } catch (err) {
     error.value = extractApiErrorMessage(err, label('error'))
   }
+}
+
+function apply() {
+  const next = Object.fromEntries(Object.entries(filters).filter(([, value]) => value !== '' && value != null)) as CaptureFilter
+  if (from.value) next.from = new Date(from.value).toISOString()
+  if (to.value) next.to = new Date(to.value).toISOString()
+  if (next.from && next.to && new Date(next.from) >= new Date(next.to)) { error.value = label('invalidRange'); return }
+  applied.value = next
+  page.value = 1
+  void load()
+}
+
+function changePage(value: number) { page.value = value; void load() }
+function changeSize(value: number) { pageSize.value = value; page.value = 1; void load() }
+
+async function openBatchRecovery() {
+  batchOpen.value = true
+  batchLoading.value = true
+  batchSubmitted.value = false
+  batchResult.value = null
+  batchPage.value = 1
+  try { batchResult.value = await api.previewRecoveries() }
+  catch (err) { app.showError(extractApiErrorMessage(err, label('error'))); batchOpen.value = false }
+  finally { batchLoading.value = false }
+}
+
+async function submitBatchRecovery() {
+  if (batchLoading.value || !batchResult.value?.ready) return
+  batchLoading.value = true
+  try {
+    batchResult.value = await api.createRecoveries()
+    batchSubmitted.value = true
+    batchPage.value = 1
+    const ids = batchResult.value.items.flatMap(item => item.job_id && ['created', 'requeued', 'resumed', 'already_running'].includes(item.status) ? [item.job_id] : [])
+    if (ids.length) emit('recovery-created', ids)
+    await load()
+    app.showSuccess(`${label('recoverySubmitted')}: ${ids.length}`)
+  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { batchLoading.value = false }
+}
+
+function closeBatchRecovery() {
+  if (batchLoading.value) return
+  batchOpen.value = false
+  batchResult.value = null
+  batchSubmitted.value = false
 }
 
 async function detail(id: number) {
@@ -79,13 +134,30 @@ watch(() => props.refreshKey, () => { void load() })
 
 <template>
   <section class="card">
-    <header class="mb-4 flex justify-between">
+    <header class="mb-4 flex flex-wrap justify-between gap-3">
       <div>
         <h2 class="text-xl font-semibold">{{ label('captures') }}</h2>
         <p class="mt-2 text-sm text-gray-500">{{ label('captureHint') }}</p>
       </div>
-      <button class="btn btn-secondary" @click="load">{{ label('refresh') }}</button>
+      <div class="flex flex-wrap gap-2"><button class="btn btn-secondary" @click="openBatchRecovery">{{ label('recoverAllFailures') }}</button><button class="btn btn-secondary" @click="load">{{ label('refresh') }}</button></div>
     </header>
+    <form class="mb-5 space-y-4 rounded-xl border border-gray-100 p-4 dark:border-dark-700" @submit.prevent="apply">
+      <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <label class="space-y-1 text-sm"><span>{{ label('keyword') }}</span><input v-model="filters.keyword" class="input" /></label>
+        <label class="space-y-1 text-sm"><span>{{ label('protocol') }}</span><input v-model="filters.protocol" class="input" /></label>
+        <label class="space-y-1 text-sm"><span>{{ label('captureProcessing') }}</span><select v-model="filters.status" class="input"><option value="">{{ label('all') }}</option><option v-for="item in ['queued', 'processing', 'retry', 'done', 'failed', 'skipped', 'awaiting_review']" :key="item" :value="item">{{ label(item) }}</option></select></label>
+        <label class="space-y-1 text-sm"><span>{{ label('forwardingStock') }}</span><select v-model="filters.forwarding_status" class="input"><option value="">{{ label('all') }}</option><option v-for="item in ['not_forwarded', 'started', 'response_started', 'complete', 'unknown', 'blocked']" :key="item" :value="item">{{ forwardingLabel(item) }}</option></select></label>
+      </div>
+      <div><button type="button" class="inline-flex w-fit items-center gap-1 text-sm" :aria-expanded="advancedOpen" @click="advancedOpen = !advancedOpen"><span aria-hidden="true">{{ advancedOpen ? '▾' : '▸' }}</span><span>{{ label('from') }} / {{ label('userID') }} / {{ label('captureIntegrity') }}</span></button>
+        <div v-show="advancedOpen" class="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <label class="space-y-1 text-sm"><span>{{ label('from') }}</span><input v-model="from" type="datetime-local" class="input" /></label><label class="space-y-1 text-sm"><span>{{ label('to') }}</span><input v-model="to" type="datetime-local" class="input" /></label>
+          <label v-for="field in [{ key: 'user_id', name: 'userID' }, { key: 'api_key_id', name: 'apiKeyID' }, { key: 'group_id', name: 'groupID' }] as const" :key="field.key" class="space-y-1 text-sm"><span>{{ label(field.name) }}</span><input :value="filters[field.key]" type="number" min="1" step="1" class="input" @input="filters[field.key] = ($event.target as HTMLInputElement).value === '' ? undefined : ($event.target as HTMLInputElement).valueAsNumber" /></label>
+          <label class="space-y-1 text-sm"><span>{{ label('captureIntegrity') }}</span><select v-model="filters.snapshot_status" class="input"><option value="">{{ label('all') }}</option><option value="complete">{{ label('complete') }}</option><option value="incomplete">{{ label('incomplete') }}</option></select></label>
+          <label class="space-y-1 text-sm"><span>{{ label('captureEligibility') }}</span><select v-model="filters.eligibility_status" class="input"><option value="">{{ label('all') }}</option><option v-for="item in ['passed', 'unknown', 'rejected', 'manual']" :key="item" :value="item">{{ label(item) }}</option></select></label>
+        </div>
+      </div>
+      <button class="btn btn-primary">{{ label('apply') }}</button>
+    </form>
     <p v-if="error" class="text-red-600">{{ error }}</p>
     <div class="overflow-auto">
       <table class="table min-w-[72rem]">
@@ -98,7 +170,7 @@ watch(() => props.refreshKey, () => { void load() })
         </tbody>
       </table>
     </div>
-    <footer class="mt-4 flex items-center justify-end gap-3"><span>{{ total }} · {{ page }}</span><button class="btn btn-secondary" :disabled="page <= 1" @click="page--; load()">←</button><button class="btn btn-secondary" :disabled="page * 20 >= total" @click="page++; load()">→</button></footer>
+    <Pagination class="mt-4" :page="page" :page-size="pageSize" :page-size-options="[20, 50, 100, 200]" :total="total" @update:page="changePage" @update:page-size="changeSize" />
     <BaseDialog :show="!!selected" :title="label('captureDetail')" :close-on-click-outside="true" @close="selected = null">
       <template v-if="selected">
         <CaptureBody :capture="selected" />
@@ -117,6 +189,13 @@ watch(() => props.refreshKey, () => { void load() })
           <button class="text-primary-600 underline" :disabled="recovering" @click="detail(selected.id)">{{ label('refresh') }}</button>
         </div>
       </template>
+    </BaseDialog>
+    <BaseDialog :show="batchOpen" :title="label('recoverAllFailures')" width="wide" :show-close-button="!batchLoading" :close-on-escape="!batchLoading" :close-on-click-outside="!batchLoading" @close="closeBatchRecovery">
+      <div class="space-y-4">
+        <p class="text-sm text-gray-500">{{ label('recoveryPreviewHint') }}</p>
+        <p v-if="batchLoading" role="status">{{ label('loading') }}</p>
+        <template v-if="batchResult"><p>{{ label('matched') }}: {{ batchResult.matched }} · {{ label('ready') }}: {{ batchResult.ready }}</p><div class="max-h-96 overflow-auto"><div v-for="item in batchItems" :key="`${item.capture_id}-${item.job_id || 0}`" class="border-t border-gray-100 py-3 text-sm dark:border-dark-700"><span>Capture #{{ item.capture_id }}<template v-if="item.job_id"> · Job #{{ item.job_id }}</template> → {{ label(item.action) }} · {{ label(item.status) }}</span><p v-if="item.reason" class="text-gray-500">{{ item.reason }}</p></div></div><Pagination :page="batchPage" :page-size="20" :total="batchResult.items.length" :show-page-size-selector="false" @update:page="batchPage = $event" /><button v-if="!batchSubmitted" class="btn btn-primary" :disabled="batchLoading || !batchResult.ready" @click="submitBatchRecovery">{{ label('submitRecovery') }}</button><p v-else role="status">{{ label('recoverySubmitted') }}</p></template>
+      </div>
     </BaseDialog>
     <AuditDetail :id="jobID" @close="jobID = null" />
   </section>

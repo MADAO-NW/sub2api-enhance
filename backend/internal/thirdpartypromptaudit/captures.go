@@ -10,7 +10,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/klauspost/compress/zstd"
 	"io"
+	"strings"
 	"sub2api-enhance/internal/sub2api"
 	"sync/atomic"
 	"time"
@@ -43,6 +46,20 @@ type Capture struct {
 type CaptureStore struct {
 	db       *sql.DB
 	failures atomic.Uint64
+}
+
+type CaptureFilter struct {
+	From              *time.Time
+	To                *time.Time
+	UserID            *int64
+	APIKeyID          *int64
+	GroupID           *int64
+	Keyword           string
+	Protocol          string
+	SnapshotStatus    string
+	EligibilityStatus string
+	ProcessingStatus  string
+	ForwardingStatus  string
 }
 
 func NewCaptureStore(db *sql.DB) *CaptureStore { return &CaptureStore{db: db} }
@@ -131,15 +148,59 @@ func (s *CaptureStore) Get(ctx context.Context, id int64) (*Capture, error) {
 	}
 	return &c, nil
 }
-func (s *CaptureStore) List(ctx context.Context, page, size int, status string) (Page[Capture], error) {
+func (s *CaptureStore) List(ctx context.Context, page, size int, filter CaptureFilter) (Page[Capture], error) {
 	out := Page[Capture]{Page: page, PageSize: size, Items: []Capture{}}
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM sub2api_enhance.captures WHERE ($1='' OR processing_status=$1)`, status).Scan(&out.Total); err != nil {
+	clauses := make([]string, 0)
+	args := make([]any, 0)
+	add := func(expression string, value any) {
+		args = append(args, value)
+		clauses = append(clauses, fmt.Sprintf(expression, len(args)))
+	}
+	if filter.From != nil {
+		add("c.created_at>=$%d", *filter.From)
+	}
+	if filter.To != nil {
+		add("c.created_at<$%d", *filter.To)
+	}
+	if filter.UserID != nil {
+		add("c.user_id=$%d", *filter.UserID)
+	}
+	if filter.APIKeyID != nil {
+		add("c.api_key_id=$%d", *filter.APIKeyID)
+	}
+	if filter.GroupID != nil {
+		add("c.group_id=$%d", *filter.GroupID)
+	}
+	if filter.Keyword != "" {
+		add(`(COALESCE(NULLIF(u.username,''),c.identity_snapshot::json->>'username','') ILIKE '%%'||$%[1]d||'%%'
+		 OR COALESCE(NULLIF(u.email,''),c.identity_snapshot::json->>'user_email','') ILIKE '%%'||$%[1]d||'%%'
+		 OR COALESCE(NULLIF(k.name,''),c.identity_snapshot::json->>'api_key_name','') ILIKE '%%'||$%[1]d||'%%')`, filter.Keyword)
+	}
+	for _, item := range []struct {
+		expression string
+		value      string
+	}{{"c.protocol=$%d", filter.Protocol}, {"c.snapshot_status=$%d", filter.SnapshotStatus},
+		{"c.eligibility_status=$%d", filter.EligibilityStatus}, {"c.processing_status=$%d", filter.ProcessingStatus},
+		{"c.forwarding_status=$%d", filter.ForwardingStatus}} {
+		if item.value != "" {
+			add(item.expression, item.value)
+		}
+	}
+	where := "TRUE"
+	if len(clauses) > 0 {
+		where = strings.Join(clauses, " AND ")
+	}
+	from := ` FROM sub2api_enhance.captures c
+ LEFT JOIN public.users u ON u.id=c.user_id AND u.deleted_at IS NULL
+ LEFT JOIN public.api_keys k ON k.id=c.api_key_id AND k.deleted_at IS NULL `
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*)`+from+`WHERE `+where, args...).Scan(&out.Total); err != nil {
 		return out, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.capture_key,COALESCE(c.conversation_key,''),c.transport,c.protocol,c.body_format,c.body_sha256,c.body_bytes,c.snapshot_status,c.eligibility_status,c.processing_status,c.forwarding_status,c.last_error_message,c.created_at,
+	queryArgs := append(append([]any{}, args...), size, (page-1)*size)
+	query := `SELECT c.id,c.capture_key,COALESCE(c.conversation_key,''),c.transport,c.protocol,c.body_format,c.body_sha256,c.body_bytes,c.snapshot_status,c.eligibility_status,c.processing_status,c.forwarding_status,c.last_error_message,c.created_at,
  COALESCE(NULLIF(u.username,''),c.identity_snapshot::json->>'username',''),COALESCE(NULLIF(u.email,''),c.identity_snapshot::json->>'user_email',''),COALESCE(c.user_id,0)
- FROM sub2api_enhance.captures c LEFT JOIN public.users u ON u.id=c.user_id AND u.deleted_at IS NULL
- WHERE ($1='' OR c.processing_status=$1) ORDER BY c.id DESC LIMIT $2 OFFSET $3`, status, size, (page-1)*size)
+	` + from + `WHERE ` + where + fmt.Sprintf(" ORDER BY c.id DESC LIMIT $%d OFFSET $%d", len(queryArgs)-1, len(queryArgs))
+	rows, err := s.db.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
 		return out, err
 	}
@@ -205,13 +266,24 @@ func captureAuditBody(c *Capture) (string, []byte, error) {
 	}
 	raw := c.Raw
 	if encoding := c.Metadata["content_encoding"]; encoding != "" && encoding != "identity" {
-		var reader io.ReadCloser
+		var reader io.Reader
+		var closeReader func()
 		var err error
 		switch encoding {
 		case "gzip":
-			reader, err = gzip.NewReader(bytes.NewReader(raw))
+			var gzipReader *gzip.Reader
+			gzipReader, err = gzip.NewReader(bytes.NewReader(raw))
+			reader = gzipReader
+			closeReader = func() { _ = gzipReader.Close() }
 		case "deflate":
-			reader = flate.NewReader(bytes.NewReader(raw))
+			flateReader := flate.NewReader(bytes.NewReader(raw))
+			reader = flateReader
+			closeReader = func() { _ = flateReader.Close() }
+		case "zstd":
+			var zstdReader *zstd.Decoder
+			zstdReader, err = zstd.NewReader(bytes.NewReader(raw), zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
+			reader = zstdReader
+			closeReader = zstdReader.Close
 		default:
 			err = errors.New("该内容编码尚未支持审核解析")
 		}
@@ -219,7 +291,7 @@ func captureAuditBody(c *Capture) (string, []byte, error) {
 			return "", nil, err
 		}
 		raw, err = io.ReadAll(reader)
-		_ = reader.Close()
+		closeReader()
 		if err != nil {
 			return "", nil, err
 		}

@@ -7,19 +7,65 @@ import (
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"io"
+	"slices"
 	"strconv"
 	"sub2api-enhance/internal/pkg/response"
+	"sub2api-enhance/internal/server/middleware"
 	"sub2api-enhance/internal/sub2api"
 	"time"
 )
 
 func (h *AdminHandler) ListCaptures(c *gin.Context) {
-	_, page, size, err := listQuery(c)
+	page, size, err := paginationQuery(c)
 	if err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	result, err := h.captures.List(c.Request.Context(), page, size, c.Query("status"))
+	filter := CaptureFilter{Keyword: c.Query("keyword"), Protocol: c.Query("protocol"), SnapshotStatus: c.Query("snapshot_status"),
+		EligibilityStatus: c.Query("eligibility_status"), ProcessingStatus: c.Query("status"), ForwardingStatus: c.Query("forwarding_status")}
+	for _, field := range []struct {
+		name   string
+		target **int64
+	}{{"user_id", &filter.UserID}, {"api_key_id", &filter.APIKeyID}, {"group_id", &filter.GroupID}} {
+		if value := c.Query(field.name); value != "" {
+			id, parseErr := strconv.ParseInt(value, 10, 64)
+			if parseErr != nil || id <= 0 {
+				response.BadRequest(c, field.name+" 必须为正整数")
+				return
+			}
+			*field.target = &id
+		}
+	}
+	for _, field := range []struct {
+		name   string
+		target **time.Time
+	}{{"from", &filter.From}, {"to", &filter.To}} {
+		if value := c.Query(field.name); value != "" {
+			at, parseErr := time.Parse(time.RFC3339Nano, value)
+			if parseErr != nil {
+				response.BadRequest(c, field.name+" 必须为含时区的时间")
+				return
+			}
+			*field.target = &at
+		}
+	}
+	if filter.From != nil && filter.To != nil && !filter.From.Before(*filter.To) {
+		response.BadRequest(c, "开始时间必须早于结束时间")
+		return
+	}
+	if filter.SnapshotStatus != "" && !slices.Contains([]string{"complete", "incomplete"}, filter.SnapshotStatus) {
+		response.BadRequest(c, "原文完整性状态无效")
+		return
+	}
+	if filter.EligibilityStatus != "" && !slices.Contains([]string{"passed", "unknown", "rejected", "manual"}, filter.EligibilityStatus) {
+		response.BadRequest(c, "身份资格状态无效")
+		return
+	}
+	if filter.ProcessingStatus != "" && !slices.Contains([]string{"queued", "processing", "retry", "done", "failed", "skipped", "awaiting_review"}, filter.ProcessingStatus) {
+		response.BadRequest(c, "采集处理状态无效")
+		return
+	}
+	result, err := h.captures.List(c.Request.Context(), page, size, filter)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -167,6 +213,32 @@ func (h *AdminHandler) ReprocessCapture(c *gin.Context) {
 	}
 	response.Success(c, result)
 }
+
+func (h *AdminHandler) PreviewRecoveries(c *gin.Context) {
+	result, err := h.service.PreviewRecoveries(c.Request.Context())
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AdminHandler) CreateRecoveries(c *gin.Context) {
+	result, err := h.service.CreateRecoveries(c.Request.Context(), adminActor(c))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	counts := map[string]any{"matched_count": result.Matched, "ready_count": result.Ready}
+	for _, item := range result.Items {
+		key := item.Status + "_count"
+		count, _ := counts[key].(int)
+		counts[key] = count + 1
+	}
+	middleware.SetAuditExtra(c, counts)
+	response.Accepted(c, result)
+}
+
 func (h *AdminHandler) EnableAndReset(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {

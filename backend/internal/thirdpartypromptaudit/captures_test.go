@@ -9,11 +9,27 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
 	"sub2api-enhance/internal/sub2api"
 	"testing"
 	"time"
 )
+
+func TestCaptureAuditBodySupportsZstd(t *testing.T) {
+	body := []byte(`{"input":"zstd 正文"}`)
+	encoder, err := zstd.NewWriter(nil)
+	require.NoError(t, err)
+	compressed := encoder.EncodeAll(body, nil)
+	encoder.Close()
+	protocol, raw, err := captureAuditBody(&Capture{Raw: compressed, Protocol: "openai_responses", Format: "entity_bytes", SnapshotStatus: "complete", Metadata: map[string]string{"content_encoding": "zstd"}})
+	require.NoError(t, err)
+	require.Equal(t, "openai_responses", protocol)
+	require.Equal(t, body, raw)
+
+	_, _, err = captureAuditBody(&Capture{Raw: []byte("broken"), Protocol: "openai_responses", Format: "entity_bytes", SnapshotStatus: "complete", Metadata: map[string]string{"content_encoding": "zstd"}})
+	require.Error(t, err)
+}
 
 func TestUncertainCaptureCommitRequiresDigestConfirmation(t *testing.T) {
 	for _, match := range []bool{false, true} {
@@ -49,15 +65,33 @@ func TestCaptureListIncludesUsernameAndEmailForDisplay(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
-	mock.ExpectQuery("SELECT count\\(\\*\\) FROM sub2api_enhance.captures").WithArgs("").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery("SELECT count\\(\\*\\) FROM sub2api_enhance.captures").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	columns := []string{"id", "capture_key", "conversation_key", "transport", "protocol", "body_format", "body_sha256", "body_bytes", "snapshot_status", "eligibility_status", "processing_status", "forwarding_status", "last_error_message", "created_at", "display_username", "display_email", "user_id"}
-	mock.ExpectQuery("SELECT c.id,c.capture_key").WithArgs("", 20, 0).WillReturnRows(sqlmock.NewRows(columns).AddRow(3, "capture-3", "", "http", "responses", "entity_bytes", "sha", 12, "complete", "passed", "done", "complete", nil, time.Now(), "测试用户", "user@example.invalid", 7))
-	page, err := NewCaptureStore(db).List(context.Background(), 1, 20, "")
+	mock.ExpectQuery("SELECT c.id,c.capture_key").WithArgs(20, 0).WillReturnRows(sqlmock.NewRows(columns).AddRow(3, "capture-3", "", "http", "responses", "entity_bytes", "sha", 12, "complete", "passed", "done", "complete", nil, time.Now(), "测试用户", "user@example.invalid", 7))
+	page, err := NewCaptureStore(db).List(context.Background(), 1, 20, CaptureFilter{})
 	require.NoError(t, err)
 	require.Len(t, page.Items, 1)
 	require.Equal(t, "测试用户", page.Items[0].DisplayUsername)
 	require.Equal(t, "user@example.invalid", page.Items[0].DisplayEmail)
 	require.EqualValues(t, 7, page.Items[0].Identity.UserID)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestCaptureListAppliesIdentityProtocolAndStatusFilters(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	userID := int64(7)
+	filter := CaptureFilter{UserID: &userID, Keyword: "example", Protocol: "openai_responses", ProcessingStatus: "failed"}
+	mock.ExpectQuery(`(?s)SELECT count\(\*\).*LEFT JOIN public.api_keys`).
+		WithArgs(userID, "example", "openai_responses", "failed").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery(`(?s)SELECT c.id,c.capture_key.*c.processing_status=\$4`).
+		WithArgs(userID, "example", "openai_responses", "failed", 50, 0).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	page, err := NewCaptureStore(db).List(context.Background(), 1, 50, filter)
+	require.NoError(t, err)
+	require.Empty(t, page.Items)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
