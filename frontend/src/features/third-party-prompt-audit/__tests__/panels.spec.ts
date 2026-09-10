@@ -410,12 +410,20 @@ describe('audit overview refresh', () => {
       capture_stock: {}, forwarding_stock: {}, action_execution_stock: {}, stock: {}, oldest_waiting_at: null, waiting_for_slot: 0, cohort: {}, received: 0, reaudits_created: 0,
       formal: {}, reaudit: {}, failures: {}, current_decisions: {}, gateway: {}, gateway_latency: { count: 0, p50_ms: null, p95_ms: null }, task_latency: { count: 0, p50_ms: null, p95_ms: null },
       calls: [], evaluation_rounds: 0, reuse: { whole_lookups: 0, whole_hits: 0, segment_lookups: 0, segment_hits: 0, within_job_hits: 0, inflight_hits: 0, short_circuited_nodes: 0 },
-      segment_reuse: { reused: 18, total: 20, rate: 0.9 }, actions: {}, notification_stock: {}, delivery_stock: {}, auth_cache_stock: {}
+      segment_reuse: { reused: 18, total: 20, rate: 0.9 }, segment_reuse_by_user: [{ user_id: 2, username: 'nw', email: 'nwjump@163.com', reused: 9, total: 10, rate: 0.9 }, { user_id: 7, username: '', email: '', reused: 0, total: 0, rate: null }], actions: {}, notification_stock: {}, delivery_stock: {}, auth_cache_stock: {}
     })
     const wrapper = mount(AuditOverview)
     await flushPromises()
     expect(wrapper.text()).toContain('globalSegmentReuseRate')
     expect(wrapper.text()).toContain('90% 18 / 20')
+    expect(wrapper.text()).toContain('userSegmentReuseRate')
+    expect(wrapper.text()).toContain('(#2)nw')
+    expect(wrapper.text()).toContain('nwjump@163.com')
+    const users = wrapper.get('[data-test="user-segment-reuse"]').text()
+    expect(users).toContain('90%')
+    expect(users).toContain('9 / 10')
+    expect(users).toContain('(#7)')
+    expect(users).toContain('0 / 0')
     wrapper.unmount()
   })
   it('moves the end time to now before reloading all overview data', async () => {

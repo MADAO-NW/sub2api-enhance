@@ -230,6 +230,7 @@ export default {
     "segmentReuse": "L1: reused / looked-up fragment uses",
     "segmentReuseRate": "Segment reuse rate",
     "globalSegmentReuseRate": "Global segment reuse rate in the current filter",
+    "userSegmentReuseRate": "Segment reuse rate by user",
     "withinJob": "Within-job fragment reuse",
     "inflightReuse": "Global in-flight reuse",
     "shortCircuitedNodes": "Nodes skipped after aggregation",

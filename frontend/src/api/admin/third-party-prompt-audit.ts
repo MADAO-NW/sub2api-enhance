@@ -79,6 +79,7 @@ export interface ModelResult {
   segments: { order: number; source_path: string; reuse_kind: string; result: Score & { id: number; source_role: string; policy_role: string; turn_scope: string } }[]
 }
 export interface SegmentReuse { reused: number; total: number; rate: number | null }
+export interface UserSegmentReuse extends SegmentReuse { user_id: number; username: string; email: string }
 export interface Outcome { id: number; job_id: number; user_id: number; audit_round: number; run_kind: 'request' | 'reaudit'; requested_by: number | null; reuse_mode: 'allow' | 'force'; config_snapshot?: AuditConfig & { revision: number }; decision: AuditDecision; models: ModelResult[]; partial_failure: boolean; enforcement_eligible: boolean; source_outcome_id?: number; started_at: string | null; finished_at: string | null; duration_ms: number | null; created_at: string; decision_config?: DecisionConfig; segment_reuse: SegmentReuse }
 export interface LatestUserContent { content: string | null; unavailable_reason: string }
 export interface AuditJob {
@@ -170,7 +171,7 @@ export interface AuditStats extends StatsQuery {
   received: number; reaudits_created: number; formal: Record<string, number>; reaudit: Record<string, number>; failures: Record<string, number>
   current_decisions: Record<string, number>; gateway: Record<string, number>; gateway_latency: Distribution; task_latency: Distribution
   calls: { model_id: string; call_kind: string; stage: string; total: number; http_success: number; valid_result: number; failed: number; unknown: number; in_flight: number; errors: Record<string, number>; latency: Distribution }[]
-  evaluation_rounds: number; reuse: Reuse; segment_reuse: SegmentReuse; actions: Record<string, number>; notification_stock: Record<string, number>; delivery_stock: Record<string, number>; auth_cache_stock: Record<string, number>
+  evaluation_rounds: number; reuse: Reuse; segment_reuse: SegmentReuse; segment_reuse_by_user: UserSegmentReuse[]; actions: Record<string, number>; notification_stock: Record<string, number>; delivery_stock: Record<string, number>; auth_cache_stock: Record<string, number>
 }
 
 const base = '/admin/third-party-prompt-audit'

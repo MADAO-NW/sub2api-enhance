@@ -230,6 +230,7 @@ export default {
     "segmentReuse": "L1：片段复用 / 查找使用数",
     "segmentReuseRate": "片段复用率",
     "globalSegmentReuseRate": "当前筛选范围全局片段复用率",
+    "userSegmentReuseRate": "每用户片段复用率",
     "withinJob": "同任务内片段去重",
     "inflightReuse": "全库并发复用",
     "shortCircuitedNodes": "聚合提前结束节点",
