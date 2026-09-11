@@ -230,14 +230,22 @@ func TestLatestUserContentReturnsTheCurrentUserTurn(t *testing.T) {
 	require.Empty(t, result.UnavailableReason)
 }
 
-func TestLatestUserContentKeepsAllCurrentTaskUserItemsInOrder(t *testing.T) {
+func TestLatestUserContentExcludesEarlierCurrentUserItems(t *testing.T) {
 	snapshot, err := CaptureInput("openai_responses", []byte(`{"input":[{"role":"user","content":"history"},{"role":"assistant","content":"answer"},{"role":"user","content":"current-a"},{"role":"user","content":[{"type":"input_text","text":"current-b"}]}]}`))
 	require.NoError(t, err)
 	result := latestUserContent(snapshot)
-	require.Equal(t, 2, result.CombinedCount)
+	require.Equal(t, 1, result.FragmentCount)
+	require.Len(t, result.Items, 1)
+	require.Equal(t, "current-b", *result.Content)
+}
+
+func TestLatestUserContentKeepsTextFragmentsFromOneLogicalMessage(t *testing.T) {
+	snapshot, err := CaptureInput("anthropic_messages", []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"前半部"},{"type":"tool_result","tool_use_id":"call_1","content":"工具结果"},{"type":"text","text":"后半部"}]}]}`))
+	require.NoError(t, err)
+	result := latestUserContent(snapshot)
+	require.Equal(t, 2, result.FragmentCount)
 	require.Len(t, result.Items, 2)
-	require.Equal(t, "current-a\n\ncurrent-b", *result.Content)
-	require.Less(t, result.Items[0].Order, result.Items[1].Order)
+	require.Equal(t, "前半部\n\n后半部", *result.Content)
 }
 
 func TestLatestUserContentDoesNotFallBackToAnotherRole(t *testing.T) {

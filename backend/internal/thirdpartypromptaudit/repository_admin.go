@@ -29,6 +29,7 @@ type OutcomeView struct {
 	DecisionConfig *DecisionConfig   `json:"decision_config,omitempty"`
 	SegmentReuse   SegmentReuseView  `json:"segment_reuse"`
 	TargetReuse    TargetReuseView   `json:"target_reuse"`
+	AuditTargets   AuditStageTargets `json:"audit_targets,omitempty"`
 }
 
 type SegmentReuseView struct {
@@ -258,17 +259,19 @@ func (r *Repository) ListJobs(ctx context.Context, filter Filter, page, pageSize
 }
 
 type JobDetail struct {
-	InputJSON   string                  `json:"input_json"`
-	InputParts  []Segment               `json:"input_parts"`
-	AuditTarget *auditTarget            `json:"audit_target,omitempty"`
-	NonText     []NonTextInput          `json:"non_text"`
-	Job         *Job                    `json:"job"`
-	Outcome     *OutcomeView            `json:"outcome"`
-	Rounds      []*OutcomeView          `json:"rounds"`
-	Attempts    []ModelAttempt          `json:"attempts"`
-	Actions     []Action                `json:"actions"`
-	Enforcement *EnforcementExplanation `json:"enforcement,omitempty"`
+	InputJSON    string                  `json:"input_json"`
+	InputParts   []Segment               `json:"input_parts"`
+	AuditTargets AuditStageTargets       `json:"audit_targets,omitempty"`
+	NonText      []NonTextInput          `json:"non_text"`
+	Job          *Job                    `json:"job"`
+	Outcome      *OutcomeView            `json:"outcome"`
+	Rounds       []*OutcomeView          `json:"rounds"`
+	Attempts     []ModelAttempt          `json:"attempts"`
+	Actions      []Action                `json:"actions"`
+	Enforcement  *EnforcementExplanation `json:"enforcement,omitempty"`
 }
+
+type AuditStageTargets map[string]auditEnvelope
 
 type EnforcementExplanation struct {
 	Role                  string `json:"role"`
@@ -293,11 +296,18 @@ func (r *Repository) JobDetail(ctx context.Context, id int64) (*JobDetail, error
 		}
 		result.InputJSON = string(raw)
 		result.NonText = job.FullInput.NonText
-		if parts, err := ExtractSegments(job.FullInput, job.Config.AuditScope); err == nil {
-			result.InputParts = parts
+		displayJob := *job
+		target, targetErr := prepareTargetForContract(&displayJob, job.Config.ContractVersion)
+		if targetErr == nil {
+			result.AuditTargets = auditStageTargets(target)
 		}
-		if target, err := prepareTarget(job); err == nil {
-			result.AuditTarget = &target
+		if parts, extractErr := ExtractSegments(job.FullInput, "full_request"); extractErr == nil {
+			for i := range parts {
+				if i < len(displayJob.Manifest) {
+					parts[i].SegmentMeta = displayJob.Manifest[i]
+				}
+			}
+			result.InputParts = parts
 		}
 	}
 	outcome, err := r.GetOutcome(ctx, id)
@@ -305,6 +315,13 @@ func (r *Repository) JobDetail(ctx context.Context, id int64) (*JobDetail, error
 		return nil, err
 	}
 	result.Outcome = outcomeView(outcome, job.DecisionConfig)
+	if result.Outcome != nil && job.FullInput != nil {
+		outcomeJob := *job
+		outcomeJob.Config = outcome.Config
+		if target, err := prepareTargetForContract(&outcomeJob, outcome.Config.ContractVersion); err == nil {
+			result.Outcome.AuditTargets = auditStageTargets(target)
+		}
+	}
 	job.Outcome = result.Outcome
 	roundRows, err := r.db.QueryContext(ctx, `SELECT id FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1 ORDER BY audit_round DESC,id DESC`, job.ID)
 	if err != nil {
@@ -331,7 +348,15 @@ func (r *Repository) JobDetail(ctx context.Context, id int64) (*JobDetail, error
 		if err != nil {
 			return nil, err
 		}
-		result.Rounds = append(result.Rounds, outcomeView(round, nil))
+		roundView := outcomeView(round, nil)
+		if job.FullInput != nil {
+			roundJob := *job
+			roundJob.Config = round.Config
+			if target, err := prepareTargetForContract(&roundJob, round.Config.ContractVersion); err == nil {
+				roundView.AuditTargets = auditStageTargets(target)
+			}
+		}
+		result.Rounds = append(result.Rounds, roundView)
 		if round.AuditRound == 1 {
 			decision := round.Decision
 			job.OriginalDecision = &decision
@@ -350,6 +375,19 @@ func (r *Repository) JobDetail(ctx context.Context, id int64) (*JobDetail, error
 		return nil, err
 	}
 	return result, nil
+}
+
+// auditStageTargets 把冻结的结构化输入展开为模型各阶段的实际 user 消息目标。
+func auditStageTargets(target auditTarget) AuditStageTargets {
+	current := messageBundle{Protocol: target.Protocol, Messages: target.CurrentUser}
+	result := AuditStageTargets{TargetKindCurrentUser: {Stage: TargetKindCurrentUser, Target: current}}
+	if len(target.InstructionContext) == 0 {
+		return result
+	}
+	instructions := messageBundle{Protocol: target.Protocol, Messages: target.InstructionContext}
+	result[TargetKindInstructionContext] = auditEnvelope{Stage: TargetKindInstructionContext, Target: instructions}
+	result[TargetKindIntentBinding] = auditEnvelope{Stage: TargetKindIntentBinding, Target: intentBindingTarget{CurrentUser: current, InstructionContext: instructions}}
+	return result
 }
 
 // enforcementExplanation 使用当前处置规则和已持久化状态解释最新结论为何触发或未触发账号动作。

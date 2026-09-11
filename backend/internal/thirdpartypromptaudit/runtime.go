@@ -99,12 +99,16 @@ type RuntimeSnapshot struct {
 	EvaluationLatency      LatencySummary           `json:"evaluation_latency"`
 	Probes                 []ProbeResult            `json:"probes"`
 	Scheduler              schedulerRuntimeSnapshot `json:"scheduler"`
+	Redis                  RedisRuntime              `json:"redis"`
 }
 
 func (s *Service) Runtime(ctx context.Context) RuntimeSnapshot {
 	result := RuntimeSnapshot{InstanceID: s.metrics.InstanceID, StartedAt: s.metrics.StartedAt, AsOf: time.Now().UTC(), Running: s.running.Load(), Mode: s.config.EffectiveMode(),
 		ActiveWorkers: s.active.Load(), InputPersistFailures: s.metrics.IntakeFailures.Load(), Probes: []ProbeResult{}}
 	result.WorkerCapacity = s.config.WorkerCapacity()
+	if s.redis != nil {
+		result.Redis = s.redis.Runtime()
+	}
 	result.WorkerPool = s.repo.db.Stats()
 	s.config.mu.RLock()
 	result.ExpectedRevision = s.config.expectedRevision

@@ -53,6 +53,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 		return nil, err
 	}
 	configuredRules := current.Config
+	currentlyExcluded := slices.Contains(current.ExcludedUserIDs, job.UserID)
 	current.Config = effectiveConfigForUser(current.Config, job.UserID)
 	var priorDecision Decision
 	priorErr := tx.QueryRowContext(ctx, `SELECT decision FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1 ORDER BY audit_round DESC,id DESC LIMIT 1`, job.ID).Scan(&priorDecision)
@@ -101,7 +102,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 	runKind := job.auditRunKind()
 	firstRecoveryOutcome := runKind == "reaudit" && errors.Is(priorErr, sql.ErrNoRows)
 	cloned.EnforcementEligible = job.IngressStage != "manual_capture_reprocess" && eligible &&
-		((runKind == "request" && (job.ExecutionMode == "async" || foreground)) || firstRecoveryOutcome) && current.Mode != "off"
+		((runKind == "request" && (job.ExecutionMode == "async" || foreground)) || firstRecoveryOutcome) && current.Mode != "off" && !currentlyExcluded
 	outcome := &Outcome{JobID: job.ID, UserID: job.UserID, ReuseMode: job.ReuseMode, Evaluation: *cloned}
 	models, err := json.Marshal(cloned.Models)
 	if err != nil {
@@ -154,7 +155,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 
 	before := state
 	window := make([]Decision, 0)
-	canonicalEligible := outcome.EnforcementEligible || (runKind == "reaudit" && originalEligible)
+	canonicalEligible := !currentlyExcluded && (outcome.EnforcementEligible || (runKind == "reaudit" && originalEligible))
 	if canonicalEligible {
 		ruleHash, err := warningRuleHash(configuredRules, current.WarningRuleRevision, job.UserID)
 		if err != nil {
@@ -254,6 +255,11 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
+	}
+	if r.redis != nil && !outcome.PartialFailure && outcome.SourceOutcomeID == nil && job.EvaluationHash != "" && job.TargetHash != "" {
+		cacheCtx, cacheCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
+		_ = r.redis.SaveWhole(cacheCtx, *outcome, job.EvaluationHash, job.TargetHash)
+		cacheCancel()
 	}
 	resultName := map[Decision]string{DecisionPass: "通过", DecisionReview: "待复核", DecisionBlock: "违规"}[outcome.Decision]
 	logger.LegacyPrintf("third_party_prompt_audit", "审核分类已提交：%s job_id=%d outcome_id=%d decision=%s state_transition=%s", resultName, job.ID, outcome.ID, outcome.Decision, string(transition))

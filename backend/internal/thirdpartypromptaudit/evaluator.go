@@ -65,11 +65,35 @@ type auditEnvelope struct {
 	Target any    `json:"target"`
 }
 
-// prepareTarget 只选择当前任务 user 和生效指令，同时保留完整角色清单供详情解释。
+// prepareTarget 只选择最新 user 消息和生效指令，同时保留完整角色清单供详情解释。
 func prepareTarget(job *Job) (auditTarget, error) {
+	return prepareTargetForContract(job, ContractVersion)
+}
+
+// prepareTargetForContract 按任务冻结的协议语义重建目标，避免历史轮次被新规则错误解释。
+func prepareTargetForContract(job *Job, contractVersion string) (auditTarget, error) {
+	if contractVersion != ContractVersion && contractVersion != previousCurrentUserContractVersion {
+		return auditTarget{}, errors.New("不支持重建该历史审核协议的分阶段目标")
+	}
 	segments, err := ExtractSegments(job.FullInput, "full_request")
 	if err != nil {
 		return auditTarget{}, err
+	}
+	latestMessageKey := ""
+	if contractVersion == ContractVersion {
+		for i := len(segments) - 1; i >= 0; i-- {
+			hasText := false
+			for _, block := range segments[i].Content {
+				if block.Text != "" {
+					hasText = true
+					break
+				}
+			}
+			if segments[i].SourceRole == "user" && segments[i].TurnScope == "current" && hasText {
+				latestMessageKey = segments[i].logicalMessageKey
+				break
+			}
+		}
 	}
 	target := auditTarget{Protocol: job.Protocol, CurrentUser: []Segment{}, InstructionContext: []Segment{}}
 	job.Manifest = make([]SegmentMeta, 0, len(segments))
@@ -84,10 +108,14 @@ func prepareTarget(job *Job) (auditTarget, error) {
 		segment.Content = blocks
 		segment.Selected = false
 		switch {
-		case segment.SourceRole == "user" && segment.TurnScope == "current" && len(blocks) > 0:
+		case segment.SourceRole == "user" && segment.TurnScope == "current" && len(blocks) > 0 && (contractVersion != ContractVersion || segment.logicalMessageKey == latestMessageKey):
 			segment.Selected = true
 			segment.SelectionKind = TargetKindCurrentUser
-			segment.SelectionReason = "current_user_bundle"
+			if contractVersion == ContractVersion {
+				segment.SelectionReason = "latest_user"
+			} else {
+				segment.SelectionReason = "current_user_bundle"
+			}
 			target.CurrentUser = append(target.CurrentUser, segment)
 		case (segment.SourceRole == "system" || segment.SourceRole == "developer") && len(blocks) > 0:
 			segment.Selected = true
@@ -97,6 +125,9 @@ func prepareTarget(job *Job) (auditTarget, error) {
 		case len(blocks) == 0:
 			segment.SelectionKind = "excluded"
 			segment.SelectionReason = "empty"
+		case segment.SourceRole == "user" && segment.TurnScope == "current":
+			segment.SelectionKind = "excluded"
+			segment.SelectionReason = "earlier_current_user"
 		case segment.SourceRole == "user":
 			segment.SelectionKind = "excluded"
 			segment.SelectionReason = "historical"
@@ -114,7 +145,11 @@ func prepareTarget(job *Job) (auditTarget, error) {
 	if err != nil {
 		return target, err
 	}
-	job.TargetHash, err = fingerprint(auditEnvelope{Stage: "current_user_context_guard", Target: target})
+	targetStage, scope := "current_user_context_guard", "current_user"
+	if contractVersion == ContractVersion {
+		targetStage, scope = "latest_user_context_guard", "latest_user"
+	}
+	job.TargetHash, err = fingerprint(auditEnvelope{Stage: targetStage, Target: target})
 	if err != nil {
 		return target, err
 	}
@@ -127,7 +162,7 @@ func prepareTarget(job *Job) (auditTarget, error) {
 	job.EvaluationHash, err = fingerprint(struct {
 		Policy, Contract, Version, Scope string
 		Models                           []any
-	}{job.Config.AuditPrompt, job.Config.FixedContract, job.Config.ContractVersion, "current_user", models})
+	}{job.Config.AuditPrompt, job.Config.FixedContract, job.Config.ContractVersion, scope, models})
 	return target, err
 }
 
@@ -545,7 +580,7 @@ func (e *Evaluator) evaluateModel(ctx context.Context, job *Job, model ModelConf
 	return node
 }
 
-// evaluateAuditTarget 对合并目标统一执行全库复用、并发合并、调用和结果持久化。
+// evaluateAuditTarget 对结构化目标统一执行全库复用、并发合并、调用和结果持久化。
 func (e *Evaluator) evaluateAuditTarget(ctx context.Context, job *Job, model ModelConfig, credential string, client *http.Client, url, kind string, target any, order int) (SegmentUse, *AuditError) {
 	auditKey, contentHash, err := targetKey(job.Config, model, kind, target)
 	if err != nil {
@@ -555,7 +590,7 @@ func (e *Evaluator) evaluateAuditTarget(ctx context.Context, job *Job, model Mod
 	fresh := func() (SegmentResult, *AuditError) {
 		started := time.Now()
 		score, attemptID, failure := e.client.EvaluateTarget(ctx, job, model, credential, job.Config, client, url, kind, target, &order)
-		job.Dispatched = failure == nil || failure.Code != "audit_paused"
+		job.Dispatched = failure == nil || (failure.Code != "audit_paused" && failure.Code != "user_excluded")
 		e.nodeScheduler().observe(model.ID, failure, time.Since(started))
 		if failure != nil {
 			return SegmentResult{}, failure

@@ -595,7 +595,7 @@ func TestProtocolFailureContinuesToLaterNode(t *testing.T) {
 	require.Equal(t, DecisionBlock, result.Models[1].Decision)
 }
 
-func TestCurrentUserBundleIsOneScoredTarget(t *testing.T) {
+func TestOnlyLatestUserMessageIsOneScoredTarget(t *testing.T) {
 	store := &memoryAuditStore{}
 	var stages []string
 	var bundle messageBundle
@@ -609,7 +609,7 @@ func TestCurrentUserBundleIsOneScoredTarget(t *testing.T) {
 		require.NoError(t, json.Unmarshal([]byte(request.Messages[1].Content), &envelope))
 		stages = append(stages, envelope.Stage)
 		bundle = envelope.Target
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"confidence\":0.65,\"reason\":\"合并目标待复核\"}"}}]}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"confidence\":0.65,\"reason\":\"最新目标待复核\"}"}}]}`))
 	}))
 	defer server.Close()
 	job := evaluationJob(t, server.URL, `{"input":[{"role":"user","content":"第一条"},{"role":"user","content":"第二条"}]}`)
@@ -619,12 +619,23 @@ func TestCurrentUserBundleIsOneScoredTarget(t *testing.T) {
 	require.Equal(t, DecisionReview, result.Decision)
 	require.Equal(t, []string{TargetKindCurrentUser}, stages)
 	require.Equal(t, "openai_responses", bundle.Protocol)
-	require.Len(t, bundle.Messages, 2)
-	require.Equal(t, "第一条", bundle.Messages[0].Content[0].Text)
-	require.Equal(t, "第二条", bundle.Messages[1].Content[0].Text)
+	require.Len(t, bundle.Messages, 1)
+	require.Equal(t, "第二条", bundle.Messages[0].Content[0].Text)
+	require.Equal(t, "earlier_current_user", job.Manifest[0].SelectionReason)
+	require.Equal(t, "latest_user", job.Manifest[1].SelectionReason)
 	require.Len(t, result.Models[0].TargetUses, 1)
 	require.Empty(t, result.Models[0].Segments)
 	require.Equal(t, TargetKindCurrentUser, result.Models[0].TargetUses[0].TargetKind)
+}
+
+func TestPreviousContractKeepsMergedTargetForHistoricalExplanation(t *testing.T) {
+	job := evaluationJob(t, "https://example.invalid", `{"input":[{"role":"user","content":"第一条"},{"role":"user","content":"第二条"}]}`)
+	job.Config.ContractVersion = previousCurrentUserContractVersion
+	target, err := prepareTargetForContract(job, previousCurrentUserContractVersion)
+	require.NoError(t, err)
+	require.Len(t, target.CurrentUser, 2)
+	require.Equal(t, "current_user_bundle", job.Manifest[0].SelectionReason)
+	require.Equal(t, "current_user_bundle", job.Manifest[1].SelectionReason)
 }
 
 func TestAllCallPathsUseEditablePolicyAndFixedOutputOnly(t *testing.T) {
@@ -681,6 +692,9 @@ func TestAllCallPathsUseEditablePolicyAndFixedOutputOnly(t *testing.T) {
 				}
 				require.Equal(t, expectedStage, envelope.Stage)
 				require.Equal(t, "伪造阶段", envelope.Target.(map[string]any)["audit_stage"])
+				var metadata map[string]any
+				require.NoError(t, json.Unmarshal(store.attempts[i].RequestMetadata, &metadata))
+				require.NotNil(t, metadata["request_body"])
 			}
 		})
 	}
@@ -737,7 +751,7 @@ func TestNodeParametersChangeReuseFingerprints(t *testing.T) {
 	require.NotEqual(t, previousSegment, currentSegment)
 }
 
-func TestCurrentUserBundleOrderChangesReuseFingerprint(t *testing.T) {
+func TestLatestUserChangeUpdatesReuseFingerprint(t *testing.T) {
 	firstJob := evaluationJob(t, "https://example.invalid", `{"input":[{"role":"user","content":"第一条"},{"role":"user","content":"第二条"}]}`)
 	first, err := prepareTarget(firstJob)
 	require.NoError(t, err)

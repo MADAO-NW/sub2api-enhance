@@ -39,11 +39,20 @@ beforeEach(() => {
   mocks.probe.mockResolvedValue({ ok: true, model_id: 'a', result: { confidence: 0.1, reason: 'normal' }, tested_at: '2026-09-06T00:00:00Z' })
   mocks.stats.mockResolvedValue(null)
   mocks.runtime.mockResolvedValue(null)
-  mocks.jobLatestUserContent.mockResolvedValue({ content: 'latest user text', items: [{ order: 1, source_path: '$.input', content: 'latest user text' }], combined_count: 1, unavailable_reason: '' })
+  mocks.jobLatestUserContent.mockResolvedValue({ content: 'latest user text', items: [{ order: 1, source_path: '$.input', content: 'latest user text' }], fragment_count: 1, unavailable_reason: '' })
   mocks.captureLatestUserContent.mockResolvedValue({ content: 'captured user text', unavailable_reason: '' })
 })
 
 describe('third-party audit configuration', () => {
+	it('collapses saved model cards and supports bulk expansion', async () => {
+		const wrapper = mount(AuditConfigPanel); await flushPromises()
+		expect(wrapper.get('[data-test="model-card"]').attributes('open')).toBeUndefined()
+		expect(wrapper.findAll('button').some(button => button.text() === 'expandAll')).toBe(true)
+		await wrapper.findAll('button').find(button => button.text() === 'expandAll')!.trigger('click')
+		await flushPromises()
+		expect(wrapper.get('[data-test="model-card"]').attributes('open')).toBeDefined()
+		wrapper.unmount()
+	})
   it('edits all rules together, uses the server timeout default and removes unsupported model parameters', async () => {
     const wrapper = mount(AuditConfigPanel); await flushPromises()
     expect(wrapper.text()).not.toContain('fixed roles')
@@ -297,7 +306,7 @@ describe('third-party audit records', () => {
     expect(mocks.capture).toHaveBeenCalledWith(4)
     wrapper.unmount()
   })
-  it('shows live identity order, merged user count, and the latest outcome target reuse rate', async () => {
+  it('shows live identity order, latest user fragments, request id, and the latest outcome target reuse rate', async () => {
     const job = { id: 9, user_id: 2, display_username: 'nw', display_email: 'nwjump@163.com', current_run_kind: 'request', identity: { api_key_name: 'nw', group_name: 'openai' }, status: 'done', snapshot_status: 'complete', attempts: 1, max_attempts: 3, current_user_count: 2,
       outcome: { decision: 'pass', models: [], segment_reuse: { reused: 18, total: 20, rate: 0.9 } } } as unknown as AuditJob
     mocks.jobs.mockResolvedValue({ items: [job], total: 1 })
@@ -305,7 +314,8 @@ describe('third-party audit records', () => {
     await flushPromises()
     expect(wrapper.text()).toContain('(#2)nw')
     expect(wrapper.text()).toContain('nwjump@163.com')
-    expect(wrapper.text()).toContain('currentUserMessages: 2 userItemsUnit · mergedAudit')
+    expect(wrapper.text()).toContain('latestUserFragments: 2 userItemsUnit')
+    expect(wrapper.text()).toContain('requestID:')
     expect(wrapper.text()).toContain('segmentReuseRate 90% 18 / 20')
     wrapper.unmount()
   })
@@ -339,12 +349,37 @@ describe('lossless full input', () => {
     expect(wrapper.text()).not.toContain('9007199254740992')
     wrapper.unmount()
   })
+  it('shows parsed prompts, node targets, and the exact persisted model request', async () => {
+    const currentTarget = { audit_stage: 'current_user', target: { protocol: 'responses', messages: [{ source_role: 'user', content: [{ text: '最新需求' }] }] } }
+    mocks.job.mockResolvedValue({
+      job: { id: 1, request_id: 'request-1', identity: {}, status: 'done', snapshot_status: 'complete', config_snapshot: {} },
+      outcome: { decision: 'pass', models: [{ model_id: 'node', model_name: 'Node', basis: 'current_user', confidence: 0.1, reason: '正常', reused: false, segments: [], target_uses: [{ order: 1, source_path: 'current_user', target_kind: 'current_user', reuse_kind: 'fresh', result: { id: 2, confidence: 0.1, reason: '正常' } }] }], decision_config: {}, audit_targets: { current_user: currentTarget } },
+      audit_targets: { current_user: currentTarget }, input_json: '{}', input_parts: [{ order: 1, source_path: '$.input[1].content', source_role: 'user', policy_role: 'user', turn_scope: 'current', selected: true, selection_reason: 'latest_user', content: [{ type: 'text', text: '最新需求', source_path: '$.input[1].content' }] }], non_text: [], rounds: [], actions: [],
+      attempts: [{ id: 3, job_id: 1, audit_round: 1, evaluation_round: 1, model_id: 'node', model_snapshot: { name: 'Node' }, stage: 'current_user', status: 'succeeded', request_metadata: { request_body: { model: 'test', messages: [{ role: 'system', content: '审核政策' }, { role: 'user', content: JSON.stringify(currentTarget) }] } }, raw_response: '{"confidence":0.1,"reason":"正常"}' }]
+    })
+    const wrapper = mount(AuditDetail, { props: { id: 1 }, global: { stubs } })
+    await flushPromises()
+    expect(wrapper.text()).toContain('parsedPrompts')
+    expect(wrapper.text()).toContain('最新需求')
+    expect(wrapper.text()).toContain('auditedContent')
+    expect(wrapper.text()).toContain('actualModelRequest')
+    expect(wrapper.text()).toContain('审核政策')
+    expect(wrapper.text()).toContain('requestID: request-1')
+    wrapper.unmount()
+  })
   it('renders captured UTF-8 bytes directly in the web view', () => {
     const original = '{"input":"原始请求"}'
     const wrapper = mount(CaptureBody, { props: { capture: { id: 2, capture_key: 'c', transport: 'http', protocol: 'responses', body_format: 'entity_bytes', raw_body: btoa(unescape(encodeURIComponent(original))), body_bytes: original.length, body_sha256: 'sha', snapshot_status: 'complete', eligibility_status: 'passed', processing_status: 'done', forwarding_status: 'complete', forwarding_observations: [{ status: 'complete', http_status: 200 }], created_at: '2026-09-06T00:00:00Z', last_error_message: '' } } })
     expect(wrapper.text()).toContain(original)
     expect(wrapper.text()).toContain('forwarding_complete')
     expect(wrapper.text()).toContain('http_status')
+    wrapper.unmount()
+  })
+  it('shows why capture identity eligibility was rejected', () => {
+    const wrapper = mount(CaptureBody, { props: { capture: { id: 2, capture_key: 'c', transport: 'http', protocol: 'media', body_format: 'entity_bytes', raw_body: btoa('{}'), body_bytes: 2, body_sha256: 'sha', snapshot_status: 'complete', eligibility_status: 'rejected', processing_status: 'skipped', forwarding_status: 'complete', identity: { user_id: 0, eligibility: 'rejected', reason: '凭据或用户不存在' }, created_at: '2026-09-06T00:00:00Z', last_error_message: '' } } })
+    expect(wrapper.text()).toContain('eligibilityStatus')
+    expect(wrapper.text()).toContain('eligibilityReason')
+    expect(wrapper.text()).toContain('凭据或用户不存在')
     wrapper.unmount()
   })
   it('requeues the same job for a new audit round and exposes it for global refresh', async () => {

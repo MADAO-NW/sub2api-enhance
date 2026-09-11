@@ -2,13 +2,14 @@ package thirdpartypromptaudit
 
 import (
 	"context"
+	"errors"
 	"strings"
 )
 
 type LatestUserContent struct {
 	Content           *string                  `json:"content"`
 	Items             []CurrentUserContentItem `json:"items"`
-	CombinedCount     int                      `json:"combined_count"`
+	FragmentCount     int                      `json:"fragment_count"`
 	UnavailableReason string                   `json:"unavailable_reason"`
 }
 
@@ -18,18 +19,19 @@ type CurrentUserContentItem struct {
 	Content    string `json:"content"`
 }
 
-// latestUserContent 返回本次审核使用的全部当前任务 user 文本，保留旧接口名称。
+// latestUserContent 返回本次审核使用的最新 user 消息文本，保留旧接口名称。
 func latestUserContent(snapshot *InputSnapshot) LatestUserContent {
-	segments, err := ExtractSegments(snapshot, "full_request")
+	target, err := prepareTarget(&Job{Protocol: snapshot.Protocol, FullInput: snapshot, Config: ConfigSnapshot{ContractVersion: ContractVersion}})
 	if err != nil {
-		return LatestUserContent{Items: []CurrentUserContentItem{}, UnavailableReason: "input_unavailable"}
+		reason := "input_unavailable"
+		if errors.Is(err, ErrNoText) {
+			reason = "current_user_not_found"
+		}
+		return LatestUserContent{Items: []CurrentUserContentItem{}, UnavailableReason: reason}
 	}
 	result := LatestUserContent{Items: []CurrentUserContentItem{}}
 	combined := make([]string, 0)
-	for _, segment := range segments {
-		if segment.SourceRole != "user" || segment.TurnScope != "current" {
-			continue
-		}
+	for _, segment := range target.CurrentUser {
 		parts := make([]string, 0, len(segment.Content))
 		for _, block := range segment.Content {
 			if block.Text != "" {
@@ -42,12 +44,8 @@ func latestUserContent(snapshot *InputSnapshot) LatestUserContent {
 			combined = append(combined, content)
 		}
 	}
-	if len(combined) == 0 {
-		result.UnavailableReason = "current_user_not_found"
-		return result
-	}
 	content := strings.Join(combined, "\n\n")
-	result.Content, result.CombinedCount = &content, len(result.Items)
+	result.Content, result.FragmentCount = &content, len(result.Items)
 	return result
 }
 

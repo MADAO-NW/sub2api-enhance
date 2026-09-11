@@ -251,3 +251,21 @@ func TestCapacityDeferralReleasesLeaseAndRollsBackExecutionCount(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestExcludedUserSkipEndsUndispatchedJobWithoutConsumingAttempt(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	mock.ExpectBegin()
+	mock.ExpectExec(`status='failed',error_code='user_excluded'`).
+		WithArgs(int64(7), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`status='skipped',attempts=GREATEST\(0,attempts-1\)`).
+		WithArgs(int64(7), int64(3), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	repo := NewRepository(db)
+	err = repo.SkipExcluded(context.Background(), &Job{ID: 7, ClaimGeneration: 3})
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}

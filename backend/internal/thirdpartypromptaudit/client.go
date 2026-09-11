@@ -28,10 +28,16 @@ type ModelClient struct {
 	publicOrigin string
 	attempts     AttemptStore
 	allowAudit   func() bool
+	allowJob     func(*Job) error
 }
 
 func NewModelClient(repository *Repository, config *ConfigManager) *ModelClient {
-	return &ModelClient{publicOrigin: config.publicOrigin, attempts: repository, allowAudit: func() bool { return config.EffectiveMode() != "off" }}
+	return &ModelClient{publicOrigin: config.publicOrigin, attempts: repository, allowAudit: func() bool { return config.EffectiveMode() != "off" }, allowJob: func(job *Job) error {
+		if job != nil && !job.Dispatched && job.IngressStage != "manual_capture_reprocess" && job.CurrentRequestedBy == nil && config.IsExcluded(job.UserID) {
+			return ErrUserExcluded
+		}
+		return nil
+	}}
 }
 
 type chatMessage struct {
@@ -96,6 +102,11 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 	if (job != nil || automaticHealthProbe) && c.allowAudit != nil && !c.allowAudit() {
 		return nil, 0, persistenceFailure(ErrAuditPaused, "audit_paused")
 	}
+	if job != nil && c.allowJob != nil {
+		if err := c.allowJob(job); err != nil {
+			return nil, 0, persistenceFailure(err, "user_excluded")
+		}
+	}
 	auditStage := ruleStage
 	if auditStage == "probe" || auditStage == "health_probe" {
 		auditStage = TargetKindCurrentUser
@@ -115,7 +126,7 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 	if err != nil {
 		return nil, 0, &AuditError{Code: "request_encode_failed", Stage: "model_request", Message: err.Error()}
 	}
-	metadata := map[string]any{"stage": ruleStage, "segment_order": order, "repair_of_attempt_id": repairOf, "model": model, "contract_version": snapshot.ContractVersion}
+	metadata := map[string]any{"stage": ruleStage, "segment_order": order, "repair_of_attempt_id": repairOf, "model": model, "contract_version": snapshot.ContractVersion, "request_body": request}
 	metadata["audit_stage"] = auditStage
 	attempt := &ModelAttempt{ModelID: model.ID, ModelSnapshot: model, Stage: callStage, SegmentOrder: order, RepairOfAttemptID: repairOf, Status: "prepared"}
 	if job == nil {
@@ -123,7 +134,6 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 		if automatic, _ := ctx.Value(healthProbeContext).(bool); automatic {
 			attempt.CallKind = "health_probe"
 		}
-		metadata["request_body"] = request
 		metadata["actor_user_id"] = ctx.Value(probeActorContext)
 	} else {
 		attempt.JobID = &job.ID
@@ -140,6 +150,11 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 	if err := c.attempts.PrepareAttempt(ctx, job, attempt); err != nil {
 		return nil, 0, persistenceFailure(err, "attempt_prepare_failed")
 	}
+	if job != nil && c.allowJob != nil {
+		if err := c.allowJob(job); err != nil {
+			return nil, attempt.ID, persistenceFailure(err, "user_excluded")
+		}
+	}
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, attempt.ID, &AuditError{Code: "request_invalid", Stage: "model_request", Message: err.Error()}
@@ -151,6 +166,9 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 	}
 	if err := c.attempts.StartAttempt(ctx, job, attempt); err != nil {
 		return nil, attempt.ID, persistenceFailure(err, "attempt_start_failed")
+	}
+	if job != nil {
+		job.Dispatched = true
 	}
 	started := time.Now()
 	response, callErr := client.Do(httpRequest)
@@ -225,6 +243,9 @@ func persistenceFailure(err error, code string) *AuditError {
 	}
 	if errors.Is(err, ErrAuditPaused) {
 		return &AuditError{Code: "audit_paused", Stage: "worker", Message: err.Error(), Retryable: true}
+	}
+	if errors.Is(err, ErrUserExcluded) {
+		return &AuditError{Code: "user_excluded", Stage: "worker", Message: err.Error()}
 	}
 	retryable := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, driver.ErrBadConn)
 	var network net.Error

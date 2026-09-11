@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 type StatsQuery struct {
@@ -17,9 +19,10 @@ type StatsQuery struct {
 }
 
 type Distribution struct {
-	Count int64    `json:"count"`
-	P50MS *float64 `json:"p50_ms"`
-	P95MS *float64 `json:"p95_ms"`
+	Count       int64    `json:"count"`
+	P50MS       *float64 `json:"p50_ms"`
+	P95MS       *float64 `json:"p95_ms"`
+	Approximate bool     `json:"approximate"`
 }
 
 type CallStats struct {
@@ -50,33 +53,171 @@ type Stats struct {
 	ForwardingStock      map[string]int64 `json:"forwarding_stock"`
 	ActionExecutionStock map[string]int64 `json:"action_execution_stock"`
 	StatsQuery
-	AsOf               time.Time              `json:"as_of"`
-	Stock              map[string]int64       `json:"stock"`
-	OldestWaitingAt    *time.Time             `json:"oldest_waiting_at"`
-	WaitingForSlot     int64                  `json:"waiting_for_slot"`
-	Cohort             map[string]int64       `json:"cohort"`
-	Received           int64                  `json:"received"`
-	ReauditsCreated    int64                  `json:"reaudits_created"`
-	Formal             map[string]int64       `json:"formal"`
-	Reaudit            map[string]int64       `json:"reaudit"`
-	Failures           map[string]int64       `json:"failures"`
-	CurrentDecisions   map[string]int64       `json:"current_decisions"`
-	Gateway            map[string]int64       `json:"gateway"`
-	GatewayLatency     Distribution           `json:"gateway_latency"`
-	TaskLatency        Distribution           `json:"task_latency"`
-	Calls              []CallStats            `json:"calls"`
-	EvaluationRounds   int64                  `json:"evaluation_rounds"`
-	Reuse              ReuseMetrics           `json:"reuse"`
-	SegmentReuse       SegmentReuseView       `json:"segment_reuse"`
-	SegmentReuseByUser []UserSegmentReuseView `json:"segment_reuse_by_user"`
-	Actions            map[string]int64       `json:"actions"`
-	NotificationStock  map[string]int64       `json:"notification_stock"`
-	DeliveryStock      map[string]int64       `json:"delivery_stock"`
-	AuthCacheStock     map[string]int64       `json:"auth_cache_stock"`
+	StatsSource          string                 `json:"stats_source"`
+	ProjectionAsOf       *time.Time             `json:"projection_as_of"`
+	ProjectionRebuilding bool                   `json:"projection_rebuilding"`
+	AsOf                 time.Time              `json:"as_of"`
+	Stock                map[string]int64       `json:"stock"`
+	OldestWaitingAt      *time.Time             `json:"oldest_waiting_at"`
+	WaitingForSlot       int64                  `json:"waiting_for_slot"`
+	Cohort               map[string]int64       `json:"cohort"`
+	Received             int64                  `json:"received"`
+	ReauditsCreated      int64                  `json:"reaudits_created"`
+	Formal               map[string]int64       `json:"formal"`
+	Reaudit              map[string]int64       `json:"reaudit"`
+	Failures             map[string]int64       `json:"failures"`
+	CurrentDecisions     map[string]int64       `json:"current_decisions"`
+	Gateway              map[string]int64       `json:"gateway"`
+	GatewayLatency       Distribution           `json:"gateway_latency"`
+	TaskLatency          Distribution           `json:"task_latency"`
+	Calls                []CallStats            `json:"calls"`
+	EvaluationRounds     int64                  `json:"evaluation_rounds"`
+	Reuse                ReuseMetrics           `json:"reuse"`
+	SegmentReuse         SegmentReuseView       `json:"segment_reuse"`
+	SegmentReuseByUser   []UserSegmentReuseView `json:"segment_reuse_by_user"`
+	Actions              map[string]int64       `json:"actions"`
+	NotificationStock    map[string]int64       `json:"notification_stock"`
+	DeliveryStock        map[string]int64       `json:"delivery_stock"`
+	AuthCacheStock       map[string]int64       `json:"auth_cache_stock"`
 }
 
-// Stats 在同一 PostgreSQL 只读快照内计算各口径，时段统一采用左闭右开区间。
+// Stats 优先复用与当前数据库水位一致的 Redis 投影，未命中时从 PostgreSQL 重建。
 func (r *Repository) Stats(ctx context.Context, q StatsQuery) (*Stats, error) {
+	revision := ""
+	if r.redis != nil {
+		if current, err := r.statsProjectionRevision(ctx); err == nil {
+			revision = current
+			if cached, stale, err := r.redis.FindStats(ctx, revision, q); err == nil && cached != nil {
+				r.refreshStatsUserIdentity(ctx, cached)
+				if stale {
+					r.refreshStatsProjection(q, revision)
+				}
+				return cached, nil
+			}
+		}
+	}
+	result, err := r.statsFromDatabase(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	result.StatsSource = "postgresql"
+	result.ProjectionAsOf = &result.AsOf
+	result.ProjectionRebuilding = r.redis != nil
+	if r.redis != nil && revision != "" {
+		cacheCtx, cacheCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
+		if err := r.redis.SaveStats(cacheCtx, revision, result); err == nil {
+			result.ProjectionRebuilding = false
+		}
+		cacheCancel()
+	}
+	return result, nil
+}
+
+// refreshStatsUserIdentity 让 Redis 统计继续显示原版当前用户名和邮箱，不把身份快照当成权威资料。
+func (r *Repository) refreshStatsUserIdentity(ctx context.Context, stats *Stats) {
+	ids := make([]int64, 0, len(stats.SegmentReuseByUser))
+	byID := make(map[int64]*UserSegmentReuseView, len(stats.SegmentReuseByUser))
+	for i := range stats.SegmentReuseByUser {
+		item := &stats.SegmentReuseByUser[i]
+		ids = append(ids, item.UserID)
+		byID[item.UserID] = item
+	}
+	if len(ids) == 0 {
+		return
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT id,username,email FROM public.users WHERE id=ANY($1) AND deleted_at IS NULL`, pq.Array(ids))
+	if err != nil {
+		return
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id int64
+		var username, email string
+		if rows.Scan(&id, &username, &email) == nil {
+			byID[id].Username, byID[id].Email = username, email
+		}
+	}
+}
+
+// refreshStatsProjection 让过期快照先返回，再在后台按当前数据库水位重建同一查询。
+func (r *Repository) refreshStatsProjection(query StatsQuery, revision string) {
+	key, err := statsCacheKey(query)
+	if err != nil {
+		return
+	}
+	r.statsRefreshMu.Lock()
+	if r.statsRefreshing == nil {
+		r.statsRefreshing = make(map[string]bool)
+	}
+	if r.statsRefreshing[key] {
+		r.statsRefreshMu.Unlock()
+		return
+	}
+	r.statsRefreshing[key] = true
+	r.statsWG.Add(1)
+	r.statsRefreshMu.Unlock()
+	go func() {
+		defer r.statsWG.Done()
+		defer func() {
+			r.statsRefreshMu.Lock()
+			delete(r.statsRefreshing, key)
+			finished := len(r.statsRefreshing) == 0
+			r.statsRefreshMu.Unlock()
+			if finished && r.redis != nil {
+				r.redis.setProjectionRebuilding(false)
+			}
+		}()
+		base := r.projectionCtx
+		if base == nil {
+			base = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(base, 2*time.Minute)
+		defer cancel()
+		stats, err := r.statsFromDatabase(ctx, query)
+		if err != nil {
+			return
+		}
+		stats.StatsSource = "redis"
+		stats.ProjectionAsOf = &stats.AsOf
+		_ = r.redis.SaveStats(ctx, revision, stats)
+	}()
+}
+
+// WarmStatsProjections 在服务启动后刷新 Redis 中已有的管理员统计视图，不阻塞代理启动。
+func (r *Repository) WarmStatsProjections(ctx context.Context) {
+	if r.redis == nil {
+		return
+	}
+	queries, err := r.redis.StatsQueries(ctx)
+	if err != nil || len(queries) == 0 {
+		r.redis.setProjectionRebuilding(false)
+		return
+	}
+	revision, err := r.statsProjectionRevision(ctx)
+	if err != nil {
+		return
+	}
+	r.redis.setProjectionRebuilding(true)
+	for _, query := range queries {
+		r.refreshStatsProjection(query, revision)
+	}
+}
+
+// statsProjectionRevision 只读取各事实表的索引水位，用于识别 Redis 聚合是否仍有效。
+func (r *Repository) statsProjectionRevision(ctx context.Context) (string, error) {
+	var revision string
+	err := r.db.QueryRowContext(ctx, `SELECT concat_ws(':',
+	 COALESCE((SELECT max(updated_at)::text FROM sub2api_enhance.captures),''),
+	 COALESCE((SELECT max(updated_at)::text FROM sub2api_enhance.third_party_prompt_audit_jobs),''),
+	 COALESCE((SELECT max(updated_at)::text FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions),''),
+	 COALESCE((SELECT max(updated_at)::text FROM sub2api_enhance.third_party_prompt_audit_model_attempts),''),
+	 COALESCE((SELECT max(id)::text FROM sub2api_enhance.third_party_prompt_audit_outcomes),''),
+	 COALESCE((SELECT max(id)::text FROM sub2api_enhance.third_party_prompt_audit_segment_results),''))`).Scan(&revision)
+	return revision, err
+}
+
+// statsFromDatabase 在同一 PostgreSQL 只读快照内计算各口径，时段统一采用左闭右开区间。
+func (r *Repository) statsFromDatabase(ctx context.Context, q StatsQuery) (*Stats, error) {
 	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
 	if err != nil {
 		return nil, err

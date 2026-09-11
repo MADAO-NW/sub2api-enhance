@@ -11,18 +11,20 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
-	QuotaRedisURL, QuotaTimezone, QuotaFlusherEnabled                       string
+	EnhanceRedisURL, QuotaRedisURL, QuotaTimezone, QuotaFlusherEnabled      string
 	Listen, DatabaseURL, OfficialURL, PublicOrigin, AdminKey, EncryptionKey string
 	TrustedProxies                                                          []string
 	DatabaseConnections, IngressConnections                                 int
 	SMTPHost, SMTPPort, SMTPUser, SMTPPassword, SMTPFrom                    string
+	AuditCacheTTL                                                           time.Duration
 }
 
 func Load() (*Config, error) {
-	c := &Config{Listen: os.Getenv("ENHANCE_LISTEN"), DatabaseURL: os.Getenv("ENHANCE_DATABASE_URL"), OfficialURL: os.Getenv("SUB2API_INTERNAL_URL"), PublicOrigin: os.Getenv("ENHANCE_PUBLIC_ORIGIN"), AdminKey: os.Getenv("SUB2API_ADMIN_API_KEY"), EncryptionKey: os.Getenv("ENHANCE_ENCRYPTION_KEY"), SMTPHost: os.Getenv("SMTP_HOST"), SMTPPort: os.Getenv("SMTP_PORT"), SMTPUser: os.Getenv("SMTP_USER"), SMTPPassword: os.Getenv("SMTP_PASSWORD"), SMTPFrom: os.Getenv("SMTP_FROM"), QuotaRedisURL: os.Getenv("QUOTA_FOLLOW_REDIS_URL"), QuotaTimezone: os.Getenv("SUB2API_TIMEZONE"), QuotaFlusherEnabled: os.Getenv("SUB2API_USER_PLATFORM_QUOTA_FLUSHER_ENABLED")}
+	c := &Config{Listen: os.Getenv("ENHANCE_LISTEN"), DatabaseURL: os.Getenv("ENHANCE_DATABASE_URL"), OfficialURL: os.Getenv("SUB2API_INTERNAL_URL"), PublicOrigin: os.Getenv("ENHANCE_PUBLIC_ORIGIN"), AdminKey: os.Getenv("SUB2API_ADMIN_API_KEY"), EncryptionKey: os.Getenv("ENHANCE_ENCRYPTION_KEY"), SMTPHost: os.Getenv("SMTP_HOST"), SMTPPort: os.Getenv("SMTP_PORT"), SMTPUser: os.Getenv("SMTP_USER"), SMTPPassword: os.Getenv("SMTP_PASSWORD"), SMTPFrom: os.Getenv("SMTP_FROM"), EnhanceRedisURL: os.Getenv("ENHANCE_REDIS_URL"), QuotaRedisURL: os.Getenv("QUOTA_FOLLOW_REDIS_URL"), QuotaTimezone: os.Getenv("SUB2API_TIMEZONE"), QuotaFlusherEnabled: os.Getenv("SUB2API_USER_PLATFORM_QUOTA_FLUSHER_ENABLED")}
 	if c.Listen == "" {
 		c.Listen = "127.0.0.1:18081"
 	}
@@ -32,6 +34,14 @@ func Load() (*Config, error) {
 	if c.DatabaseURL == "" {
 		return nil, errors.New("必须配置 ENHANCE_DATABASE_URL")
 	}
+	if c.EnhanceRedisURL == "" {
+		return nil, errors.New("必须配置 ENHANCE_REDIS_URL")
+	}
+	auditCacheTTL, err := time.ParseDuration(os.Getenv("ENHANCE_AUDIT_CACHE_TTL"))
+	if err != nil || auditCacheTTL <= 0 {
+		return nil, errors.New("ENHANCE_AUDIT_CACHE_TTL 必须是正数 Go 时长")
+	}
+	c.AuditCacheTTL = auditCacheTTL
 	for _, v := range []struct{ name, value string }{{"SUB2API_INTERNAL_URL", c.OfficialURL}, {"ENHANCE_PUBLIC_ORIGIN", c.PublicOrigin}} {
 		u, err := url.Parse(v.value)
 		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {

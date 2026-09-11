@@ -85,8 +85,10 @@ export interface ModelResult {
 export interface SegmentReuse { reused: number; total: number; rate: number | null }
 export interface TargetReuse extends SegmentReuse { by_kind?: Record<string, SegmentReuse> }
 export interface UserSegmentReuse extends SegmentReuse { user_id: number; username: string; email: string }
-export interface Outcome { id: number; job_id: number; user_id: number; audit_round: number; run_kind: 'request' | 'reaudit'; requested_by: number | null; reuse_mode: 'allow' | 'force'; config_snapshot?: AuditConfig & { revision: number }; decision: AuditDecision; models: ModelResult[]; partial_failure: boolean; enforcement_eligible: boolean; source_outcome_id?: number; started_at: string | null; finished_at: string | null; duration_ms: number | null; created_at: string; decision_config?: DecisionConfig; segment_reuse: SegmentReuse; target_reuse?: TargetReuse }
-export interface LatestUserContent { content: string | null; items: { order: number; source_path: string; content: string }[]; combined_count: number; unavailable_reason: string }
+export interface Outcome { id: number; job_id: number; user_id: number; audit_round: number; run_kind: 'request' | 'reaudit'; requested_by: number | null; reuse_mode: 'allow' | 'force'; config_snapshot?: AuditConfig & { revision: number }; decision: AuditDecision; models: ModelResult[]; partial_failure: boolean; enforcement_eligible: boolean; source_outcome_id?: number; started_at: string | null; finished_at: string | null; duration_ms: number | null; created_at: string; decision_config?: DecisionConfig; segment_reuse: SegmentReuse; target_reuse?: TargetReuse; audit_targets?: AuditStageTargets }
+export interface AuditEnvelope { audit_stage: string; target: unknown }
+export type AuditStageTargets = Partial<Record<'current_user' | 'instruction_context' | 'intent_binding', AuditEnvelope>>
+export interface LatestUserContent { content: string | null; items: { order: number; source_path: string; content: string }[]; fragment_count: number; unavailable_reason: string }
 export interface AuditJob {
   capture_id?: number|null
   id: number
@@ -140,7 +142,7 @@ export interface AuditCapture {
   id: number; capture_key: string; conversation_key?: string; transport: string; protocol: string; body_format: string; raw_body?: string; body_bytes: number; body_sha256: string
   snapshot_status: string; eligibility_status: string; processing_status: string; forwarding_status: string; created_at: string; last_error_message: string
   display_username?: string; display_email?: string
-  identity?: { user_id: number }; metadata?: Record<string, string>; forwarding_observations?: unknown
+  identity?: { user_id: number; api_key_id?: number; group_id?: number|null; username?: string; user_email?: string; api_key_name?: string; group_name?: string; platform?: string; eligibility?: string; reason?: string }; metadata?: Record<string, string>; forwarding_observations?: unknown
 }
 export interface AuditUser {
   id: number; username: string; email: string; role: string; status: string; disable_violation_count: number; disable_reset_at: string | null; action_pending: boolean
@@ -157,24 +159,26 @@ export interface AuditAction {
   applied_at: string|null; notification_status: string; auth_cache_status: string; auth_cache_error: string
   deliveries: { recipient: string; kind: string; status: string; last_error: string; attempts: unknown[] }[]
 }
-export interface JobDetail { input_json: string; input_parts: (SegmentMeta & { content: { type: string; text: string; source_path: string }[] })[]; audit_target?: { protocol: string; messages: unknown[]; tools: Record<string, unknown> }; non_text: { type: string; source_path: string }[]; job: AuditJob; outcome: Outcome | null; rounds: Outcome[]; attempts: ModelAttempt[]; actions: AuditAction[]; enforcement?: { role: string; user_status: string; warning_reason: string; disable_reason: string; window_violations: number; window_size: number; disable_violation_count: number } }
+export interface JobDetail { input_json: string; input_parts: (SegmentMeta & { content: { type: string; text: string; source_path: string }[] })[]; audit_targets?: AuditStageTargets; non_text: { type: string; source_path: string }[]; job: AuditJob; outcome: Outcome | null; rounds: Outcome[]; attempts: ModelAttempt[]; actions: AuditAction[]; enforcement?: { role: string; user_status: string; warning_reason: string; disable_reason: string; window_violations: number; window_size: number; disable_violation_count: number } }
 export interface AuditFilter { ids?: number[]; from?: string; to?: string; user_id?: number; api_key_id?: number; group_id?: number; status?: string; decision?: string; run_kind?: string; mode?: string; platform?: string; request_id?: string; keyword?: string; model_id?: string; model_name?: string }
 export interface CaptureFilter { from?: string; to?: string; user_id?: number; api_key_id?: number; group_id?: number; keyword?: string; protocol?: string; snapshot_status?: string; eligibility_status?: string; status?: string; forwarding_status?: string }
 export interface AuditPage<T> { items: T[]; total: number; page: number; page_size: number }
 export interface ReauditRequest { reuse_mode?: 'allow' | 'force'; filter: AuditFilter }
 export interface ReauditResult { matched: number; ready: number; items: { job_id: number; status: string; reason: string }[] }
 export interface RecoveryResult { matched: number; ready: number; items: { capture_id: number; job_id?: number; action: 'resume_checkpoint' | 'requeue_job' | 'create_job'; status: string; reason?: string }[] }
-export interface Distribution { count: number; p50_ms: number | null; p95_ms: number | null }
+export interface Distribution { count: number; p50_ms: number | null; p95_ms: number | null; approximate?: boolean }
 export interface AuditRuntime {
   warning_enabled: boolean; disable_enabled: boolean
   instance_id: string; started_at: string; as_of: string; running: boolean; mode: AuditMode; revision: number; expected_revision: number
   worker_capacity: number; active_workers: number; database_ok: boolean; database_error: string; config_error: string; input_persist_failures: number
   last_success: string | null; last_error: { code: string; message: string; at: string } | null
   evaluation_latency: Distribution & { capacity: number; from: string | null; to: string | null }; probes: ProbeResult[]
-  scheduler?: { backpressured_total: number; blocking_waiters: number; nodes: { model_id: string; health: string; active: number; max_concurrency: number; eligible_waiters: number; load_ratio: number; latency_ewma_ms: number | null; consecutive_failures: number; cooldown_until: string | null; next_probe_at: string | null; last_error_code: string; last_observed_at: string | null }[] }
+	scheduler?: { backpressured_total: number; blocking_waiters: number; nodes: { model_id: string; health: string; active: number; max_concurrency: number; eligible_waiters: number; load_ratio: number; latency_ewma_ms: number | null; consecutive_failures: number; cooldown_until: string | null; next_probe_at: string | null; last_error_code: string; last_observed_at: string | null }[] }
+	redis?: { ok: boolean; status: string; error: string; projection_version: string; projection_as_of: string|null; projection_rebuilding: boolean }
 }
 export interface StatsQuery { from: string; to: string; timezone: string; mode?: string; model_id?: string; stage?: string }
 export interface AuditStats extends StatsQuery {
+	stats_source?: string; projection_as_of?: string|null; projection_rebuilding?: boolean;
   capture_stock?: Record<string,number>; forwarding_stock?: Record<string,number>; action_execution_stock?: Record<string,number>;
   as_of: string; stock: Record<string, number>; oldest_waiting_at: string | null; waiting_for_slot: number; cohort: Record<string, number>
   received: number; reaudits_created: number; formal: Record<string, number>; reaudit: Record<string, number>; failures: Record<string, number>

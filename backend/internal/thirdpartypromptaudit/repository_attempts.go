@@ -52,14 +52,19 @@ func (r *Repository) PrepareAttempt(ctx context.Context, job *Job, attempt *Mode
 
 func (r *Repository) StartAttempt(ctx context.Context, job *Job, attempt *ModelAttempt) error {
 	var generation int64
+	allowExcluded := true
+	userID := int64(0)
 	if job != nil {
 		generation = job.ClaimGeneration
+		userID = job.UserID
+		allowExcluded = job.IngressStage == "manual_capture_reprocess" || job.CurrentRequestedBy != nil || job.Dispatched
 	}
-	err := r.db.QueryRowContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_model_attempts a SET status='started',dispatch_started_at=clock_timestamp()
- WHERE a.id=$1 AND a.status='prepared' AND (a.job_id IS NULL OR EXISTS
- (SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_jobs j WHERE j.id=a.job_id AND j.claim_generation=$2 AND j.status='processing' AND j.lease_until>clock_timestamp()))
-	AND (a.call_kind='probe' OR (SELECT value::json->>'mode' FROM sub2api_enhance.settings WHERE key='third_party_prompt_audit_config') IN ('async','blocking'))
- RETURNING dispatch_started_at`, attempt.ID, generation).Scan(&attempt.DispatchStartedAt)
+	err := r.db.QueryRowContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_model_attempts a SET status='started',dispatch_started_at=clock_timestamp(),updated_at=clock_timestamp()
+	 WHERE a.id=$1 AND a.status='prepared' AND (a.job_id IS NULL OR EXISTS
+	 (SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_jobs j WHERE j.id=a.job_id AND j.claim_generation=$2 AND j.status='processing' AND j.lease_until>clock_timestamp()))
+		AND (a.call_kind='probe' OR ((SELECT value::json->>'mode' FROM sub2api_enhance.settings WHERE key='third_party_prompt_audit_config') IN ('async','blocking')
+		AND ($3 OR NOT COALESCE((SELECT (value::jsonb->'excluded_user_ids') @> to_jsonb(ARRAY[$4::bigint]) FROM sub2api_enhance.settings WHERE key='third_party_prompt_audit_config'),false))))
+	 RETURNING dispatch_started_at`, attempt.ID, generation, allowExcluded, userID).Scan(&attempt.DispatchStartedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		if job != nil {
 			var valid bool
@@ -68,6 +73,16 @@ func (r *Repository) StartAttempt(ctx context.Context, job *Job, attempt *ModelA
 				return lookupErr
 			}
 			if valid {
+				if !allowExcluded {
+					var excluded bool
+					lookupErr = r.db.QueryRowContext(ctx, `SELECT COALESCE((value::jsonb->'excluded_user_ids') @> to_jsonb(ARRAY[$1::bigint]),false) FROM sub2api_enhance.settings WHERE key=$2`, userID, SettingKey).Scan(&excluded)
+					if lookupErr != nil {
+						return lookupErr
+					}
+					if excluded {
+						return ErrUserExcluded
+					}
+				}
 				return ErrAuditPaused
 			}
 		}
@@ -89,7 +104,7 @@ func (r *Repository) FinishAttempt(ctx context.Context, job *Job, attempt *Model
 		generation = job.ClaimGeneration
 	}
 	result, err := r.db.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_model_attempts a SET status=$2,http_status=$3,raw_response=$4,confidence=$5,reason=$6,
- input_tokens=$7,output_tokens=$8,latency_ms=$9,error_code=$10,error_message=$11,finished_at=clock_timestamp()
+	 input_tokens=$7,output_tokens=$8,latency_ms=$9,error_code=$10,error_message=$11,finished_at=clock_timestamp(),updated_at=clock_timestamp()
  WHERE a.id=$1 AND a.status IN ('prepared','started') AND (a.job_id IS NULL OR EXISTS
  (SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_jobs j WHERE j.id=a.job_id AND j.claim_generation=$12 AND j.status='processing' AND j.lease_until>clock_timestamp()))`,
 		attempt.ID, attempt.Status, attempt.HTTPStatus, raw, confidence, reason, attempt.InputTokens, attempt.OutputTokens,
@@ -102,9 +117,26 @@ func (r *Repository) FindSegments(ctx context.Context, modelID string, keys []st
 	if len(keys) == 0 {
 		return results, nil
 	}
+	missing := append([]string(nil), keys...)
+	if r.redis != nil {
+		if cached, err := r.redis.FindSegments(ctx, keys); err == nil {
+			for key, item := range cached {
+				results[key] = item
+			}
+			missing = missing[:0]
+			for _, key := range keys {
+				if _, ok := results[key]; !ok {
+					missing = append(missing, key)
+				}
+			}
+		}
+	}
+	if len(missing) == 0 {
+		return results, nil
+	}
 	rows, err := r.db.QueryContext(ctx, `SELECT DISTINCT ON (audit_key) id,user_id,model_id,audit_key,source_attempt_id,source_role,policy_role,turn_scope,content_hash,target_kind,confidence,reason
 	 FROM sub2api_enhance.third_party_prompt_audit_segment_results WHERE model_id=$1 AND audit_key=ANY($2)
-	 ORDER BY audit_key,id DESC`, modelID, pq.Array(keys))
+	 ORDER BY audit_key,id DESC`, modelID, pq.Array(missing))
 	if err != nil {
 		return nil, err
 	}
@@ -117,6 +149,9 @@ func (r *Repository) FindSegments(ctx context.Context, modelID string, keys []st
 		}
 		item.Reason = decodeStoredText(item.Reason)
 		results[item.AuditKey] = item
+		if r.redis != nil {
+			_ = r.redis.SaveSegment(ctx, item)
+		}
 	}
 	return results, rows.Err()
 }
@@ -132,14 +167,26 @@ func (r *Repository) SaveSegment(ctx context.Context, job *Job, item *SegmentRes
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrLeaseLost
 	}
+	if err == nil && r.redis != nil {
+		_ = r.redis.SaveSegment(ctx, *item)
+	}
 	return err
 }
 
 func (r *Repository) FindWholeResult(ctx context.Context, job *Job) (*Outcome, error) {
-	return r.queryOutcome(ctx, `SELECT o.id,o.job_id,o.user_id,o.decision,o.partial_failure,o.enforcement_eligible,o.model_results,o.source_outcome_id,o.created_at,o.audit_round,o.run_kind,o.requested_by,o.config_snapshot,o.started_at,o.finished_at,o.reuse_mode
+	if r.redis != nil {
+		if outcome, err := r.redis.FindWhole(ctx, job.EvaluationHash, job.TargetHash); err == nil && outcome != nil {
+			return outcome, nil
+		}
+	}
+	outcome, err := r.queryOutcome(ctx, `SELECT o.id,o.job_id,o.user_id,o.decision,o.partial_failure,o.enforcement_eligible,o.model_results,o.source_outcome_id,o.created_at,o.audit_round,o.run_kind,o.requested_by,o.config_snapshot,o.started_at,o.finished_at,o.reuse_mode
 	 FROM sub2api_enhance.third_party_prompt_audit_outcomes o
 		 WHERE o.evaluation_hash=$1 AND o.target_hash=$2 AND NOT o.partial_failure AND o.source_outcome_id IS NULL
 		 ORDER BY o.id DESC LIMIT 1`, job.EvaluationHash, job.TargetHash)
+	if err == nil && outcome != nil && r.redis != nil {
+		_ = r.redis.SaveWhole(ctx, *outcome, job.EvaluationHash, job.TargetHash)
+	}
+	return outcome, err
 }
 
 func (r *Repository) GetOutcome(ctx context.Context, jobID int64) (*Outcome, error) {

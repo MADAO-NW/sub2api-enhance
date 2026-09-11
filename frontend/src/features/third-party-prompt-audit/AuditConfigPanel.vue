@@ -38,6 +38,7 @@ const customProbeInput = ref('')
 const structuredProbeInput = ref('')
 const providersJSON = ref('')
 const providersJSONError = ref('')
+const expandedModelIDs = ref<string[]>([])
 const loading = ref(false)
 const saving = ref(false)
 const error = ref('')
@@ -180,12 +181,25 @@ function syncModelNames() {
 function addModel() {
   if (!draft.value || !saved.value) return
   const id = crypto.randomUUID()
-	  draft.value.models.push({ id, name: '', enabled: true, base_url: '', model: '', timeout_ms: saved.value.model_defaults.timeout_ms, max_concurrency: saved.value.model_defaults.max_concurrency, parameters: {} })
+	draft.value.models.push({ id, name: '', enabled: true, base_url: '', model: '', timeout_ms: saved.value.model_defaults.timeout_ms, max_concurrency: saved.value.model_defaults.max_concurrency, parameters: {} })
+	expandedModelIDs.value.push(id)
   keys[id] = { model_id: id, action: 'keep', api_key: '' }
   modelOptions[id] = []
 }
+function setModelExpanded(id: string, expanded: boolean) {
+  expandedModelIDs.value = expanded ? Array.from(new Set([...expandedModelIDs.value, id])) : expandedModelIDs.value.filter(value => value !== id)
+}
+function setAllModelsExpanded(expanded: boolean) {
+  expandedModelIDs.value = expanded ? (draft.value?.models.map(model => model.id) ?? []) : []
+}
+function expandInvalidModel(event: Event) {
+  const details = (event.target as HTMLElement | null)?.closest<HTMLDetailsElement>('[data-test="model-card"]')
+  const id = details?.querySelector<HTMLInputElement>('input[data-model-id]')?.dataset.modelId
+  if (id) setModelExpanded(id, true)
+}
 async function listModels(model: AuditModel) {
-  if (!model.base_url || listingModels.value.includes(model.id)) return
+	if (!model.base_url || listingModels.value.includes(model.id)) return
+	setModelExpanded(model.id, true)
   listingModels.value.push(model.id)
   delete modelListErrors[model.id]
   try {
@@ -278,7 +292,8 @@ async function save() {
   finally { saving.value = false }
 }
 async function probe(model: AuditModel) {
-  if (!draft.value || probing.value.includes(model.id)) return
+	if (!draft.value || probing.value.includes(model.id)) return
+	setModelExpanded(model.id, true)
   probing.value.push(model.id)
   try {
     const input = probeInput.value
@@ -298,7 +313,7 @@ watch(() => props.refreshKey, () => { void load(true) })
     <div v-if="error" class="rounded-xl bg-red-50 p-4 text-red-700 dark:bg-red-950/30 dark:text-red-300" role="alert">
       {{ error }} <button type="button" class="btn btn-secondary ml-3" @click="load()">{{ label('refresh') }}</button>
     </div>
-    <form v-if="draft && saved" class="space-y-5" @submit.prevent="save">
+	<form v-if="draft && saved" class="space-y-5" @submit.prevent="save" @invalid.capture="expandInvalidModel">
       <div v-if="saved.application_error" class="rounded-xl bg-amber-50 p-4 text-amber-800 dark:bg-amber-950/30 dark:text-amber-200" role="alert">
         {{ label('applicationError') }} · {{ saved.application_error }}
       </div>
@@ -311,8 +326,7 @@ watch(() => props.refreshKey, () => { void load(true) })
               <select v-model="draft.mode" class="input"><option v-for="mode in ['off', 'async', 'blocking']" :key="mode" :value="mode">{{ label(mode) }}</option></select>
             </label>
             <label class="flex items-center gap-2 self-end pb-3 text-sm"><input v-model="draft.capture_when_audit_off" type="checkbox" />{{ label('captureWhenAuditOff') }}</label>
-            <div class="space-y-2"><span class="text-sm font-medium">{{ label('scope') }}</span><p class="input flex items-center">{{ label('current_user') }}</p></div>
-            <label class="space-y-2"><span class="text-sm font-medium">{{ label('worker') }}</span><input v-model.number="draft.worker_count" class="input" type="number" min="1" step="1" required /></label>
+			<label class="space-y-2"><span class="text-sm font-medium">{{ label('worker') }}</span><input v-model.number="draft.worker_count" class="input" type="number" min="1" step="1" required /></label>
           </div>
           <p class="mt-3 text-sm text-gray-500 dark:text-dark-400">{{ label('scopeHint') }}</p>
           <p class="mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('scopeExample') }}</p>
@@ -334,10 +348,11 @@ watch(() => props.refreshKey, () => { void load(true) })
         </section>
 
         <section class="card space-y-5 p-5 sm:p-6">
-          <div class="flex items-center justify-between gap-4"><h2 class="text-lg font-semibold">{{ label('models') }}</h2><button type="button" class="btn btn-secondary" @click="addModel">{{ label('addModel') }}</button></div>
-          <div v-for="(model, index) in draft.models" :key="model.id" class="space-y-4 rounded-xl border border-gray-200 p-4 dark:border-dark-600">
-            <div class="flex justify-between gap-3"><label class="flex items-center gap-2"><input v-model="model.enabled" type="checkbox" />#{{ index + 1 }} · {{ label('enabled') }}</label><div class="flex gap-2"><button type="button" class="btn btn-ghost" :disabled="index === 0" @click="moveModel(index, -1)">{{ label('moveUp') }}</button><button type="button" class="btn btn-ghost" :disabled="index === draft.models.length - 1" @click="moveModel(index, 1)">{{ label('moveDown') }}</button><button type="button" class="btn btn-ghost text-red-600" @click="removeModel(model.id)">{{ label('remove') }}</button></div></div>
-            <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+		  <div class="flex flex-wrap items-center justify-between gap-4"><h2 class="text-lg font-semibold">{{ label('models') }}</h2><div class="flex flex-wrap gap-2"><button type="button" class="btn btn-ghost" @click="setAllModelsExpanded(true)">{{ label('expandAll') }}</button><button type="button" class="btn btn-ghost" @click="setAllModelsExpanded(false)">{{ label('collapseAll') }}</button><button type="button" class="btn btn-secondary" @click="addModel">{{ label('addModel') }}</button></div></div>
+		  <details v-for="(model, index) in draft.models" :key="model.id" class="rounded-xl border border-gray-200 p-4 dark:border-dark-600" data-test="model-card" :open="expandedModelIDs.includes(model.id)" @toggle="setModelExpanded(model.id, ($event.target as HTMLDetailsElement).open)">
+			<summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3"><label class="flex items-center gap-2" @click.stop><input v-model="model.enabled" type="checkbox" :data-model-id="model.id" />#{{ index + 1 }} · {{ label('enabled') }}</label><div class="min-w-0 flex-1"><strong class="block truncate">{{ model.name || label('chooseModel') }}</strong><span class="block truncate text-xs text-gray-500">{{ model.base_url || '—' }} · {{ label(saved.has_api_keys[model.id] ? 'keyPresent' : 'keyAbsent') }}</span></div><div class="flex gap-2" @click.stop><button type="button" class="btn btn-ghost" :disabled="index === 0" @click="moveModel(index, -1)">{{ label('moveUp') }}</button><button type="button" class="btn btn-ghost" :disabled="index === draft.models.length - 1" @click="moveModel(index, 1)">{{ label('moveDown') }}</button><button type="button" class="btn btn-ghost text-red-600" @click="removeModel(model.id)">{{ label('remove') }}</button></div></summary>
+			<div class="mt-4 space-y-4">
+			<div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
               <label class="space-y-2"><span class="text-sm">{{ label('baseURL') }}</span><input v-model="model.base_url" class="input" type="url" required /></label>
               <label class="space-y-2"><span class="text-sm">{{ label('model') }}</span><input v-model="model.model" class="input" required :list="`audit-models-${model.id}`" :placeholder="label('chooseOrInputModel')" data-test="model-input" /><datalist :id="`audit-models-${model.id}`"><option v-for="option in modelOptions[model.id] ?? []" :key="option" :value="option" /></datalist></label>
               <label class="space-y-2"><span class="text-sm">{{ label('timeout') }}</span><input v-model.number="model.timeout_ms" class="input" type="number" min="1" step="1" required /></label>
@@ -351,13 +366,14 @@ watch(() => props.refreshKey, () => { void load(true) })
             <div class="flex flex-wrap gap-3"><button type="button" class="btn btn-secondary" :disabled="!model.base_url || listingModels.includes(model.id)" @click="listModels(model)">{{ label(listingModels.includes(model.id) ? 'loading' : 'loadModels') }}</button><button type="button" class="btn btn-secondary" :disabled="!model.model || probing.includes(model.id)" @click="probe(model)">{{ label(probing.includes(model.id) ? 'loading' : 'probe') }}</button></div>
             <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('modelListHint') }}</p>
             <p v-if="modelListErrors[model.id]" class="text-sm text-red-600 dark:text-red-400">{{ modelListErrors[model.id] }}</p>
-            <div v-if="probes[model.id]" class="rounded-lg bg-gray-50 p-3 text-sm dark:bg-dark-900" role="status">
+			<div v-if="probes[model.id]" class="rounded-lg bg-gray-50 p-3 text-sm dark:bg-dark-900" role="status">
               <span>{{ formatTime(probes[model.id]!.tested_at) }} · {{ probes[model.id]!.latency_ms }} ms · #{{ probes[model.id]!.attempt_id }}</span>
               <p v-if="probes[model.id]?.result">{{ label('score') }} {{ probes[model.id]!.result!.confidence }} · {{ probes[model.id]!.result!.reason }}</p>
               <p v-if="probes[model.id]?.error" class="text-red-600 dark:text-red-400">{{ probes[model.id]!.error!.message }} · {{ probes[model.id]!.error!.code }}</p>
             <button type="button" class="mt-2 block text-primary-600 underline" @click="showProbeDetails(probes[model.id]!.attempt_id)">{{ label('probeDetails') }}</button>
-            </div>
-          </div>
+			</div>
+			</div>
+		  </details>
           <details class="rounded-xl border border-gray-200 p-4 dark:border-dark-600">
             <summary class="cursor-pointer font-semibold">{{ label('providersJSON') }}</summary>
             <p class="my-3 text-sm text-gray-500 dark:text-dark-400">{{ label('providersJSONHint') }}</p>

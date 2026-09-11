@@ -1,6 +1,6 @@
 <script lang="ts">
 // contentCache 按记录 ID 跨列表刷新复用已读取的不可变原文结果。
-const contentCache = new Map<string, { content: string | null; items: { order: number; source_path: string; content: string }[]; combined_count: number; unavailable_reason: string }>()
+const contentCache = new Map<string, { content: string | null; items: { order: number; source_path: string; content: string }[]; fragment_count: number; unavailable_reason: string }>()
 </script>
 
 <script setup lang="ts">
@@ -59,7 +59,7 @@ onUnmounted(cancelHide)
       <span v-if="open" class="fixed z-[60] block max-w-[calc(100vw-1rem)] rounded-lg border border-gray-200 bg-white p-3 text-left shadow-xl dark:border-dark-700 dark:bg-dark-900" :style="popoverStyle" @mouseenter="cancelHide" @mouseleave="hidePopover">
         <span v-if="loading" class="text-sm">{{ label('loading') }}</span>
         <span v-else-if="error" class="text-sm text-red-600">{{ error }}</span>
-        <span v-else-if="result?.content" class="block"><span class="mb-2 block text-xs text-gray-500">{{ label('combinedUserCount') }}: {{ result.combined_count ?? 1 }}</span><pre class="max-h-72 overflow-auto whitespace-pre-wrap break-words text-xs">{{ result.content }}</pre></span>
+        <span v-else-if="result?.content" class="block"><span class="mb-2 block text-xs text-gray-500">{{ label('latestUserFragmentCount') }}: {{ result.fragment_count ?? 1 }}</span><pre class="max-h-72 overflow-auto whitespace-pre-wrap break-words text-xs">{{ result.content }}</pre></span>
         <span v-else class="text-sm text-gray-500">{{ label(result?.unavailable_reason || 'user_content_not_found') }}</span>
       </span>
     </Teleport>
@@ -69,7 +69,7 @@ onUnmounted(cancelHide)
     <BaseDialog :show="open" :title="label('currentUserContent')" :close-on-click-outside="true" @close="open = false">
       <p v-if="loading">{{ label('loading') }}</p>
       <p v-else-if="error" class="text-red-600">{{ error }}</p>
-      <div v-else-if="result?.content"><p class="mb-3 text-sm text-gray-500">{{ label('combinedUserCount') }}: {{ result.combined_count ?? 1 }}</p><div class="max-h-[65vh] space-y-3 overflow-auto"><article v-for="item in result.items ?? []" :key="item.order" class="rounded-lg bg-gray-50 p-4 text-sm dark:bg-dark-950"><p class="mb-2 text-xs text-gray-500">#{{ item.order }} · {{ item.source_path }}</p><pre class="whitespace-pre-wrap break-words">{{ item.content }}</pre></article><pre v-if="!result.items?.length" class="whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-4 text-sm dark:bg-dark-950">{{ result.content }}</pre></div></div>
+      <div v-else-if="result?.content"><p class="mb-3 text-sm text-gray-500">{{ label('latestUserFragmentCount') }}: {{ result.fragment_count ?? 1 }}</p><div class="max-h-[65vh] space-y-3 overflow-auto"><article v-for="item in result.items ?? []" :key="item.order" class="rounded-lg bg-gray-50 p-4 text-sm dark:bg-dark-950"><p class="mb-2 text-xs text-gray-500">#{{ item.order }} · {{ item.source_path }}</p><pre class="whitespace-pre-wrap break-words">{{ item.content }}</pre></article><pre v-if="!result.items?.length" class="whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-4 text-sm dark:bg-dark-950">{{ result.content }}</pre></div></div>
       <p v-else class="text-gray-500">{{ label(result?.unavailable_reason || 'user_content_not_found') }}</p>
     </BaseDialog>
   </template>

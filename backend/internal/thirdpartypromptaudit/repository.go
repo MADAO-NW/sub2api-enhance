@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sub2api-enhance/internal/pkg/logger"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -18,15 +19,31 @@ var ErrLeaseLost = errors.New("审核任务租约已失效")
 // ErrAuditPaused 表示当前配置已撤销尚未发起的审核调用许可。
 var ErrAuditPaused = errors.New("审核已暂停，等待重新启用")
 
+// ErrUserExcluded 表示用户在首个模型调用前已被设置为不审核。
+var ErrUserExcluded = errors.New("用户当前已设置为不审核")
+
 // ErrNotFound 表示请求的本模块业务记录不存在。
 var ErrNotFound = errors.New("审核记录不存在")
 
 // leaseDuration 为可续租任务提供进程故障恢复窗口。
 const leaseDuration = 30 * time.Second
 
-type Repository struct{ db *sql.DB }
+type Repository struct {
+	db              *sql.DB
+	redis           *RedisStore
+	statsRefreshMu  sync.Mutex
+	statsRefreshing map[string]bool
+	projectionCtx   context.Context
+	statsWG         sync.WaitGroup
+}
 
-func NewRepository(db *sql.DB) *Repository { return &Repository{db: db} }
+func NewRepository(db *sql.DB) *Repository {
+	return &Repository{db: db, statsRefreshing: make(map[string]bool)}
+}
+
+func (r *Repository) SetRedisStore(store *RedisStore) { r.redis = store }
+
+func (r *Repository) SetProjectionContext(ctx context.Context) { r.projectionCtx = ctx }
 
 // jobColumns 仅列举列表需要的字段，全文通过单独投影读取，避免列表展开大字段。
 const jobColumns = `COALESCE(capture.created_at,j.created_at) AS captured_at,j.capture_id,j.id,j.capture_key,j.user_id,j.api_key_id,j.group_id,
@@ -233,7 +250,7 @@ func (r *Repository) RecoverExpired(ctx context.Context) error {
 		return err
 	}
 	// 回收租约时一并标记未确认的调用，未知响应不伪装为模型失败。
-	if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_model_attempts SET status=CASE WHEN dispatch_started_at IS NULL THEN 'failed' ELSE 'unknown' END,error_code=CASE WHEN dispatch_started_at IS NULL THEN 'not_dispatched' ELSE 'worker_lost' END,error_message=$1,finished_at=clock_timestamp() WHERE job_id=$2 AND status IN ('prepared','started')`, encodeStoredText("执行进程失联，调用结果未知"), jobID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_model_attempts SET status=CASE WHEN dispatch_started_at IS NULL THEN 'failed' ELSE 'unknown' END,error_code=CASE WHEN dispatch_started_at IS NULL THEN 'not_dispatched' ELSE 'worker_lost' END,error_message=$1,finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE job_id=$2 AND status IN ('prepared','started')`, encodeStoredText("执行进程失联，调用结果未知"), jobID); err != nil {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs SET
@@ -293,9 +310,9 @@ func (r *Repository) Fail(ctx context.Context, job *Job, failure *AuditError, re
 	}
 	// 退出本轮时终结未确认调用，后续重试不能留下永久的 started。
 	_, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_model_attempts SET
-      status=CASE WHEN dispatch_started_at IS NULL THEN 'failed' ELSE 'unknown' END,
-      error_code=CASE WHEN dispatch_started_at IS NULL THEN 'not_dispatched' ELSE 'result_unconfirmed' END,
-      error_message=$4,finished_at=clock_timestamp() WHERE job_id=$1 AND evaluation_round=$2 AND audit_round=$3 AND status IN ('prepared','started')`, job.ID, job.Attempts, jobAuditRound(job), encodeStoredText(failure.Message))
+	      status=CASE WHEN dispatch_started_at IS NULL THEN 'failed' ELSE 'unknown' END,
+	      error_code=CASE WHEN dispatch_started_at IS NULL THEN 'not_dispatched' ELSE 'result_unconfirmed' END,
+	      error_message=$4,finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE job_id=$1 AND evaluation_round=$2 AND audit_round=$3 AND status IN ('prepared','started')`, job.ID, job.Attempts, jobAuditRound(job), encodeStoredText(failure.Message))
 	if err != nil {
 		return err
 	}
@@ -324,6 +341,29 @@ func (r *Repository) DeferCapacity(ctx context.Context, job *Job, failure *Audit
  WHERE id=$1 AND claim_generation=$2 AND status='processing' AND lease_until>clock_timestamp()`,
 		job.ID, job.ClaimGeneration, failure.Stage, failure.Code, encodeStoredText(failure.Message), interval(wait))
 	return checkLeaseUpdate(result, err)
+}
+
+// SkipExcluded 在尚未发出模型调用时终结任务，不消耗审核轮次或产生处罚事实。
+func (r *Repository) SkipExcluded(ctx context.Context, job *Job) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_model_attempts SET
+	 status='failed',error_code='user_excluded',error_message=$2,finished_at=clock_timestamp(),updated_at=clock_timestamp()
+	 WHERE job_id=$1 AND status='prepared'`, job.ID, encodeStoredText(ErrUserExcluded.Error())); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs SET
+	 status='skipped',attempts=GREATEST(0,attempts-1),failure_stage=NULL,last_error_code='user_excluded',last_error_message=$3,
+	 finished_at=clock_timestamp(),lease_until=NULL,updated_at=clock_timestamp()
+	 WHERE id=$1 AND claim_generation=$2 AND status='processing' AND lease_until>clock_timestamp()`,
+		job.ID, job.ClaimGeneration, encodeStoredText(ErrUserExcluded.Error()))
+	if err := checkLeaseUpdate(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *Repository) BeginForegroundEvaluation(ctx context.Context, job *Job) error {

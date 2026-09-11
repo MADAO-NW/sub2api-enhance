@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -193,6 +194,35 @@ func TestExcludedUserBypassesAudit(t *testing.T) {
 	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config}}}
 	service := &Service{config: manager}
 	require.Nil(t, service.Check(context.Background(), IntakeRequest{UserID: 7, Provider: "openai"}))
+	_, _, err := manager.EvaluationBinding(7)
+	require.ErrorIs(t, err, ErrUserExcluded)
+	_, _, err = manager.EvaluationBindingAllowExcluded(7)
+	require.NoError(t, err)
+}
+
+func TestSavingNewExclusionTerminatesQueuedAndRetryJobs(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	current := storedConfig{Config: testConfig(), Revision: 1, EncryptedKeys: map[string]string{"test-node": "encrypted-value"}}
+	raw, err := json.Marshal(current)
+	require.NoError(t, err)
+	next := current.Config
+	next.ExcludedUserIDs = []int64{7}
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(configLockKey).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT value FROM sub2api_enhance.settings").WithArgs(SettingKey).WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(string(raw)))
+	mock.ExpectExec("INSERT INTO sub2api_enhance.settings").WithArgs(SettingKey, sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE sub2api_enhance.third_party_prompt_audit_jobs").WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectCommit()
+	storedNext := storedConfig{Config: next, Revision: 2, EncryptedKeys: map[string]string{"test-node": "encrypted-value"}}
+	nextRaw, err := json.Marshal(storedNext)
+	require.NoError(t, err)
+	mock.ExpectQuery("SELECT key,value FROM sub2api_enhance.settings").WithArgs(SettingKey).WillReturnRows(sqlmock.NewRows([]string{"key", "value"}).AddRow(SettingKey, string(nextRaw)))
+	manager := &ConfigManager{db: db}
+	_, err = manager.Save(context.Background(), ConfigUpdate{ExpectedRevision: 1, Config: next, Keys: []KeyUpdate{{ModelID: "test-node", Action: "keep"}}}, 9)
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestAutomaticRequestWithoutCurrentUserDoesNotCreateJob(t *testing.T) {

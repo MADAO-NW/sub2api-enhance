@@ -129,3 +129,21 @@ func TestTargetHealthMigrationPreservesLegacyEvidenceAndAddsNewKinds(t *testing.
 	require.NotContains(t, strings.ToUpper(sql), "DELETE FROM")
 	require.NotContains(t, strings.ToUpper(sql), "DROP COLUMN")
 }
+
+func TestRedisProjectionMigrationAddsOnlyIncrementalWatermarksAndIndexes(t *testing.T) {
+	raw, err := files.ReadFile("007_prompt_audit_redis_projection.sql")
+	require.NoError(t, err)
+	sql := string(raw)
+	for _, required := range []string{
+		"ADD COLUMN updated_at TIMESTAMPTZ",
+		"SET updated_at = COALESCE(finished_at, dispatch_started_at, created_at)",
+		"enhance_captures_updated_idx",
+		"tppa_jobs_updated_idx",
+		"tppa_actions_updated_idx",
+		"tppa_attempts_updated_idx",
+	} {
+		require.Contains(t, sql, required)
+	}
+	require.NotContains(t, strings.ToUpper(sql), "DELETE FROM")
+	require.NotContains(t, strings.ToUpper(sql), "DROP COLUMN")
+}

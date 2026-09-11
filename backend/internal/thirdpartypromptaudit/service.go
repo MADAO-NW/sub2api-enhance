@@ -37,9 +37,16 @@ type Service struct {
 	active        atomic.Int64
 	running       atomic.Bool
 	metrics       *RuntimeMetrics
+	redis         *RedisStore
 	flightMu      sync.Mutex
 	flights       map[string]*evaluationFlight
 	flightLeaders map[int64]string
+}
+
+// SetRedisStore 在服务对外启动前装配可重建的统计投影与审核热缓存。
+func (s *Service) SetRedisStore(store *RedisStore) {
+	s.redis = store
+	s.repo.SetRedisStore(store)
 }
 
 type evaluationFlight struct {
@@ -59,6 +66,8 @@ func (s *Service) Start(parent context.Context) error {
 		return nil
 	}
 	s.ctx, s.cancel = context.WithCancel(parent)
+	s.repo.SetProjectionContext(s.ctx)
+	s.repo.WarmStatsProjections(s.ctx)
 	s.closing = false
 	err := s.config.upgradeLegacyDefaultPolicy(s.ctx)
 	if err == nil {
@@ -83,7 +92,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 	done := make(chan struct{})
-	go func() { s.foreground.Wait(); s.wg.Wait(); close(done) }()
+	go func() { s.foreground.Wait(); s.wg.Wait(); s.repo.statsWG.Wait(); close(done) }()
 	select {
 	case <-done:
 		return nil
@@ -228,6 +237,10 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 	}
 	outcome, failure := s.processJob(ctx, job, true)
 	if failure != nil {
+		if failure.Code == "user_excluded" {
+			result.Kind, result.ErrorCode = IngressDecisionAllow, "user_excluded"
+			return result
+		}
 		result.Kind, result.ErrorCode = IngressDecisionUnavailable, "third_party_audit_unavailable"
 		return result
 	}
@@ -302,9 +315,18 @@ func (s *Service) processJob(parent context.Context, job *Job, foreground bool) 
 		}
 		started := time.Now()
 		var failure *AuditError
-		binding, keys, err := s.config.EvaluationBinding(job.UserID)
+		var binding ConfigSnapshot
+		var keys map[string]string
+		var err error
+		if job.IngressStage == "manual_capture_reprocess" || job.CurrentRequestedBy != nil {
+			binding, keys, err = s.config.EvaluationBindingAllowExcluded(job.UserID)
+		} else {
+			binding, keys, err = s.config.EvaluationBinding(job.UserID)
+		}
 		if errors.Is(err, ErrAuditPaused) {
 			failure = persistenceFailure(err, "audit_paused")
+		} else if errors.Is(err, ErrUserExcluded) {
+			failure = persistenceFailure(err, "user_excluded")
 		} else if err != nil {
 			failure = &AuditError{Code: "evaluation_binding_unavailable", Stage: "config", Message: err.Error(), Retryable: true}
 		} else {
@@ -520,6 +542,15 @@ func (s *Service) finishFailure(ctx context.Context, job *Job, failure *AuditErr
 		failure = persistenceFailure(cause, "lease_renew_failed")
 	}
 	if failure.Code == "lease_lost" {
+		return failure
+	}
+	if !job.Dispatched && failure.Code == "user_excluded" {
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
+		defer cancel()
+		if err := s.repo.SkipExcluded(persistCtx, job); err != nil {
+			s.noteError("excluded_skip_failed", err)
+		}
+		s.notify()
 		return failure
 	}
 	if !job.Dispatched && job.ExecutionMode == "async" && (failure.Code == "capacity_saturated" || failure.Code == "temporarily_unhealthy" || failure.Code == "audit_paused") {

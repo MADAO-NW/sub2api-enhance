@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lib/pq"
 	appconfig "sub2api-enhance/internal/config"
 	infraerrors "sub2api-enhance/internal/pkg/errors"
 	"sub2api-enhance/internal/pkg/logger"
@@ -49,6 +50,7 @@ const defaultDisableLimit = 1
 var legacyDefaultPolicySHA256 = map[string]struct{}{
 	"9071cf397aa94bca6982620a56c908a5977fdfc94206c7e198f160c5f65b2e0d": {},
 	"4ebb50f2c9183ab5c20214d094f291ae1571cbbd931a16f6bcca9915043a011c": {},
+	"88606d5072b66a33a6a91f720e9989a99304c68210589be24131feb605a76734": {},
 }
 
 type ModelConfig struct {
@@ -619,6 +621,12 @@ func (m *ConfigManager) EffectiveModeForUser(userID int64) string {
 	return effectiveConfigForUser(m.active.Stored.Config, userID).Mode
 }
 
+func (m *ConfigManager) IsExcluded(userID int64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.active != nil && m.loadError == nil && slices.Contains(m.active.Stored.ExcludedUserIDs, userID)
+}
+
 // CaptureWhenAuditOff 返回全局关闭时是否仍启用独立原文采集。
 func (m *ConfigManager) CaptureWhenAuditOff() bool {
 	m.mu.RLock()
@@ -628,6 +636,15 @@ func (m *ConfigManager) CaptureWhenAuditOff() bool {
 
 // EvaluationBinding 在同一配置读锁内冻结当前用户规则、审核节点及节点凭据。
 func (m *ConfigManager) EvaluationBinding(userID int64) (ConfigSnapshot, map[string]string, error) {
+	return m.evaluationBinding(userID, false)
+}
+
+// EvaluationBindingAllowExcluded 仅供管理员明确发起的人工审核绕过自动排除名单。
+func (m *ConfigManager) EvaluationBindingAllowExcluded(userID int64) (ConfigSnapshot, map[string]string, error) {
+	return m.evaluationBinding(userID, true)
+}
+
+func (m *ConfigManager) evaluationBinding(userID int64, allowExcluded bool) (ConfigSnapshot, map[string]string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.active == nil || m.loadError != nil {
@@ -635,6 +652,9 @@ func (m *ConfigManager) EvaluationBinding(userID int64) (ConfigSnapshot, map[str
 	}
 	if m.active.Stored.Mode == "off" {
 		return ConfigSnapshot{}, nil, ErrAuditPaused
+	}
+	if !allowExcluded && slices.Contains(m.active.Stored.ExcludedUserIDs, userID) {
+		return ConfigSnapshot{}, nil, ErrUserExcluded
 	}
 	snapshot := ConfigSnapshot{Config: effectiveConfigForUser(m.active.Stored.Config, userID), Revision: m.active.Stored.Revision,
 		WarningRuleRevision: m.active.Stored.WarningRuleRevision, ContractVersion: ContractVersion, FixedContract: OutputContract}
@@ -776,6 +796,19 @@ func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID in
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.settings (key,value,updated_at) VALUES ($1,$2,NOW()) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at`, SettingKey, string(encoded)); err != nil {
 		return PublicConfig{}, err
+	}
+	newlyExcluded := make([]int64, 0)
+	for _, userID := range next.ExcludedUserIDs {
+		if !slices.Contains(current.ExcludedUserIDs, userID) {
+			newlyExcluded = append(newlyExcluded, userID)
+		}
+	}
+	if len(newlyExcluded) > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs SET
+		 status='skipped',finished_at=clock_timestamp(),lease_until=NULL,failure_stage=NULL,last_error_code='user_excluded',last_error_message=$2,updated_at=clock_timestamp()
+		 WHERE user_id=ANY($1) AND status IN ('queued','retry') AND result_checkpoint IS NULL`, pq.Array(newlyExcluded), encodeStoredText(ErrUserExcluded.Error())); err != nil {
+			return PublicConfig{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return PublicConfig{}, err

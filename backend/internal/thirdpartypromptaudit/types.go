@@ -18,7 +18,7 @@ const (
 	ReuseModeForce = "force"
 )
 
-// 审核目标类型区分新合并目标和只读历史片段。
+// 审核目标类型区分新分阶段目标和只读历史片段。
 const (
 	TargetKindLegacySegment      = "legacy_segment"
 	TargetKindCurrentUser        = "current_user"

@@ -85,6 +85,13 @@ func run(info systemupdate.BuildInfo) error {
 	ingressDB.SetMaxOpenConns(cfg.IngressConnections)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	redisCtx, redisCancel := context.WithTimeout(ctx, 5*time.Second)
+	redisStore, err := audit.NewRedisStore(redisCtx, cfg.EnhanceRedisURL, cfg.AuditCacheTTL)
+	redisCancel()
+	if err != nil {
+		return err
+	}
+	defer redisStore.Close()
 	initCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	err = migrations.Run(initCtx, db)
 	cancel()
@@ -96,6 +103,7 @@ func run(info systemupdate.BuildInfo) error {
 	if err != nil {
 		return err
 	}
+	core.Service.SetRedisStore(redisStore)
 	client := sub2api.NewClient(cfg)
 	core.Service.SetAccountClient(client)
 	proxy, err := ingress.New(cfg.OfficialURL, captures, core.Service, sub2api.NewIdentityStore(ingressDB))

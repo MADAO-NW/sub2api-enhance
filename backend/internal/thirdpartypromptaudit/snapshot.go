@@ -49,7 +49,8 @@ type TextBlock struct {
 
 type Segment struct {
 	SegmentMeta
-	Content []TextBlock `json:"content"`
+	Content           []TextBlock `json:"content"`
+	logicalMessageKey string
 }
 
 type protocolMessage struct {
@@ -545,6 +546,7 @@ func ExtractSegments(snapshot *InputSnapshot, scope string) ([]Segment, error) {
 			}
 		}
 		messageIDs = append(messageIDs, identity)
+		segments[len(segments)-1].logicalMessageKey = identity
 	}
 	starts := make(map[string]int)
 	for i, segment := range segments {
