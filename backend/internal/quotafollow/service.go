@@ -223,8 +223,17 @@ func (s *Service) detect(ctx context.Context) error {
 	}
 	transition, _ := json.Marshal(map[string]any{"before_accounts": runtime.Accounts, "after_accounts": discovery.Accounts, "before_states": runtime.States, "after_states": states})
 	result := "等待账号一致重置"
+	rebased := false
+	for _, state := range states {
+		if state.BaselineRebased {
+			rebased = true
+			break
+		}
+	}
 	if changed {
 		result = "已建立新账号基线"
+	} else if rebased {
+		result = "账号重置边界已调整，正在重新建立基线"
 	} else if boundary != nil {
 		result = "已确认账号一致重置"
 	}

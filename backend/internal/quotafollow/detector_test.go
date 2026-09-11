@@ -90,12 +90,40 @@ func TestNaturalBoundaryUsesOriginalTimezoneAndMonday(t *testing.T) {
 	require.False(t, naturalBoundary(monday, observed, "weekly", nil))
 }
 
-func TestRegressedResetBoundaryDoesNotReplaceTrustedBaseline(t *testing.T) {
-	now := time.Now().UTC()
+func TestRegressedResetBoundaryRebuildsBaselineBeforeNextStableObservation(t *testing.T) {
+	now := time.Date(2026, 9, 7, 8, 0, 0, 0, time.UTC)
 	known := now.Add(time.Hour)
 	regressed := now.Add(time.Minute)
-	state := observe(AccountState{NextResetAt: &known}, sub2api.QuotaAccount{ID: 7}, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &regressed}, now, now.Add(-time.Hour), nil)
-	require.NotEmpty(t, state.Error)
-	require.Equal(t, known, *state.NextResetAt)
+	account := sub2api.QuotaAccount{ID: 7}
+	state := observe(AccountState{NextResetAt: &known}, account, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &regressed}, now, now.Add(-time.Hour), nil)
+	require.Empty(t, state.Error)
+	require.Equal(t, regressed, *state.NextResetAt)
+	require.True(t, state.BaselineRebased)
 	require.Nil(t, state.CandidateResetAt)
+
+	stable := observe(state, account, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &regressed}, now.Add(time.Minute), now.Add(-time.Hour), nil)
+	require.Empty(t, stable.Error)
+	require.False(t, stable.BaselineRebased)
+	require.Nil(t, stable.CandidateResetAt)
+}
+
+func TestRegressedPastBoundaryDoesNotCreateCandidateWhenBaselineRecovers(t *testing.T) {
+	now := time.Date(2026, 9, 7, 8, 0, 0, 0, time.UTC)
+	known := now.Add(-time.Hour)
+	regressed := now.Add(-2 * time.Hour)
+	account := sub2api.QuotaAccount{ID: 7}
+	rebased := observe(AccountState{NextResetAt: &known}, account, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &regressed}, now, now.Add(-3*time.Hour), nil)
+	require.True(t, rebased.BaselineRebased)
+
+	pastStable := observe(rebased, account, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &regressed}, now.Add(time.Minute), now.Add(-3*time.Hour), nil)
+	require.True(t, pastStable.BaselineRebased)
+
+	stableBoundary := now.Add(time.Hour)
+	stable := observe(pastStable, account, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &stableBoundary}, now.Add(2*time.Minute), now.Add(-3*time.Hour), nil)
+	require.False(t, stable.BaselineRebased)
+	require.Nil(t, stable.CandidateResetAt)
+
+	later := stableBoundary.Add(7 * 24 * time.Hour)
+	next := observe(stable, account, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &later}, stableBoundary.Add(time.Minute), now.Add(-3*time.Hour), nil)
+	require.Equal(t, stableBoundary, *next.CandidateResetAt)
 }

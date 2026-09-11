@@ -64,6 +64,7 @@ type AccountState struct {
 	Utilization       *json.Number         `json:"utilization"`
 	NextResetAt       *time.Time           `json:"next_reset_at"`
 	CandidateResetAt  *time.Time           `json:"candidate_reset_at"`
+	BaselineRebased   bool                 `json:"baseline_rebased"`
 	ObservedAt        *time.Time           `json:"observed_at"`
 	UpstreamUpdatedAt *time.Time           `json:"upstream_updated_at"`
 	SuspectedDrop     bool                 `json:"suspected_drop"`
@@ -179,18 +180,25 @@ func observe(previous AccountState, account sub2api.QuotaAccount, usage sub2api.
 		next.Error = "账号用量快照早于上次观测来源"
 		return next
 	}
-	if previous.NextResetAt != nil && usage.ResetsAt.Before(*previous.NextResetAt) {
-		next.Error = "账号重置边界发生回退，本轮不用于自动重置"
-		return next
-	}
 	if previous.Utilization != nil {
 		if before, ok := new(big.Rat).SetString(previous.Utilization.String()); ok && value.Cmp(before) < 0 {
 			next.SuspectedDrop = true
 		}
 	}
-	if previous.NextResetAt != nil && !now.Before(*previous.NextResetAt) && usage.ResetsAt.After(*previous.NextResetAt) && !previous.NextResetAt.Before(enabledAt) && (lastEvent == nil || previous.NextResetAt.After(*lastEvent)) {
-		boundary := *previous.NextResetAt
-		next.CandidateResetAt = &boundary
+	if previous.NextResetAt != nil {
+		if usage.ResetsAt.Before(*previous.NextResetAt) {
+			// 上游窗口可能因账号窗口修正而提前，接受新边界但要求下一次稳定观测后再确认重置。
+			next.NextResetAt = usage.ResetsAt
+			next.CandidateResetAt = nil
+			next.BaselineRebased = true
+		} else if previous.BaselineRebased {
+			next.CandidateResetAt = nil
+			// 回退到过去的边界时，必须等到新的边界重新落在未来，避免回升被误判为重置。
+			next.BaselineRebased = usage.ResetsAt.Before(now)
+		} else if !now.Before(*previous.NextResetAt) && usage.ResetsAt.After(*previous.NextResetAt) && !previous.NextResetAt.Before(enabledAt) && (lastEvent == nil || previous.NextResetAt.After(*lastEvent)) {
+			boundary := *previous.NextResetAt
+			next.CandidateResetAt = &boundary
+		}
 	}
 	next.Utilization = usage.Utilization
 	next.NextResetAt = usage.ResetsAt

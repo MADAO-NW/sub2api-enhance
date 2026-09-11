@@ -40,8 +40,8 @@ func carryoverHealth(cfg SavedConfig, runtime Runtime, now time.Time) error {
 	}
 	var first, last time.Time
 	for _, state := range runtime.States {
-		if state.Error != "" || state.ObservedAt == nil || now.Sub(*state.ObservedAt) > time.Duration(cfg.MaxInterval)*time.Minute || state.ObservedAt.After(now) || state.NextResetAt == nil || !state.NextResetAt.After(now) {
-			return errors.New("周一结转暂停：账号证据失效、过旧或官方重置边界已到达")
+		if state.Error != "" || state.BaselineRebased || state.ObservedAt == nil || now.Sub(*state.ObservedAt) > time.Duration(cfg.MaxInterval)*time.Minute || state.ObservedAt.After(now) || state.NextResetAt == nil || !state.NextResetAt.After(now) {
+			return errors.New("周一结转暂停：账号基线正在重建、证据失效、过旧或官方重置边界已到达")
 		}
 		if first.IsZero() || state.NextResetAt.Before(first) {
 			first = *state.NextResetAt

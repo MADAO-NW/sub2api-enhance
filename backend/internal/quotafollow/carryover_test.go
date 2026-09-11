@@ -64,6 +64,10 @@ func TestCarryoverRequiresFreshAlignedAccountsAndExplicitEnvironment(t *testing.
 	r := Runtime{Epoch: "epoch", Accounts: []sub2api.QuotaAccount{{ID: 1}}, States: []AccountState{{ObservedAt: &now, NextResetAt: &boundary}}}
 	require.NoError(t, carryoverHealth(cfg, r, now))
 	require.Error(t, carryoverHealth(cfg, r, now.Add(16*time.Minute)))
+	r.States[0].ObservedAt = &now
+	r.States[0].BaselineRebased = true
+	require.ErrorContains(t, carryoverHealth(cfg, r, now), "基线正在重建")
+	r.States[0].BaselineRebased = false
 	r.States[0].Error = "upstream error"
 	require.Error(t, carryoverHealth(cfg, r, now))
 	require.ErrorContains(t, (&Service{}).carryoverPrerequisite(), "Flusher")

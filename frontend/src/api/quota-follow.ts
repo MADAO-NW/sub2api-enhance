@@ -3,7 +3,7 @@ export interface FollowConfig {enabled:boolean;group_id:number|null;reset_weekly
 export interface SavedFollowConfig extends FollowConfig {revision:number;epoch:string;enabled_at:string|null;updated_by:number;updated_at:string}
 export interface Account {id:number;name:string;type:string}
 export interface User {id:number;username:string;email:string}
-export interface AccountState {account:Account;utilization:number|null;next_reset_at:string|null;candidate_reset_at:string|null;observed_at:string|null;suspected_drop:boolean;error:string}
+export interface AccountState {account:Account;utilization:number|null;next_reset_at:string|null;candidate_reset_at:string|null;baseline_rebased?:boolean;observed_at:string|null;suspected_drop:boolean;error:string}
 export interface FollowRuntime {carryover_error:string;account_states:AccountState[];accounts:Account[];last_event_at:string|null;last_checked_at:string|null;next_check_at:string|null;last_error:string;paused_revision:number|null;redis_status:string;collector_error:string;original_timezone:string}
 export interface QuotaSnapshot {daily_usage_usd:string;weekly_usage_usd:string;daily_window_start:string|null;weekly_window_start:string|null;observed_at:string}
 export interface ResetRecord {action_type:string;before_usage_usd?:string|null;after_usage_usd?:string|null;accounts?:Account[];id:number;source:string;source_detail:string;evidence_type:string;user_id:number;username:string;window:string|null;occurred_at:string;detected_at:string;status:string;event_id:number|null;delivery_id:number|null;audit_log_id:number|null;request_id:string;error_message:string;before_snapshot?:QuotaSnapshot|null;after_snapshot?:QuotaSnapshot|null;evidence?:unknown}
