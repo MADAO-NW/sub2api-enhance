@@ -42,6 +42,7 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	q.PUT("/config", quota.SaveConfig)
 	q.GET("/runtime", quota.Runtime)
 	q.GET("/discovery", quota.Discovery)
+	q.POST("/reset-now", quota.ImmediateReset)
 	q.GET("/reset-records", quota.Records)
 	q.GET("/reset-records/:id", quota.Detail)
 	q.POST("/reset-records/:id/repair-cache", quota.RepairCache)

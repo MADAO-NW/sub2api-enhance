@@ -76,6 +76,25 @@ func (h *Handler) Discovery(c *gin.Context) {
 	}
 	response.Success(c, value)
 }
+func (h *Handler) ImmediateReset(c *gin.Context) {
+	var input ImmediateResetRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "立即重置参数无效")
+		return
+	}
+	result, err := h.service.ImmediateReset(c.Request.Context(), input)
+	if err != nil {
+		if errors.Is(err, errImmediateResetInvalidGroup) || errors.Is(err, errImmediateResetNoWindow) || errors.Is(err, errImmediateResetWindow) {
+			response.BadRequest(c, err.Error())
+			return
+		}
+		respondError(c, err)
+		return
+	}
+	actor, _ := middleware.GetAuthSubjectFromContext(c)
+	middleware.SetAuditExtra(c, map[string]any{"actor_user_id": actor.UserID, "group_id": input.GroupID, "windows": result.Windows, "total": result.Total, "succeeded": result.Succeeded, "non_success": result.NonSuccess})
+	response.Success(c, result)
+}
 func (h *Handler) Records(c *gin.Context) {
 	f := Filter{Source: c.Query("source"), Detail: c.Query("source_detail"), Window: c.Query("window"), Status: c.Query("status"), Keyword: c.Query("keyword")}
 	var err error
