@@ -49,7 +49,7 @@ func (r *Repository) SetProjectionContext(ctx context.Context) { r.projectionCtx
 const jobColumns = `COALESCE(capture.created_at,j.created_at) AS captured_at,j.capture_id,j.id,j.capture_key,j.user_id,j.api_key_id,j.group_id,
 j.request_id,j.conversation_key,j.identity_snapshot,COALESCE(NULLIF(display_user.username,''),j.identity_snapshot::json->>'username','') AS display_username,
 COALESCE(NULLIF(display_user.email,''),j.identity_snapshot::json->>'user_email','') AS display_email,j.platform,j.protocol,j.ingress_stage,j.requested_model,j.execution_mode,j.audit_round,j.current_run_kind,j.current_requested_by,
-j.reuse_mode,j.disable_counted,j.config_revision,j.snapshot_status,j.input_hash,j.target_hash,j.evaluation_hash,j.status,j.attempts,j.max_attempts,
+j.reuse_mode,j.reaudit_batch_id,j.disable_counted,j.config_revision,j.snapshot_status,j.input_hash,j.target_hash,j.evaluation_hash,j.status,j.attempts,j.max_attempts,
 j.claim_generation,j.lease_until,j.next_attempt_at,j.reuse_metrics,j.failure_stage,j.last_error_code,j.last_error_message,
 j.gateway_result,j.gateway_completed_at,j.gateway_duration_ms,j.started_at,j.finished_at,
 COALESCE((SELECT count(*) FROM json_array_elements(COALESCE(j.input_manifest,'[]')::json) manifest WHERE manifest->>'selection_kind'='current_user'),0) AS current_user_count,

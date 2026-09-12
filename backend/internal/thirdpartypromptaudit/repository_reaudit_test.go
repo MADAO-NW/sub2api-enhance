@@ -15,7 +15,7 @@ func TestCreateReauditRequeuesOriginalJob(t *testing.T) {
 	mock.ExpectQuery(`SELECT j.id,j.user_id,j.snapshot_status='complete'.*FROM sub2api_enhance.third_party_prompt_audit_jobs j`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "ready", "active_id"}).AddRow(int64(7), int64(5), true, nil))
 	mock.ExpectQuery(`UPDATE sub2api_enhance.third_party_prompt_audit_jobs root SET.*audit_round=audit_round\+1.*attempts=0.*RETURNING root.id`).
-		WithArgs(int64(42), int64(9), sqlmock.AnyArg(), ReuseModeAllow, MaxEvaluationAttempts, int64(7)).
+		WithArgs(int64(42), int64(9), sqlmock.AnyArg(), ReuseModeAllow, nil, MaxEvaluationAttempts, int64(7)).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(7)))
 
 	result, err := NewRepository(db).CreateReaudits(context.Background(), ReauditRequest{}, ConfigSnapshot{Revision: 9}, 42)

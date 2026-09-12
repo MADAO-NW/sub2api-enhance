@@ -22,6 +22,7 @@ type memoryAuditStore struct {
 	whole                    *Outcome
 	wholeReads, segmentReads int
 	startError               error
+	forceTargets             map[string]string
 }
 
 func (s *memoryAuditStore) PrepareAttempt(_ context.Context, _ *Job, a *ModelAttempt) error {
@@ -63,6 +64,116 @@ func (s *memoryAuditStore) SaveSegment(_ context.Context, _ *Job, result *Segmen
 	}
 	s.segments[result.AuditKey] = *result
 	return nil
+}
+
+func (s *memoryAuditStore) ClaimForceTarget(_ context.Context, batchID, auditKey string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.forceTargets == nil {
+		s.forceTargets = map[string]string{}
+	}
+	key := batchID + ":" + auditKey
+	if _, exists := s.forceTargets[key]; exists {
+		return false, nil
+	}
+	s.forceTargets[key] = "pending"
+	return true, nil
+}
+
+func (s *memoryAuditStore) ForceTargetState(_ context.Context, batchID, auditKey string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.forceTargets[batchID+":"+auditKey], nil
+}
+
+func (s *memoryAuditStore) CompleteForceTarget(_ context.Context, batchID, auditKey string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.forceTargets[batchID+":"+auditKey] = "succeeded"
+	return nil
+}
+
+func (s *memoryAuditStore) ReleaseForceTarget(_ context.Context, batchID, auditKey string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.forceTargets, batchID+":"+auditKey)
+	return nil
+}
+
+func TestForcedBatchWritesGlobalSegmentAndReusesItForLaterJob(t *testing.T) {
+	store := &memoryAuditStore{}
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"confidence\":0.1,\"reason\":\"正常\"}"}}]}`))
+	}))
+	defer server.Close()
+	evaluator := &Evaluator{store: store, client: &ModelClient{attempts: store}, segmentFlights: make(map[string]*segmentFlight)}
+	service := &Service{evaluator: evaluator, flights: make(map[string]*evaluationFlight)}
+	first := evaluationJob(t, server.URL, `{"input":"批次相同输入"}`)
+	second := evaluationJob(t, server.URL, `{"input":"批次相同输入"}`)
+	first.ID, second.ID = 1, 2
+	first.ReuseMode, second.ReuseMode = ReuseModeForce, ReuseModeForce
+	first.ReauditBatchID, second.ReauditBatchID = "batch-1", "batch-1"
+	_, err := prepareTarget(first)
+	require.NoError(t, err)
+	_, err = prepareTarget(second)
+	require.NoError(t, err)
+	_, firstFailure := service.evaluateWithInflightReuse(context.Background(), first)
+	secondResult, secondFailure := service.evaluateWithInflightReuse(context.Background(), second)
+	require.Nil(t, firstFailure)
+	require.Nil(t, secondFailure)
+	require.EqualValues(t, 1, calls.Load())
+	require.Len(t, store.segments, 1)
+	require.Equal(t, "force_batch", secondResult.Models[0].TargetUses[0].ReuseKind)
+}
+
+func TestForcedBatchCoordinatesFirstCallAcrossEvaluators(t *testing.T) {
+	store := &memoryAuditStore{}
+	var calls atomic.Int32
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			started <- struct{}{}
+			<-release
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"confidence\":0.1,\"reason\":\"正常\"}"}}]}`))
+	}))
+	defer server.Close()
+	firstEvaluator := &Evaluator{store: store, client: &ModelClient{attempts: store}, segmentFlights: make(map[string]*segmentFlight)}
+	secondEvaluator := &Evaluator{store: store, client: &ModelClient{attempts: store}, segmentFlights: make(map[string]*segmentFlight)}
+	firstService := &Service{evaluator: firstEvaluator, flights: make(map[string]*evaluationFlight)}
+	secondService := &Service{evaluator: secondEvaluator, flights: make(map[string]*evaluationFlight)}
+	first := evaluationJob(t, server.URL, `{"input":"跨实例批次相同输入"}`)
+	second := evaluationJob(t, server.URL, `{"input":"跨实例批次相同输入"}`)
+	first.ID, second.ID = 11, 12
+	first.ReuseMode, second.ReuseMode = ReuseModeForce, ReuseModeForce
+	first.ReauditBatchID, second.ReauditBatchID = "batch-cross-instance", "batch-cross-instance"
+	_, err := prepareTarget(first)
+	require.NoError(t, err)
+	_, err = prepareTarget(second)
+	require.NoError(t, err)
+	results := make(chan *Evaluation, 2)
+	failures := make(chan *AuditError, 2)
+	go func() {
+		result, failure := firstService.evaluateWithInflightReuse(context.Background(), first)
+		results <- result
+		failures <- failure
+	}()
+	<-started
+	go func() {
+		result, failure := secondService.evaluateWithInflightReuse(context.Background(), second)
+		results <- result
+		failures <- failure
+	}()
+	close(release)
+	firstResult, secondResult := <-results, <-results
+	require.Nil(t, <-failures)
+	require.Nil(t, <-failures)
+	require.NotNil(t, firstResult)
+	require.NotNil(t, secondResult)
+	require.EqualValues(t, 1, calls.Load())
 }
 
 func TestInflightReuseIsGlobalUnlessFreshAuditIsForced(t *testing.T) {

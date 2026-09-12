@@ -29,6 +29,7 @@ async function showProbeDetails(id: number) {
 const probing = ref<string[]>([])
 const listingModels = ref<string[]>([])
 const resetting = ref(false)
+const testingAdminEmail = ref(false)
 const selectedResetUserID = ref<number | null>(null)
 const selectedRuleUserID = ref<number | null>(null)
 const probeInputKind = ref('text')
@@ -280,6 +281,15 @@ async function resetCounter() {
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { resetting.value = false }
 }
+async function testAdminEmail() {
+  if (!saved.value?.admin_email || draft.value?.admin_email !== saved.value.admin_email || testingAdminEmail.value) return
+  testingAdminEmail.value = true
+  try {
+    await api.testAdminEmail()
+    app.showSuccess(label('adminEmailTested'))
+  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { testingAdminEmail.value = false }
+}
 async function save() {
   if (!draft.value || !saved.value) return
   saving.value = true
@@ -412,7 +422,7 @@ watch(() => props.refreshKey, () => { void load(true) })
               <div v-if="draft.warning.enabled" class="space-y-3"><div class="grid grid-cols-2 gap-4"><label class="space-y-2"><span class="text-sm">{{ label('warningWindow') }}</span><input v-model.number="draft.warning.window" class="input" type="number" min="1" step="1" required /></label><label class="space-y-2"><span class="text-sm">{{ label('warningLimit') }}</span><input v-model.number="draft.warning.limit" class="input" type="number" min="1" :max="draft.warning.window" step="1" required /></label></div><p class="text-xs text-gray-500 dark:text-dark-400">{{ label('warningWindowHint') }}</p></div>
             </fieldset>
             <fieldset class="space-y-4"><label class="flex items-center gap-2"><input v-model="draft.disable.enabled" type="checkbox" />{{ label('disable') }}</label><label v-if="draft.disable.enabled" class="block space-y-2"><span class="text-sm">{{ label('disableLimit') }}</span><input v-model.number="draft.disable.limit" class="input" type="number" min="1" step="1" required /></label></fieldset>
-          </div><label class="block space-y-2"><span class="text-sm">{{ label('adminEmail') }}</span><input v-model="draft.admin_email" class="input" type="email" /><span class="block text-xs text-gray-500 dark:text-dark-400">{{ label('adminEmailHint') }}</span></label>
+          </div><div class="flex flex-wrap items-end gap-3"><label class="min-w-72 flex-1 space-y-2"><span class="text-sm">{{ label('adminEmail') }}</span><input v-model="draft.admin_email" class="input" type="email" /><span class="block text-xs text-gray-500 dark:text-dark-400">{{ label('adminEmailHint') }}</span></label><button type="button" class="btn btn-secondary self-end" data-test="test-admin-email" :disabled="saving || loading || testingAdminEmail || !saved.admin_email || draft.admin_email !== saved.admin_email" @click="testAdminEmail">{{ label(testingAdminEmail ? 'loading' : 'testAdminEmail') }}</button></div><p class="text-xs text-gray-500 dark:text-dark-400">{{ label('testAdminEmailHint') }}</p>
           <div class="border-t border-gray-200 pt-5 dark:border-dark-700">
             <h3 class="font-semibold">{{ label('userRules') }}</h3><p class="mb-4 mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('userRulesHint') }}</p>
             <div class="flex flex-wrap items-end gap-3"><label class="min-w-72 flex-1 space-y-2"><span class="text-sm">{{ label('user') }}</span><select v-model="selectedRuleUserID" class="input"><option :value="null">{{ label('chooseRuleUser') }}</option><option v-for="user in ruleUsers" :key="user.id" :value="user.id">{{ user.username }} (#{{ user.id }}) · {{ user.email }} · {{ userRoleLabel(user.role) }}</option></select></label><button type="button" class="btn btn-secondary" :disabled="!selectedRuleUserID" @click="addUserRule">{{ label('addUserRule') }}</button></div>

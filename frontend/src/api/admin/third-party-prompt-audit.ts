@@ -101,6 +101,7 @@ export interface AuditJob {
   audit_round: number
   current_requested_by: number | null
   reuse_mode: 'allow' | 'force'
+  reaudit_batch_id?: string
   disable_counted: boolean
   user_id: number
   api_key_id: number | null
@@ -196,6 +197,7 @@ const base = '/admin/third-party-prompt-audit'
 export const thirdPartyPromptAuditAPI = {
   async getConfig() { return (await apiClient.get<SavedConfig>(`${base}/config`)).data },
   async saveConfig(value: ConfigUpdate) { return (await apiClient.put<SavedConfig>(`${base}/config`, value)).data },
+  async testAdminEmail() { return (await apiClient.post(`${base}/test-email`)).data },
   async getContract() { return (await apiClient.get<Contract>(`${base}/contract`)).data },
   async listModels(value: { model_id: string; base_url: string; timeout_ms: number; key_action: 'keep' | 'replace'; api_key?: string }) {
     return (await apiClient.post<{ models: string[] }>(`${base}/models/list`, value)).data

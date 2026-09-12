@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/lib/pq"
 )
 
@@ -71,7 +72,7 @@ func outcomeView(outcome *Outcome, config *DecisionConfig) *OutcomeView {
 			}
 			byKind := view.TargetReuse.ByKind[kind]
 			byKind.Total++
-			if slices.Contains([]string{"history", "within_job", "inflight", "full_evaluation"}, segment.ReuseKind) {
+			if slices.Contains([]string{"history", "within_job", "inflight", "full_evaluation", "force_batch"}, segment.ReuseKind) {
 				view.SegmentReuse.Reused++
 				view.TargetReuse.Reused++
 				byKind.Reused++
@@ -121,15 +122,15 @@ const jobOutcomeSummary = `CASE WHEN o.id IS NULL THEN NULL ELSE json_build_obje
    'behavior_decision',m->'behavior_decision','behavior_confidence',m->'behavior_confidence','behavior_reason',m->'behavior_reason','behavior_uses',COALESCE(m->'behavior_uses','[]'::json),'behavior_error',m->'behavior_error',
    'max_segment_confidence',(SELECT MAX((s->'result'->>'confidence')::double precision) FROM jsonb_array_elements((COALESCE(m->'target_uses',m->'segments','[]'::json)::jsonb || COALESCE(m->'behavior_uses','[]'::json)::jsonb)) s))),'[]') FROM json_array_elements(o.model_results::json) m),
  'decision_config',json_build_object('revision',(o.config_snapshot::json->>'revision')::bigint,'review_threshold',o.config_snapshot::json->'review_threshold','block_threshold',o.config_snapshot::json->'block_threshold'),
- 'segment_reuse',(SELECT json_build_object('reused',count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')),'total',count(*),
-   'rate',CASE WHEN count(*)=0 THEN NULL ELSE (count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')))::double precision/count(*) END)
+ 'segment_reuse',(SELECT json_build_object('reused',count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation','force_batch')),'total',count(*),
+   'rate',CASE WHEN count(*)=0 THEN NULL ELSE (count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation','force_batch')))::double precision/count(*) END)
    FROM json_array_elements(o.model_results::json) m CROSS JOIN LATERAL jsonb_array_elements((COALESCE(m->'target_uses',m->'segments','[]'::json)::jsonb || COALESCE(m->'behavior_uses','[]'::json)::jsonb)) s),
- 'target_reuse',(SELECT json_build_object('reused',count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')),'total',count(*),
-   'rate',CASE WHEN count(*)=0 THEN NULL ELSE (count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')))::double precision/count(*) END,
+ 'target_reuse',(SELECT json_build_object('reused',count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation','force_batch')),'total',count(*),
+   'rate',CASE WHEN count(*)=0 THEN NULL ELSE (count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation','force_batch')))::double precision/count(*) END,
    'by_kind',COALESCE((SELECT json_object_agg(grouped.target_kind,json_build_object('reused',grouped.reused,'total',grouped.total,
      'rate',CASE WHEN grouped.total=0 THEN NULL ELSE grouped.reused::double precision/grouped.total END)) FROM (
        SELECT COALESCE(target->>'target_kind','legacy_segment') target_kind,
-         count(*) FILTER(WHERE target->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')) reused,count(*) total
+         count(*) FILTER(WHERE target->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation','force_batch')) reused,count(*) total
        FROM json_array_elements(o.model_results::json) model CROSS JOIN LATERAL jsonb_array_elements((COALESCE(model->'target_uses',model->'segments','[]'::json)::jsonb || COALESCE(model->'behavior_uses','[]'::json)::jsonb)) target
        GROUP BY COALESCE(target->>'target_kind','legacy_segment')) grouped),'{}'::json))
    FROM json_array_elements(o.model_results::json) m CROSS JOIN LATERAL jsonb_array_elements((COALESCE(m->'target_uses',m->'segments','[]'::json)::jsonb || COALESCE(m->'behavior_uses','[]'::json)::jsonb)) s)
@@ -569,6 +570,10 @@ func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest,
 	if err != nil {
 		return nil, err
 	}
+	batchID := ""
+	if request.ReuseMode == ReuseModeForce {
+		batchID = uuid.NewString()
+	}
 	for i := range result.Items {
 		item := &result.Items[i]
 		if item.Status != "ready" {
@@ -584,11 +589,11 @@ func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest,
 		var id int64
 		err = r.db.QueryRowContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs root SET
 		 audit_round=audit_round+1,current_run_kind='reaudit',current_requested_by=$1,config_revision=$2,config_snapshot=$3,
-		 reuse_mode=$4,status='queued',attempts=0,max_attempts=$5,claim_generation=claim_generation+1,lease_until=NULL,next_attempt_at=clock_timestamp(),
+		 reuse_mode=$4,reaudit_batch_id=$5,status='queued',attempts=0,max_attempts=$6,claim_generation=claim_generation+1,lease_until=NULL,next_attempt_at=clock_timestamp(),
 		 result_checkpoint=NULL,reuse_metrics='{"whole_lookups":0,"whole_hits":0,"segment_lookups":0,"segment_hits":0,"within_job_hits":0,"inflight_hits":0,"short_circuited_nodes":0}',
 		 failure_stage=NULL,last_error_code=NULL,last_error_message=NULL,started_at=NULL,finished_at=NULL,input_manifest=NULL,input_hash=NULL,target_hash=NULL,evaluation_hash=NULL,updated_at=clock_timestamp()
-		 WHERE root.id=$6 AND root.status IN ('done','failed','skipped') AND root.snapshot_status='complete' AND root.full_input_snapshot IS NOT NULL AND COALESCE(root.last_error_code,'')<>'no_text'
-		 RETURNING root.id`, actorID, snapshot.Revision, string(encoded), request.ReuseMode, MaxEvaluationAttempts, item.JobID).Scan(&id)
+		 WHERE root.id=$7 AND root.status IN ('done','failed','skipped') AND root.snapshot_status='complete' AND root.full_input_snapshot IS NOT NULL AND COALESCE(root.last_error_code,'')<>'no_text'
+		 RETURNING root.id`, actorID, snapshot.Revision, string(encoded), request.ReuseMode, nullIfEmpty(batchID), MaxEvaluationAttempts, item.JobID).Scan(&id)
 		if err == nil {
 			item.Status, item.JobID = "requeued", id
 			continue

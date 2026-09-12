@@ -21,6 +21,41 @@ type EvaluationStore interface {
 	SaveSegment(context.Context, *Job, *SegmentResult) error
 }
 
+type forceBatchCoordinator interface {
+	ClaimForceTarget(context.Context, string, string) (bool, error)
+	ForceTargetState(context.Context, string, string) (string, error)
+	CompleteForceTarget(context.Context, string, string) error
+	ReleaseForceTarget(context.Context, string, string) error
+}
+
+func (r *Repository) ClaimForceTarget(ctx context.Context, batchID, auditKey string) (bool, error) {
+	if r.redis == nil {
+		return true, nil
+	}
+	return r.redis.ClaimForceTarget(ctx, batchID, auditKey)
+}
+
+func (r *Repository) ForceTargetState(ctx context.Context, batchID, auditKey string) (string, error) {
+	if r.redis == nil {
+		return "", nil
+	}
+	return r.redis.ForceTargetState(ctx, batchID, auditKey)
+}
+
+func (r *Repository) CompleteForceTarget(ctx context.Context, batchID, auditKey string) error {
+	if r.redis == nil {
+		return nil
+	}
+	return r.redis.CompleteForceTarget(ctx, batchID, auditKey)
+}
+
+func (r *Repository) ReleaseForceTarget(ctx context.Context, batchID, auditKey string) error {
+	if r.redis == nil {
+		return nil
+	}
+	return r.redis.ReleaseForceTarget(ctx, batchID, auditKey)
+}
+
 func jobAuditRound(job *Job) int {
 	if job == nil || job.AuditRound < 1 {
 		return 1

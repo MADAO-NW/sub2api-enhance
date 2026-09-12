@@ -104,6 +104,15 @@ func (h *AdminHandler) UpdateConfig(c *gin.Context) {
 	response.Success(c, result)
 }
 
+func (h *AdminHandler) TestAdminEmail(c *gin.Context) {
+	if err := h.service.TestAdminEmail(c.Request.Context()); err != nil {
+		respondError(c, err)
+		return
+	}
+	middleware.SetAuditExtra(c, map[string]any{"result": "success", "operation": "test_admin_email"})
+	response.Success(c, gin.H{})
+}
+
 func (h *AdminHandler) GetContract(c *gin.Context) {
 	response.Success(c, gin.H{"version": ContractVersion, "default_policy": DefaultPolicy, "output_contract": OutputContract})
 }

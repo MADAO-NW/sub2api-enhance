@@ -139,6 +139,53 @@ func (s *RedisStore) SaveSegment(ctx context.Context, item SegmentResult) error 
 	return s.setJSON(ctx, "target:"+item.AuditKey, item, s.ttl)
 }
 
+func (s *RedisStore) ClaimForceTarget(ctx context.Context, batchID, auditKey string) (bool, error) {
+	ttl := s.ttl
+	if ttl < time.Second {
+		ttl = time.Second
+	}
+	claimed, err := s.client.SetNX(ctx, redisKeyPrefix+"force:"+batchID+":"+auditKey, "pending", ttl).Result()
+	if err != nil {
+		s.noteError(err)
+		return false, err
+	}
+	return claimed, nil
+}
+
+func (s *RedisStore) ForceTargetState(ctx context.Context, batchID, auditKey string) (string, error) {
+	state, err := s.client.Get(ctx, redisKeyPrefix+"force:"+batchID+":"+auditKey).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	if err != nil {
+		s.noteError(err)
+		return "", err
+	}
+	return state, nil
+}
+
+func (s *RedisStore) CompleteForceTarget(ctx context.Context, batchID, auditKey string) error {
+	key := redisKeyPrefix + "force:" + batchID + ":" + auditKey
+	ttlSeconds := int64(s.ttl / time.Second)
+	if ttlSeconds < 1 {
+		ttlSeconds = 1
+	}
+	if _, err := s.client.Eval(ctx, `if redis.call('GET', KEYS[1]) == 'pending' then return redis.call('SET', KEYS[1], 'succeeded', 'EX', ARGV[1]) else return 0 end`, []string{key}, ttlSeconds).Result(); err != nil {
+		s.noteError(err)
+		return err
+	}
+	return nil
+}
+
+func (s *RedisStore) ReleaseForceTarget(ctx context.Context, batchID, auditKey string) error {
+	key := redisKeyPrefix + "force:" + batchID + ":" + auditKey
+	if _, err := s.client.Eval(ctx, `if redis.call('GET', KEYS[1]) == 'pending' then return redis.call('DEL', KEYS[1]) else return 0 end`, []string{key}).Result(); err != nil {
+		s.noteError(err)
+		return err
+	}
+	return nil
+}
+
 func (s *RedisStore) FindWhole(ctx context.Context, evaluationHash, targetHash string) (*Outcome, error) {
 	var cached wholeCacheValue
 	ok, err := s.getJSON(ctx, "whole:"+evaluationHash+":"+targetHash, &cached)

@@ -50,6 +50,7 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	a := group.Group("/third-party-prompt-audit")
 	a.GET("/config", handler.GetConfig)
 	a.PUT("/config", handler.UpdateConfig)
+	a.POST("/test-email", handler.TestAdminEmail)
 	a.GET("/contract", handler.GetContract)
 	a.POST("/models/list", handler.ListModels)
 	a.POST("/models/probe", handler.ProbeModel)

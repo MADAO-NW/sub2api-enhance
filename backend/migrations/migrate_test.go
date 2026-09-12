@@ -146,6 +146,15 @@ func TestEffectiveBehaviorMigrationExtendsPublishedTargetChecks(t *testing.T) {
 	require.NotContains(t, strings.ToUpper(sql), "DROP COLUMN")
 }
 
+func TestReauditBatchMigrationAddsNullableBatchIdentity(t *testing.T) {
+	raw, err := files.ReadFile("009_prompt_audit_reaudit_batch.sql")
+	require.NoError(t, err)
+	sql := string(raw)
+	require.Contains(t, sql, "ALTER TABLE sub2api_enhance.third_party_prompt_audit_jobs")
+	require.Contains(t, sql, "ADD COLUMN IF NOT EXISTS reaudit_batch_id TEXT")
+	require.Contains(t, sql, "reuse_kind IN ('fresh', 'within_job', 'history', 'full_evaluation', 'inflight', 'force_batch')")
+}
+
 func TestRedisProjectionMigrationAddsOnlyIncrementalWatermarksAndIndexes(t *testing.T) {
 	raw, err := files.ReadFile("007_prompt_audit_redis_projection.sql")
 	require.NoError(t, err)

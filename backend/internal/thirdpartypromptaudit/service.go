@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	infraerrors "sub2api-enhance/internal/pkg/errors"
 	"sub2api-enhance/internal/pkg/logger"
 
 	"github.com/google/uuid"
@@ -57,6 +58,26 @@ type evaluationFlight struct {
 
 func NewService(repo *Repository, config *ConfigManager, evaluator *Evaluator, client *ModelClient, email notify.Sender) *Service {
 	return &Service{repo: repo, config: config, evaluator: evaluator, client: client, email: email, wake: make(chan struct{}, 1), metrics: NewRuntimeMetrics(), flights: make(map[string]*evaluationFlight), flightLeaders: make(map[int64]string)}
+}
+
+func (s *Service) TestAdminEmail(ctx context.Context) error {
+	public, err := s.config.Public()
+	if err != nil {
+		return err
+	}
+	if public.AdminEmail == "" {
+		return infraerrors.BadRequest("third_party_audit_admin_email_missing", "管理员通知邮箱未配置")
+	}
+	if s.email == nil {
+		return infraerrors.ServiceUnavailable("third_party_audit_smtp_unavailable", "邮件通知服务不可用")
+	}
+	if err := s.email.SendEmail(ctx, public.AdminEmail, "第三方提示词审计管理员邮箱测试", fmt.Sprintf("<p>第三方提示词审计管理员邮箱测试成功。</p><p>发送时间：%s</p>", time.Now().UTC().Format(time.RFC3339))); err != nil {
+		if errors.Is(err, notify.ErrNotConfigured) {
+			return infraerrors.ServiceUnavailable("third_party_audit_smtp_unavailable", "SMTP 通知未配置")
+		}
+		return infraerrors.ServiceUnavailable("third_party_audit_email_failed", "测试邮件发送失败").WithCause(err)
+	}
+	return nil
 }
 
 func (s *Service) Start(parent context.Context) error {
@@ -214,6 +235,15 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		return &IntakeDecision{Mode: mode, Kind: kind, ErrorCode: "third_party_audit_unavailable"}
 	}
 	job = stored
+	if created && inputErr == nil {
+		targetCtx, targetCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
+		err := s.repo.SaveCanonicalTargets(targetCtx, job, target)
+		targetCancel()
+		if err != nil {
+			_ = s.repo.Fail(ctx, job, &AuditError{Code: "target_persist_failed", Stage: "result_persist", Message: err.Error()}, false)
+			return &IntakeDecision{JobID: job.ID, Mode: mode, Kind: IngressDecisionUnavailable, ErrorCode: "third_party_audit_unavailable"}
+		}
+	}
 	result := &IntakeDecision{JobID: job.ID, Mode: mode, Kind: IngressDecisionAllow}
 	logger.LegacyPrintf("third_party_prompt_audit", "审核输入已保存 job_id=%d request_id=%s status=%s", job.ID, job.RequestID, job.Status)
 	if mode == "async" && !behaviorGuard {

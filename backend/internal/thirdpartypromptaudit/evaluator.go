@@ -74,15 +74,16 @@ func prepareTarget(job *Job) (auditTarget, error) {
 
 // prepareTargetForContract 按任务冻结的协议语义重建目标，避免历史轮次被新规则错误解释。
 func prepareTargetForContract(job *Job, contractVersion string) (auditTarget, error) {
-	if contractVersion != ContractVersion && contractVersion != previousLatestUserContractVersion && contractVersion != previousCurrentUserContractVersion {
+	if contractVersion != ContractVersion && contractVersion != previousEffectiveBehaviorContractVersion && contractVersion != previousLatestUserContractVersion && contractVersion != previousCurrentUserContractVersion {
 		return auditTarget{}, errors.New("不支持重建该历史审核协议的分阶段目标")
 	}
+	latestUserBehavior := contractVersion == ContractVersion || contractVersion == previousEffectiveBehaviorContractVersion
 	segments, err := ExtractSegments(job.FullInput, "full_request")
 	if err != nil {
 		return auditTarget{}, err
 	}
 	latestMessageKey := ""
-	if contractVersion == ContractVersion || contractVersion == previousLatestUserContractVersion {
+	if latestUserBehavior || contractVersion == previousLatestUserContractVersion {
 		for i := len(segments) - 1; i >= 0; i-- {
 			hasText := false
 			for _, block := range segments[i].Content {
@@ -114,7 +115,7 @@ func prepareTargetForContract(job *Job, contractVersion string) (auditTarget, er
 		case segment.SourceRole == "user" && segment.TurnScope == "current" && len(blocks) > 0 && (contractVersion == previousCurrentUserContractVersion || segment.logicalMessageKey == latestMessageKey):
 			segment.Selected = true
 			segment.SelectionKind = TargetKindCurrentUser
-			if contractVersion == ContractVersion || contractVersion == previousLatestUserContractVersion {
+			if latestUserBehavior || contractVersion == previousLatestUserContractVersion {
 				segment.SelectionReason = "latest_user"
 			} else {
 				segment.SelectionReason = "current_user_bundle"
@@ -128,7 +129,7 @@ func prepareTargetForContract(job *Job, contractVersion string) (auditTarget, er
 			segment.SelectionKind = TargetKindInstructionContext
 			segment.SelectionReason = "active_instruction"
 			target.InstructionContext = append(target.InstructionContext, segment)
-		case contractVersion == ContractVersion && segment.TurnScope == "current" && segment.Order > latestUserOrder && isEffectiveBehaviorCandidate(segment):
+		case latestUserBehavior && segment.TurnScope == "current" && segment.Order > latestUserOrder && isEffectiveBehaviorCandidate(segment):
 			segment.Selected = true
 			segment.SelectionKind = TargetKindEffectiveBehavior
 			segment.SelectionReason = "effective_behavior_delta"
@@ -157,7 +158,7 @@ func prepareTargetForContract(job *Job, contractVersion string) (auditTarget, er
 		return target, err
 	}
 	targetStage, scope := "current_user_behavior_context_guard", "current_user_behavior"
-	if contractVersion == ContractVersion {
+	if latestUserBehavior {
 		targetStage, scope = "latest_user_behavior_context_guard", "latest_user_behavior"
 	} else if contractVersion == previousLatestUserContractVersion {
 		targetStage, scope = "latest_user_context_guard", "latest_user"
@@ -772,7 +773,7 @@ func (e *Evaluator) evaluateAuditTarget(ctx context.Context, job *Job, model Mod
 	if failure != nil {
 		return SegmentUse{}, failure
 	}
-	if reuseKind == "history" {
+	if reuseKind == "history" || reuseKind == "force_batch" {
 		job.Reuse.SegmentHits++
 	} else if reuseKind == "inflight" {
 		job.Reuse.InflightHits++
@@ -783,6 +784,9 @@ func (e *Evaluator) evaluateAuditTarget(ctx context.Context, job *Job, model Mod
 // evaluateSegment 合并当前实例内完全相同的首次目标审核，并在领头调用前再次查询全库缓存。
 func (e *Evaluator) evaluateSegment(ctx context.Context, job *Job, modelID, auditKey string, fresh func() (SegmentResult, *AuditError)) (SegmentResult, string, *AuditError) {
 	if job.ReuseMode == ReuseModeForce {
+		if job.ReauditBatchID != "" {
+			return e.evaluateForceBatchSegment(ctx, job, modelID, auditKey, fresh)
+		}
 		result, failure := fresh()
 		return result, "fresh", failure
 	}
@@ -826,6 +830,89 @@ func (e *Evaluator) evaluateSegment(ctx context.Context, job *Job, modelID, audi
 		return SegmentResult{}, reuseKind, flight.failure
 	}
 	return flight.result, reuseKind, nil
+}
+
+// evaluateForceBatchSegment 为同一强制复核批次协调首个真实调用，并复用其成功的全局片段结果。
+func (e *Evaluator) evaluateForceBatchSegment(ctx context.Context, job *Job, modelID, auditKey string, fresh func() (SegmentResult, *AuditError)) (SegmentResult, string, *AuditError) {
+	flightKey := "force:" + job.ReauditBatchID + ":" + auditKey
+	e.segmentMu.Lock()
+	if e.segmentFlights == nil {
+		e.segmentFlights = make(map[string]*segmentFlight)
+	}
+	if current := e.segmentFlights[flightKey]; current != nil {
+		e.segmentMu.Unlock()
+		select {
+		case <-current.done:
+			if current.failure != nil {
+				failure := *current.failure
+				return SegmentResult{}, "inflight", &failure
+			}
+			return current.result, "inflight", nil
+		case <-ctx.Done():
+			return SegmentResult{}, "inflight", requestFailure(ctx.Err())
+		}
+	}
+	flight := &segmentFlight{done: make(chan struct{})}
+	e.segmentFlights[flightKey] = flight
+	e.segmentMu.Unlock()
+
+	coordinator, coordinated := e.store.(forceBatchCoordinator)
+	result, reuseKind := SegmentResult{}, "fresh"
+	var failure *AuditError
+	if !coordinated {
+		result, failure = fresh()
+	} else {
+		for failure == nil {
+			claimed, err := coordinator.ClaimForceTarget(ctx, job.ReauditBatchID, auditKey)
+			if err != nil {
+				failure = &AuditError{Code: "force_batch_coordination_failed", Stage: "worker", Message: err.Error(), Retryable: true}
+				break
+			}
+			if claimed {
+				result, failure = fresh()
+				if failure == nil {
+					// SaveSegment 已先写入全局片段表，再发布批次内成功标记。
+					_ = coordinator.CompleteForceTarget(ctx, job.ReauditBatchID, auditKey)
+				} else {
+					_ = coordinator.ReleaseForceTarget(context.WithoutCancel(ctx), job.ReauditBatchID, auditKey)
+				}
+				break
+			}
+			state, err := coordinator.ForceTargetState(ctx, job.ReauditBatchID, auditKey)
+			if err != nil {
+				failure = &AuditError{Code: "force_batch_coordination_failed", Stage: "worker", Message: err.Error(), Retryable: true}
+				break
+			}
+			if state == "succeeded" {
+				found, findErr := e.store.FindSegments(ctx, modelID, []string{auditKey})
+				if findErr != nil {
+					failure = &AuditError{Code: "force_batch_result_lookup_failed", Stage: "result_persist", Message: findErr.Error(), Retryable: true}
+					break
+				}
+				if cached, ok := found[auditKey]; ok {
+					result, reuseKind = cached, "force_batch"
+					break
+				}
+			}
+			timer := time.NewTimer(100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				failure = requestFailure(ctx.Err())
+			case <-timer.C:
+			}
+		}
+	}
+
+	e.segmentMu.Lock()
+	delete(e.segmentFlights, flightKey)
+	flight.result, flight.failure = result, failure
+	close(flight.done)
+	e.segmentMu.Unlock()
+	if failure != nil {
+		return SegmentResult{}, reuseKind, failure
+	}
+	return result, reuseKind, nil
 }
 
 func classifyScore(score float64, config Config) Decision {

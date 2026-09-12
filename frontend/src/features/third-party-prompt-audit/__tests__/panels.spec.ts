@@ -11,7 +11,7 @@ import BaseDialog from '@/components/common/BaseDialog.vue'
 import ThirdPartyPromptAuditView from '@/views/admin/ThirdPartyPromptAuditView.vue'
 import type { AuditJob, SavedConfig } from '@/api/admin/third-party-prompt-audit'
 
-const mocks = vi.hoisted(() => ({ getConfig: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(), listModels: vi.fn(), enableAndReset: vi.fn(), probeDetails: vi.fn(), probe: vi.fn(), saveConfig: vi.fn(), jobs: vi.fn(), job: vi.fn(), jobLatestUserContent: vi.fn(), captureLatestUserContent: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), stats: vi.fn(), runtime: vi.fn(), capture: vi.fn(), showError: vi.fn(), showSuccess: vi.fn() }))
+const mocks = vi.hoisted(() => ({ getConfig: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(), listModels: vi.fn(), enableAndReset: vi.fn(), probeDetails: vi.fn(), probe: vi.fn(), saveConfig: vi.fn(), testAdminEmail: vi.fn(), jobs: vi.fn(), job: vi.fn(), jobLatestUserContent: vi.fn(), captureLatestUserContent: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), stats: vi.fn(), runtime: vi.fn(), capture: vi.fn(), showError: vi.fn(), showSuccess: vi.fn() }))
 vi.mock('@/api/admin/third-party-prompt-audit', () => ({ thirdPartyPromptAuditAPI: mocks }))
 vi.mock('@/api/admin/groups', () => ({ getAll: mocks.groups }))
 vi.mock('@/stores/app', () => ({ useAppStore: () => mocks }))
@@ -32,6 +32,7 @@ beforeEach(() => {
   mocks.getConfig.mockResolvedValue(saved())
   mocks.getContract.mockResolvedValue({ version: 'v1', output_contract: 'fixed contract', default_policy: 'default policy' })
   mocks.saveConfig.mockImplementation(async value => ({ ...saved(), ...value.config, revision: 2 }))
+  mocks.testAdminEmail.mockResolvedValue({})
   mocks.groups.mockResolvedValue([])
   mocks.users.mockResolvedValue([])
   mocks.listModels.mockResolvedValue({ models: ['test', 'second-model'] })
@@ -44,6 +45,18 @@ beforeEach(() => {
 })
 
 describe('third-party audit configuration', () => {
+	it('tests the saved administrator notification email', async () => {
+		mocks.getConfig.mockResolvedValue({ ...saved(), admin_email: 'admin@example.invalid' })
+		const wrapper = mount(AuditConfigPanel); await flushPromises()
+		const button = wrapper.get('[data-test="test-admin-email"]')
+		expect((button.element as HTMLButtonElement).disabled).toBe(false)
+		await button.trigger('click'); await flushPromises()
+		expect(mocks.testAdminEmail).toHaveBeenCalledOnce()
+		expect(mocks.showSuccess).toHaveBeenCalledWith('adminEmailTested')
+		await wrapper.get('input[type="email"]').setValue('changed@example.invalid')
+		expect((button.element as HTMLButtonElement).disabled).toBe(true)
+		wrapper.unmount()
+	})
 	it('collapses saved model cards and supports bulk expansion', async () => {
 		const wrapper = mount(AuditConfigPanel); await flushPromises()
 		expect(wrapper.get('[data-test="model-card"]').attributes('open')).toBeUndefined()

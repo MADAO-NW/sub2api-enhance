@@ -15,13 +15,16 @@ import (
 )
 
 // ContractVersion 标识固定审核阶段、目标语义和模型返回格式，不承载管理员政策版本。
-const ContractVersion = "third-party-json-v4-effective-behavior"
+const ContractVersion = "third-party-json-v5-force-batch-reuse"
 
 // previousCurrentUserContractVersion 仅用于管理端还原已完成的旧 user 合并轮次。
 const previousCurrentUserContractVersion = "third-party-json-v2-current-user"
 
 // previousLatestUserContractVersion 仅用于管理端还原已完成的 v3 最新 user 轮次。
 const previousLatestUserContractVersion = "third-party-json-v3-latest-user"
+
+// previousEffectiveBehaviorContractVersion 仅用于管理端还原已完成的 v4 分阶段轮次。
+const previousEffectiveBehaviorContractVersion = "third-party-json-v4-effective-behavior"
 
 // DefaultPolicy 提供管理员可以编辑的初始业务审核政策。
 //

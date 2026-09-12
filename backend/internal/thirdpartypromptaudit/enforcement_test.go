@@ -5,6 +5,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/require"
+	infraerrors "sub2api-enhance/internal/pkg/errors"
 	"testing"
 	"time"
 )
@@ -87,6 +88,26 @@ func TestNotificationWorkerSendsAdminAndUserDeliveriesIndependently(t *testing.T
 	require.Equal(t, []string{"admin@example.invalid", "user@example.invalid"}, sender.recipients)
 	require.Equal(t, "sent", action.NotificationStatus)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestTestAdminEmailUsesAppliedAdministratorRecipient(t *testing.T) {
+	config := testConfig()
+	config.AdminEmail = "admin@example.invalid"
+	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config}}}
+	sender := &recordingEmailSender{}
+	service := &Service{config: manager, email: sender}
+
+	require.NoError(t, service.TestAdminEmail(context.Background()))
+	require.Equal(t, []string{"admin@example.invalid"}, sender.recipients)
+}
+
+func TestTestAdminEmailRejectsMissingAdministratorRecipient(t *testing.T) {
+	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: testConfig()}}}
+	service := &Service{config: manager, email: &recordingEmailSender{}}
+
+	err := service.TestAdminEmail(context.Background())
+	require.Equal(t, 400, infraerrors.Code(err))
+	require.Equal(t, "third_party_audit_admin_email_missing", infraerrors.Reason(err))
 }
 
 func TestDisableContributionFollowsTheLatestTaskDecision(t *testing.T) {

@@ -53,6 +53,7 @@ type Job struct {
 	AuditRound         int             `json:"audit_round"`
 	CurrentRequestedBy *int64          `json:"current_requested_by"`
 	ReuseMode          string          `json:"reuse_mode"`
+	ReauditBatchID     string          `json:"reaudit_batch_id,omitempty"`
 	DisableCounted     bool            `json:"disable_counted"`
 	UserID             int64           `json:"user_id"`
 	APIKeyID           *int64          `json:"api_key_id"`
