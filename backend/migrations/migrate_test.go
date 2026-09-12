@@ -122,6 +122,7 @@ func TestTargetHealthMigrationPreservesLegacyEvidenceAndAddsNewKinds(t *testing.
 		"'current_user'",
 		"'instruction_context'",
 		"'intent_binding'",
+		"'effective_behavior'",
 		"ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'legacy_segment'",
 	} {
 		require.Contains(t, sql, required)

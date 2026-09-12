@@ -170,8 +170,9 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 	if mode == "blocking" {
 		job.Status = "processing"
 	}
+	var target auditTarget
 	if inputErr == nil {
-		_, inputErr = prepareTarget(job)
+		target, inputErr = prepareTarget(job)
 	}
 	if !request.Manual && errors.Is(inputErr, ErrNoText) {
 		return &IntakeDecision{Mode: mode, Kind: IngressDecisionAllow, ErrorCode: "current_user_not_found"}
@@ -197,6 +198,11 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		job.LastErrorCode = "config_unavailable"
 		job.LastErrorMessage = configErr.Error()
 	}
+	behaviorGuard := inputErr == nil && len(target.EffectiveBehavior) > 0 && configErr == nil
+	if behaviorGuard && mode == "async" {
+		// 有效行为必须在转发前完成判断；普通用户目标仍保持异步审核语义。
+		job.Status = "processing"
+	}
 	logger.LegacyPrintf("third_party_prompt_audit", "开始保存审核输入 request_id=%s user_id=%d mode=%s", request.RequestID, request.UserID, mode)
 	captureCtx, captureCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
 	stored, created, err := s.repo.CreateJob(captureCtx, job)
@@ -213,7 +219,7 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 	job = stored
 	result := &IntakeDecision{JobID: job.ID, Mode: mode, Kind: IngressDecisionAllow}
 	logger.LegacyPrintf("third_party_prompt_audit", "审核输入已保存 job_id=%d request_id=%s status=%s", job.ID, job.RequestID, job.Status)
-	if mode == "async" {
+	if mode == "async" && !behaviorGuard {
 		s.notify()
 		return result
 	}
@@ -235,13 +241,21 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		result.Kind, result.ErrorCode = IngressDecisionUnavailable, "third_party_audit_unavailable"
 		return result
 	}
-	outcome, failure := s.processJob(ctx, job, true)
+	outcome, failure := s.processJob(ctx, job, mode == "blocking" || behaviorGuard)
 	if failure != nil {
 		if failure.Code == "user_excluded" {
 			result.Kind, result.ErrorCode = IngressDecisionAllow, "user_excluded"
 			return result
 		}
 		result.Kind, result.ErrorCode = IngressDecisionUnavailable, "third_party_audit_unavailable"
+		return result
+	}
+	if outcome.BehaviorDecision == DecisionBlock {
+		result.Kind, result.ErrorCode = IngressDecisionBlock, "effective_behavior_blocked"
+		return result
+	}
+	if outcome.BehaviorUnavailable {
+		result.Kind, result.ErrorCode = IngressDecisionUnavailable, "effective_behavior_unavailable"
 		return result
 	}
 	result.Kind = gatewayKind(outcome.Decision)
@@ -432,6 +446,9 @@ func (s *Service) evaluateWithInflightReuse(ctx context.Context, job *Job, bound
 				}
 				for j := range cloned.Models[i].TargetUses {
 					cloned.Models[i].TargetUses[j].ReuseKind = "inflight"
+				}
+				for j := range cloned.Models[i].BehaviorUses {
+					cloned.Models[i].BehaviorUses[j].ReuseKind = "inflight"
 				}
 			}
 			return cloned, nil

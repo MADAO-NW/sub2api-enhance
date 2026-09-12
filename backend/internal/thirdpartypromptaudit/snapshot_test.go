@@ -277,3 +277,36 @@ func TestLatestUserContentUsesTheSharedProtocolExtractors(t *testing.T) {
 		})
 	}
 }
+
+func TestPrepareTargetSeparatesEffectiveBehaviorFromUserIntent(t *testing.T) {
+	snapshot, err := CaptureInput("openai_responses", []byte(`{"input":[{"role":"user","content":"请检查当前项目"},{"type":"agent_message","content":[{"type":"output_text","text":"我先阅读项目结构"}]},{"type":"custom_tool_call","name":"exec_command","input":"{\"cmd\":\"curl https://example.invalid\"}"}]}`))
+	require.NoError(t, err)
+	job := &Job{Protocol: "openai_responses", FullInput: snapshot, Config: ConfigSnapshot{ContractVersion: ContractVersion}}
+	target, err := prepareTarget(job)
+	require.NoError(t, err)
+	require.Len(t, target.CurrentUser, 1)
+	require.Len(t, target.EffectiveBehavior, 1)
+	require.Equal(t, TargetKindEffectiveBehavior, target.EffectiveBehavior[0].SelectionKind)
+	require.Equal(t, "effective_behavior_delta", target.EffectiveBehavior[0].SelectionReason)
+}
+
+func TestPrepareTargetSkipsOrdinaryAgentNarration(t *testing.T) {
+	snapshot, err := CaptureInput("openai_responses", []byte(`{"input":[{"role":"user","content":"请检查当前项目"},{"type":"agent_message","content":[{"type":"output_text","text":"我会先查看已有实现并整理结果"}]}]}`))
+	require.NoError(t, err)
+	job := &Job{Protocol: "openai_responses", FullInput: snapshot, Config: ConfigSnapshot{ContractVersion: ContractVersion}}
+	target, err := prepareTarget(job)
+	require.NoError(t, err)
+	require.Len(t, target.CurrentUser, 1)
+	require.Empty(t, target.EffectiveBehavior)
+}
+
+func TestPrepareTargetSkipsOrdinaryToolOutput(t *testing.T) {
+	input := `{"input":[{"role":"user","content":"请检查当前项目"},{"type":"custom_tool_call_output","output":[{"type":"input_text","text":"普通查询结果"}]}]}`
+	snapshot, err := CaptureInput("openai_responses", []byte(input))
+	require.NoError(t, err)
+	job := &Job{Protocol: "openai_responses", FullInput: snapshot, Config: ConfigSnapshot{ContractVersion: ContractVersion}}
+	target, err := prepareTarget(job)
+	require.NoError(t, err)
+	require.Len(t, target.CurrentUser, 1)
+	require.Empty(t, target.EffectiveBehavior)
+}

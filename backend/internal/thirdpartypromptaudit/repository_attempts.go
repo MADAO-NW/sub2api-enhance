@@ -208,6 +208,7 @@ func (r *Repository) queryOutcome(ctx context.Context, query string, args ...any
 	if err := json.Unmarshal([]byte(models), &outcome.Models); err != nil {
 		return nil, err
 	}
+	outcome.BehaviorDecision, outcome.BehaviorConfidence, outcome.BehaviorReason, outcome.BehaviorUnavailable = aggregateBehaviorResults(outcome.Models)
 	if err := json.Unmarshal([]byte(config), &outcome.Config); err != nil {
 		return nil, err
 	}

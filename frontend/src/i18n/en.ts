@@ -386,6 +386,8 @@ export default {
     "assistant_or_tool": "Agent, model, or tool content; excluded from automatic evaluation",
     "selectionEmpty": "Empty content; no model call",
     "legacy_segment": "Legacy segment evaluation",
+    "effective_behavior": "Effective behavior evaluation",
+    "effectiveBehavior": "Effective behavior decision",
     "roleExplanation": "Roles come from the upstream request protocol; user does not prove human authorship. Only the latest user message is audited for user risk, while system/developer content is used only for instruction-risk binding.",
     "emptyContentNotCalled": "The original content is empty; its structure was preserved and no model call was made",
     "actualAuditTarget": "Actual target sent to the audit model",

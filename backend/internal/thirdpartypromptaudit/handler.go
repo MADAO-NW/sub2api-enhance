@@ -170,7 +170,7 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 		response.BadRequest(c, "运行模式筛选无效")
 		return
 	}
-	if query.Stage != "" && !slices.Contains([]string{"segment", "joint", "format_repair", "probe", "current_user", "instruction_context", "intent_binding", "health_probe"}, query.Stage) {
+	if query.Stage != "" && !slices.Contains([]string{"segment", "joint", "format_repair", "probe", "current_user", "instruction_context", "intent_binding", "effective_behavior", "health_probe"}, query.Stage) {
 		response.BadRequest(c, "调用阶段筛选无效")
 		return
 	}

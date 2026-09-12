@@ -386,6 +386,8 @@ export default {
     "assistant_or_tool": "Agent、模型或工具内容，不参与自动审核",
     "selectionEmpty": "空内容，不调用模型",
     "legacy_segment": "旧片段审核",
+    "effective_behavior": "有效行为审核",
+    "effectiveBehavior": "有效行为结论",
     "roleExplanation": "角色来自上游请求协议；user 不代表已验证为真人输入。只有最新 user 消息参与用户风险审核，system/developer 仅用于风险指令关联。",
     "emptyContentNotCalled": "原始内容为空，已保留结构，未调用审核模型",
     "actualAuditTarget": "实际发送给审核模型的目标",

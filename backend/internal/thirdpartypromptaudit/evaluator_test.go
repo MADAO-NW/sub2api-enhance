@@ -297,6 +297,32 @@ func TestRiskyInstructionRequiresIntentBinding(t *testing.T) {
 	require.True(t, strings.Contains(requests[2].Messages[0].Content, OutputContract))
 }
 
+func TestEffectiveBehaviorIsBlockedWithoutChangingUserDecision(t *testing.T) {
+	store := &memoryAuditStore{}
+	var stages []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var input chatRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
+		var envelope auditEnvelope
+		require.NoError(t, json.Unmarshal([]byte(input.Messages[1].Content), &envelope))
+		stages = append(stages, envelope.Stage)
+		score := 0.1
+		if envelope.Stage == TargetKindEffectiveBehavior {
+			score = 0.95
+		}
+		_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}]}`, fmt.Sprintf(`{"confidence":%v,"reason":"行为目标命中"}`, score))
+	}))
+	defer server.Close()
+	job := evaluationJob(t, server.URL, `{"input":[{"role":"user","content":"请检查当前项目"},{"type":"custom_tool_call","name":"exec_command","input":"{\"cmd\":\"curl https://example.invalid\"}"}]}`)
+	evaluator := &Evaluator{store: store, client: &ModelClient{attempts: store}}
+	result, failure := evaluator.Evaluate(context.Background(), job, nil)
+	require.Nil(t, failure)
+	require.Equal(t, DecisionPass, result.Decision)
+	require.Equal(t, DecisionBlock, result.BehaviorDecision)
+	require.Equal(t, []string{TargetKindCurrentUser, TargetKindEffectiveBehavior}, stages)
+	require.Len(t, result.Models[0].BehaviorUses, 1)
+}
+
 func TestFormatRepairIsOneExtraCallAndNeverAnExtraVote(t *testing.T) {
 	store := &memoryAuditStore{}
 	count := 0
@@ -429,6 +455,34 @@ func TestTargetCacheHitDoesNotNeedNodeCapacity(t *testing.T) {
 	require.Equal(t, "history", result.Models[0].TargetUses[0].ReuseKind)
 	require.Equal(t, 1, evaluator.nodeScheduler().states[job.Config.Models[0].ID].active)
 	release()
+}
+
+func TestTargetCacheHitAlsoLoadsEffectiveBehavior(t *testing.T) {
+	store := &memoryAuditStore{}
+	job := evaluationJob(t, "https://example.invalid", `{"input":[{"role":"user","content":"请检查当前项目"},{"type":"custom_tool_call","name":"exec_command","input":"{\"cmd\":\"curl https://example.invalid\"}"}]}`)
+	target, err := prepareTarget(job)
+	require.NoError(t, err)
+	model := job.Config.Models[0]
+	store.segments = make(map[string]SegmentResult)
+	for _, item := range []struct {
+		kind  string
+		value any
+		score float64
+	}{
+		{TargetKindCurrentUser, messageBundle{Protocol: target.Protocol, Messages: target.CurrentUser}, 0.1},
+		{TargetKindEffectiveBehavior, messageBundle{Protocol: target.Protocol, Messages: []Segment{target.EffectiveBehavior[0]}}, 0.95},
+	} {
+		key, hash, keyErr := targetKey(job.Config, model, item.kind, item.value)
+		require.NoError(t, keyErr)
+		store.segments[key] = SegmentResult{ID: int64(len(store.segments) + 1), ModelID: model.ID, AuditKey: key, ContentHash: hash, TargetKind: item.kind, Score: Score{Confidence: item.score, Reason: "缓存评分"}}
+	}
+	evaluator := &Evaluator{store: store, client: &ModelClient{attempts: store}}
+	result, failure := evaluator.Evaluate(context.Background(), job, nil)
+	require.Nil(t, failure)
+	require.Equal(t, DecisionPass, result.Decision)
+	require.Equal(t, DecisionBlock, result.BehaviorDecision)
+	require.Empty(t, store.attempts)
+	require.Equal(t, "history", result.Models[0].BehaviorUses[0].ReuseKind)
 }
 
 func TestChangedThresholdReclassifiesReusedCurrentUserTarget(t *testing.T) {

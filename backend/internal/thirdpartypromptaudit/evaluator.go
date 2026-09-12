@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -48,6 +49,7 @@ type auditTarget struct {
 	Protocol           string    `json:"protocol"`
 	CurrentUser        []Segment `json:"current_user"`
 	InstructionContext []Segment `json:"instruction_context"`
+	EffectiveBehavior  []Segment `json:"effective_behavior,omitempty"`
 }
 
 type messageBundle struct {
@@ -72,7 +74,7 @@ func prepareTarget(job *Job) (auditTarget, error) {
 
 // prepareTargetForContract 按任务冻结的协议语义重建目标，避免历史轮次被新规则错误解释。
 func prepareTargetForContract(job *Job, contractVersion string) (auditTarget, error) {
-	if contractVersion != ContractVersion && contractVersion != previousCurrentUserContractVersion {
+	if contractVersion != ContractVersion && contractVersion != previousLatestUserContractVersion && contractVersion != previousCurrentUserContractVersion {
 		return auditTarget{}, errors.New("不支持重建该历史审核协议的分阶段目标")
 	}
 	segments, err := ExtractSegments(job.FullInput, "full_request")
@@ -80,7 +82,7 @@ func prepareTargetForContract(job *Job, contractVersion string) (auditTarget, er
 		return auditTarget{}, err
 	}
 	latestMessageKey := ""
-	if contractVersion == ContractVersion {
+	if contractVersion == ContractVersion || contractVersion == previousLatestUserContractVersion {
 		for i := len(segments) - 1; i >= 0; i-- {
 			hasText := false
 			for _, block := range segments[i].Content {
@@ -95,7 +97,8 @@ func prepareTargetForContract(job *Job, contractVersion string) (auditTarget, er
 			}
 		}
 	}
-	target := auditTarget{Protocol: job.Protocol, CurrentUser: []Segment{}, InstructionContext: []Segment{}}
+	target := auditTarget{Protocol: job.Protocol, CurrentUser: []Segment{}, InstructionContext: []Segment{}, EffectiveBehavior: []Segment{}}
+	latestUserOrder := 0
 	job.Manifest = make([]SegmentMeta, 0, len(segments))
 	for i := range segments {
 		segment := segments[i]
@@ -108,20 +111,28 @@ func prepareTargetForContract(job *Job, contractVersion string) (auditTarget, er
 		segment.Content = blocks
 		segment.Selected = false
 		switch {
-		case segment.SourceRole == "user" && segment.TurnScope == "current" && len(blocks) > 0 && (contractVersion != ContractVersion || segment.logicalMessageKey == latestMessageKey):
+		case segment.SourceRole == "user" && segment.TurnScope == "current" && len(blocks) > 0 && (contractVersion == previousCurrentUserContractVersion || segment.logicalMessageKey == latestMessageKey):
 			segment.Selected = true
 			segment.SelectionKind = TargetKindCurrentUser
-			if contractVersion == ContractVersion {
+			if contractVersion == ContractVersion || contractVersion == previousLatestUserContractVersion {
 				segment.SelectionReason = "latest_user"
 			} else {
 				segment.SelectionReason = "current_user_bundle"
 			}
 			target.CurrentUser = append(target.CurrentUser, segment)
+			if segment.Order > latestUserOrder {
+				latestUserOrder = segment.Order
+			}
 		case (segment.SourceRole == "system" || segment.SourceRole == "developer") && len(blocks) > 0:
 			segment.Selected = true
 			segment.SelectionKind = TargetKindInstructionContext
 			segment.SelectionReason = "active_instruction"
 			target.InstructionContext = append(target.InstructionContext, segment)
+		case contractVersion == ContractVersion && segment.TurnScope == "current" && segment.Order > latestUserOrder && isEffectiveBehaviorCandidate(segment):
+			segment.Selected = true
+			segment.SelectionKind = TargetKindEffectiveBehavior
+			segment.SelectionReason = "effective_behavior_delta"
+			target.EffectiveBehavior = append(target.EffectiveBehavior, segment)
 		case len(blocks) == 0:
 			segment.SelectionKind = "excluded"
 			segment.SelectionReason = "empty"
@@ -145,9 +156,13 @@ func prepareTargetForContract(job *Job, contractVersion string) (auditTarget, er
 	if err != nil {
 		return target, err
 	}
-	targetStage, scope := "current_user_context_guard", "current_user"
+	targetStage, scope := "current_user_behavior_context_guard", "current_user_behavior"
 	if contractVersion == ContractVersion {
+		targetStage, scope = "latest_user_behavior_context_guard", "latest_user_behavior"
+	} else if contractVersion == previousLatestUserContractVersion {
 		targetStage, scope = "latest_user_context_guard", "latest_user"
+	} else {
+		targetStage, scope = "current_user_context_guard", "current_user"
 	}
 	job.TargetHash, err = fingerprint(auditEnvelope{Stage: targetStage, Target: target})
 	if err != nil {
@@ -164,6 +179,48 @@ func prepareTargetForContract(job *Job, contractVersion string) (auditTarget, er
 		Models                           []any
 	}{job.Config.AuditPrompt, job.Config.FixedContract, job.Config.ContractVersion, scope, models})
 	return target, err
+}
+
+// isEffectiveBehaviorCandidate 只保留可能改变下游实际行为的新增内容，跳过普通分析和重复历史。
+func isEffectiveBehaviorCandidate(segment Segment) bool {
+	if segment.SourceRole == "user" {
+		return false
+	}
+	for _, block := range segment.Content {
+		blockType := strings.ToLower(block.Type)
+		if block.Type == "tool_data" || strings.Contains(blockType, "tool") {
+			// 已经返回的工具结果只有在包含可执行/外发信号时才进入审核，避免为普通查询结果重复付费。
+			if segment.SourceRole != "tool" {
+				return true
+			}
+			text := strings.ToLower(block.Text)
+			for _, wrapper := range []string{"custom_tool_call_output", "function_call_output", "tool_result", "tool_call", "function_call"} {
+				text = strings.ReplaceAll(text, wrapper, "")
+			}
+			if !containsBehaviorSignal(text) {
+				continue
+			}
+			return true
+		}
+		text := strings.ToLower(block.Text)
+		if containsBehaviorSignal(text) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsBehaviorSignal(text string) bool {
+	for _, marker := range []string{
+		"exec_command", "function_call", "tool_call", "curl ", "wget ", "nmap ", "ssh ", "reverse shell", "command and control", "c2 ",
+		"execute", "run ", "upload", "download", "exfiltrat", "credential", "secret", "bypass", "ignore safety",
+		"读取", "写入", "修改", "删除", "执行", "发送", "调用", "访问", "绕过", "突破", "外传", "上传", "下载", "凭据", "密钥", "反向连接", "忽略规则", "生成代码", "生成脚本",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return strings.Contains(text, "```") || strings.Contains(text, "http://") || strings.Contains(text, "https://")
 }
 
 func modelSemantics(model ModelConfig) any {
@@ -290,6 +347,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job, keys map[string]stri
 			prior := cached[model.ID]
 			prior.Segments = append([]SegmentUse(nil), prior.Segments...)
 			prior.TargetUses = append([]SegmentUse(nil), prior.TargetUses...)
+			prior.BehaviorUses = append([]SegmentUse(nil), prior.BehaviorUses...)
 			prior.ModelName = model.Name
 			prior.Reused = true
 			prior.JointAttemptID = nil
@@ -300,6 +358,9 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job, keys map[string]stri
 			}
 			for i := range prior.TargetUses {
 				prior.TargetUses[i].ReuseKind = "full_evaluation"
+			}
+			for i := range prior.BehaviorUses {
+				prior.BehaviorUses[i].ReuseKind = "full_evaluation"
 			}
 			result.Models = append(result.Models, prior)
 			if prior.Decision == DecisionBlock {
@@ -350,11 +411,42 @@ func (e *Evaluator) Evaluate(ctx context.Context, job *Job, keys map[string]stri
 		return nil, failure
 	}
 	result.Decision, result.PartialFailure = decision, partial
+	result.BehaviorDecision, result.BehaviorConfidence, result.BehaviorReason, result.BehaviorUnavailable = aggregateBehaviorResults(result.Models)
 	if allWhole {
 		job.Reuse.WholeHits++
 		result.SourceOutcomeID = &whole.ID
 	}
 	return result, nil
+}
+
+func aggregateBehaviorResults(models []ModelResult) (Decision, *float64, string, bool) {
+	decision := DecisionPass
+	var confidence *float64
+	reason := ""
+	active, unavailable := false, false
+	for _, model := range models {
+		if len(model.BehaviorUses) == 0 && model.BehaviorError == nil {
+			continue
+		}
+		active = true
+		if model.BehaviorError != nil {
+			unavailable = true
+		}
+		if model.BehaviorDecision == DecisionBlock {
+			decision = DecisionBlock
+		} else if model.BehaviorDecision == DecisionReview && decision != DecisionBlock {
+			decision = DecisionReview
+		}
+		if model.BehaviorConfidence != nil && (confidence == nil || *model.BehaviorConfidence > *confidence) {
+			score := *model.BehaviorConfidence
+			confidence = &score
+			reason = model.BehaviorReason
+		}
+	}
+	if !active {
+		return "", nil, "", false
+	}
+	return decision, confidence, reason, unavailable
 }
 
 func aggregationBlockThreshold(aggregation string, enabled int) int {
@@ -430,6 +522,9 @@ func reclassifyReusableModel(model *ModelResult, config Config, hasInstructionCo
 	model.BindingTriggered = basis == TargetKindIntentBinding
 	model.TargetUses = append([]SegmentUse(nil), requiredUses...)
 	model.Segments = []SegmentUse{}
+	if model.BehaviorConfidence != nil {
+		model.BehaviorDecision = classifyScore(*model.BehaviorConfidence, config)
+	}
 	return true
 }
 
@@ -517,8 +612,40 @@ func (e *Evaluator) cachedModel(ctx context.Context, job *Job, model ModelConfig
 			node.Decision = classifyScore(binding.Result.Confidence, job.Config.Config)
 		}
 	}
+	for index := range target.EffectiveBehavior {
+		behaviorTarget := messageBundle{Protocol: target.Protocol, Messages: []Segment{target.EffectiveBehavior[index]}}
+		behavior, found, behaviorFailure := load(TargetKindEffectiveBehavior, behaviorTarget, index+1)
+		if behaviorFailure != nil {
+			node.BehaviorError = behaviorFailure
+			return node, true
+		}
+		if !found {
+			return ModelResult{}, false
+		}
+		node.BehaviorUses = append(node.BehaviorUses, behavior)
+		if node.BehaviorConfidence == nil || behavior.Result.Confidence > *node.BehaviorConfidence {
+			score := behavior.Result.Confidence
+			node.BehaviorConfidence = &score
+			node.BehaviorReason = behavior.Result.Reason
+		}
+		decision := classifyScore(behavior.Result.Confidence, job.Config.Config)
+		if decision == DecisionBlock || (decision == DecisionReview && node.BehaviorDecision != DecisionBlock) {
+			node.BehaviorDecision = decision
+		}
+	}
+	if node.BehaviorConfidence != nil && node.BehaviorDecision == "" {
+		node.BehaviorDecision = DecisionPass
+	}
 	job.Reuse.SegmentLookups += len(node.TargetUses)
 	for _, use := range node.TargetUses {
+		if use.ReuseKind == "history" {
+			job.Reuse.SegmentHits++
+		} else if use.ReuseKind == "inflight" {
+			job.Reuse.InflightHits++
+		}
+	}
+	job.Reuse.SegmentLookups += len(node.BehaviorUses)
+	for _, use := range node.BehaviorUses {
 		if use.ReuseKind == "history" {
 			job.Reuse.SegmentHits++
 		} else if use.ReuseKind == "inflight" {
@@ -553,7 +680,7 @@ func (e *Evaluator) evaluateModel(ctx context.Context, job *Job, model ModelConf
 	if len(target.InstructionContext) == 0 {
 		node.Confidence, node.Reason, node.Basis = &currentUse.Result.Confidence, currentUse.Result.Reason, TargetKindCurrentUser
 		node.Decision = classifyScore(currentUse.Result.Confidence, job.Config.Config)
-		return node
+		return e.attachBehavior(ctx, job, model, key, client, url, target, node)
 	}
 	instructions := messageBundle{Protocol: target.Protocol, Messages: target.InstructionContext}
 	contextUse, failure := e.evaluateAuditTarget(ctx, job, model, key, client, url, TargetKindInstructionContext, instructions, 2)
@@ -565,7 +692,7 @@ func (e *Evaluator) evaluateModel(ctx context.Context, job *Job, model ModelConf
 	if contextUse.Result.Confidence < *job.Config.ReviewThreshold {
 		node.Confidence, node.Reason, node.Basis = &currentUse.Result.Confidence, currentUse.Result.Reason, TargetKindCurrentUser
 		node.Decision = classifyScore(currentUse.Result.Confidence, job.Config.Config)
-		return node
+		return e.attachBehavior(ctx, job, model, key, client, url, target, node)
 	}
 	node.BindingTriggered = true
 	binding := intentBindingTarget{CurrentUser: current, InstructionContext: instructions}
@@ -577,6 +704,35 @@ func (e *Evaluator) evaluateModel(ctx context.Context, job *Job, model ModelConf
 	node.TargetUses = append(node.TargetUses, bindingUse)
 	node.Confidence, node.Reason, node.Basis = &bindingUse.Result.Confidence, bindingUse.Result.Reason, TargetKindIntentBinding
 	node.Decision = classifyScore(bindingUse.Result.Confidence, job.Config.Config)
+	return e.attachBehavior(ctx, job, model, key, client, url, target, node)
+}
+
+// attachBehavior 逐个审核新增的有效行为候选，避免将 Agent/tool 内容并入用户结论。
+func (e *Evaluator) attachBehavior(ctx context.Context, job *Job, model ModelConfig, key string, client *http.Client, url string, target auditTarget, node ModelResult) ModelResult {
+	if len(target.EffectiveBehavior) == 0 {
+		return node
+	}
+	for index, segment := range target.EffectiveBehavior {
+		bundle := messageBundle{Protocol: target.Protocol, Messages: []Segment{segment}}
+		use, failure := e.evaluateAuditTarget(ctx, job, model, key, client, url, TargetKindEffectiveBehavior, bundle, index+1)
+		if failure != nil {
+			node.BehaviorError = failure
+			continue
+		}
+		node.BehaviorUses = append(node.BehaviorUses, use)
+		confidence := use.Result.Confidence
+		if node.BehaviorConfidence == nil || confidence > *node.BehaviorConfidence {
+			node.BehaviorConfidence = &confidence
+			node.BehaviorReason = use.Result.Reason
+		}
+		decision := classifyScore(confidence, job.Config.Config)
+		if decision == DecisionBlock || (decision == DecisionReview && node.BehaviorDecision != DecisionBlock) {
+			node.BehaviorDecision = decision
+		}
+	}
+	if node.BehaviorConfidence != nil && node.BehaviorDecision == "" {
+		node.BehaviorDecision = DecisionPass
+	}
 	return node
 }
 
@@ -598,6 +754,8 @@ func (e *Evaluator) evaluateAuditTarget(ctx context.Context, job *Job, model Mod
 		sourceRole, policyRole, turnScope := "user", "user", "current"
 		if kind == TargetKindInstructionContext {
 			sourceRole, policyRole, turnScope = "system/developer", "instruction", "active"
+		} else if kind == TargetKindEffectiveBehavior {
+			sourceRole, policyRole = "agent/model/tool", "effective_behavior"
 		}
 		result := SegmentResult{UserID: job.UserID, ModelID: model.ID, AuditKey: auditKey, SourceAttemptID: attemptID,
 			SourceRole: sourceRole, PolicyRole: policyRole, TurnScope: turnScope,

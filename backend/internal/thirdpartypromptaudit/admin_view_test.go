@@ -41,18 +41,23 @@ func TestOutcomeExplanationDoesNotMutateStoredScores(t *testing.T) {
 }
 
 func TestOutcomeTargetReuseIsGroupedByTargetKind(t *testing.T) {
-	outcome := &Outcome{Evaluation: Evaluation{Models: []ModelResult{{ModelID: "a", TargetUses: []SegmentUse{
-		{TargetKind: TargetKindCurrentUser, ReuseKind: "history", Result: SegmentResult{TargetKind: TargetKindCurrentUser, Score: Score{Confidence: 0.1}}},
-		{TargetKind: TargetKindInstructionContext, ReuseKind: "fresh", Result: SegmentResult{TargetKind: TargetKindInstructionContext, Score: Score{Confidence: 0.6}}},
-		{TargetKind: TargetKindIntentBinding, ReuseKind: "inflight", Result: SegmentResult{TargetKind: TargetKindIntentBinding, Score: Score{Confidence: 0.2}}},
-	}}}}}
+	outcome := &Outcome{Evaluation: Evaluation{Models: []ModelResult{{
+		ModelID: "a",
+		TargetUses: []SegmentUse{
+			{TargetKind: TargetKindCurrentUser, ReuseKind: "history", Result: SegmentResult{TargetKind: TargetKindCurrentUser, Score: Score{Confidence: 0.1}}},
+			{TargetKind: TargetKindInstructionContext, ReuseKind: "fresh", Result: SegmentResult{TargetKind: TargetKindInstructionContext, Score: Score{Confidence: 0.6}}},
+			{TargetKind: TargetKindIntentBinding, ReuseKind: "inflight", Result: SegmentResult{TargetKind: TargetKindIntentBinding, Score: Score{Confidence: 0.2}}},
+		},
+		BehaviorUses: []SegmentUse{{TargetKind: TargetKindEffectiveBehavior, ReuseKind: "history", Result: SegmentResult{TargetKind: TargetKindEffectiveBehavior, Score: Score{Confidence: 0.9}}}},
+	}}}}
 	view := outcomeView(outcome, nil)
-	require.Equal(t, 2, view.TargetReuse.Reused)
-	require.Equal(t, 3, view.TargetReuse.Total)
-	require.InDelta(t, 2.0/3.0, *view.TargetReuse.Rate, 0.0001)
+	require.Equal(t, 3, view.TargetReuse.Reused)
+	require.Equal(t, 4, view.TargetReuse.Total)
+	require.InDelta(t, 3.0/4.0, *view.TargetReuse.Rate, 0.0001)
 	require.Equal(t, 1, view.TargetReuse.ByKind[TargetKindCurrentUser].Reused)
 	require.Equal(t, 0, view.TargetReuse.ByKind[TargetKindInstructionContext].Reused)
 	require.Equal(t, 1, view.TargetReuse.ByKind[TargetKindIntentBinding].Reused)
+	require.Equal(t, 1, view.TargetReuse.ByKind[TargetKindEffectiveBehavior].Reused)
 }
 
 func TestJobListIncludesLatestOutcomeAndOriginalDecision(t *testing.T) {

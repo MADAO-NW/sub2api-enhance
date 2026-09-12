@@ -63,7 +63,7 @@ export interface ProbeResult { ok: boolean; model_id: string; attempt_id: number
 export interface Reuse { whole_lookups: number; whole_hits: number; segment_lookups: number; segment_hits: number; within_job_hits: number; inflight_hits?: number; short_circuited_nodes?: number }
 export interface AuditInput { protocol: string; fields?: Record<string, unknown>; non_text: { source_path: string; type: string }[]; raw_body_base64?: string }
 export interface SegmentMeta { order: number; source_path: string; source_role: string; policy_role: string; turn_scope: string; selected: boolean; selection_kind?: string; selection_reason?: string }
-export interface TargetUse { order: number; source_path: string; target_kind: 'legacy_segment' | 'current_user' | 'instruction_context' | 'intent_binding'; reuse_kind: string; result: Score & { id: number; source_role: string; policy_role: string; turn_scope: string; target_kind: string } }
+export interface TargetUse { order: number; source_path: string; target_kind: 'legacy_segment' | 'current_user' | 'instruction_context' | 'intent_binding' | 'effective_behavior'; reuse_kind: string; result: Score & { id: number; source_role: string; policy_role: string; turn_scope: string; target_kind: string } }
 export interface ModelResult {
   model_id: string
   model_name: string
@@ -81,13 +81,18 @@ export interface ModelResult {
   target_uses?: TargetUse[]
   binding_triggered?: boolean
   dispatch?: { order: number; health: string; active: number; max_concurrency: number; waiting: number; load_ratio: number; latency_ewma_ms?: number; reason: string }
+  behavior_decision?: AuditDecision
+  behavior_confidence?: number | null
+  behavior_reason?: string
+  behavior_uses?: TargetUse[]
+  behavior_error?: AuditError
 }
 export interface SegmentReuse { reused: number; total: number; rate: number | null }
 export interface TargetReuse extends SegmentReuse { by_kind?: Record<string, SegmentReuse> }
 export interface UserSegmentReuse extends SegmentReuse { user_id: number; username: string; email: string }
-export interface Outcome { id: number; job_id: number; user_id: number; audit_round: number; run_kind: 'request' | 'reaudit'; requested_by: number | null; reuse_mode: 'allow' | 'force'; config_snapshot?: AuditConfig & { revision: number }; decision: AuditDecision; models: ModelResult[]; partial_failure: boolean; enforcement_eligible: boolean; source_outcome_id?: number; started_at: string | null; finished_at: string | null; duration_ms: number | null; created_at: string; decision_config?: DecisionConfig; segment_reuse: SegmentReuse; target_reuse?: TargetReuse; audit_targets?: AuditStageTargets }
+export interface Outcome { id: number; job_id: number; user_id: number; audit_round: number; run_kind: 'request' | 'reaudit'; requested_by: number | null; reuse_mode: 'allow' | 'force'; config_snapshot?: AuditConfig & { revision: number }; decision: AuditDecision; behavior_decision?: AuditDecision; behavior_confidence?: number | null; behavior_reason?: string; behavior_unavailable?: boolean; models: ModelResult[]; partial_failure: boolean; enforcement_eligible: boolean; source_outcome_id?: number; started_at: string | null; finished_at: string | null; duration_ms: number | null; created_at: string; decision_config?: DecisionConfig; segment_reuse: SegmentReuse; target_reuse?: TargetReuse; audit_targets?: AuditStageTargets }
 export interface AuditEnvelope { audit_stage: string; target: unknown }
-export type AuditStageTargets = Partial<Record<'current_user' | 'instruction_context' | 'intent_binding', AuditEnvelope>>
+export type AuditStageTargets = Partial<Record<'current_user' | 'instruction_context' | 'intent_binding' | 'effective_behavior', AuditEnvelope>>
 export interface LatestUserContent { content: string | null; items: { order: number; source_path: string; content: string }[]; fragment_count: number; unavailable_reason: string }
 export interface AuditJob {
   capture_id?: number|null

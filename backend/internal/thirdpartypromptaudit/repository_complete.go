@@ -138,6 +138,14 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 				ReuseKind string `json:"reuse_kind"`
 			}{model.ModelID, segment.Order, segment.Result.ID, segment.ReuseKind})
 		}
+		for index, segment := range model.BehaviorUses {
+			uses = append(uses, struct {
+				ModelID   string `json:"model_id"`
+				Order     int    `json:"segment_order"`
+				ResultID  int64  `json:"segment_result_id"`
+				ReuseKind string `json:"reuse_kind"`
+			}{model.ModelID, len(segments) + index + 1, segment.Result.ID, segment.ReuseKind})
+		}
 	}
 	if len(uses) > 0 {
 		raw, err := json.Marshal(uses)

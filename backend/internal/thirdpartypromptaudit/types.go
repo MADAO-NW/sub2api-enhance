@@ -24,6 +24,8 @@ const (
 	TargetKindCurrentUser        = "current_user"
 	TargetKindInstructionContext = "instruction_context"
 	TargetKindIntentBinding      = "intent_binding"
+	// TargetKindEffectiveBehavior 表示新增的 Agent/model/tool 有效行为目标。
+	TargetKindEffectiveBehavior = "effective_behavior"
 )
 
 type Decision string
@@ -149,21 +151,26 @@ type DispatchSnapshot struct {
 }
 
 type ModelResult struct {
-	Reused           bool              `json:"reused"`
-	ModelID          string            `json:"model_id"`
-	ModelName        string            `json:"model_name"`
-	Decision         Decision          `json:"decision,omitempty"`
-	Basis            string            `json:"basis"`
-	Confidence       *float64          `json:"confidence"`
-	Reason           string            `json:"reason"`
-	JointAttemptID   *int64            `json:"joint_attempt_id"`
-	Segments         []SegmentUse      `json:"segments"`
-	TargetUses       []SegmentUse      `json:"target_uses,omitempty"`
-	BindingTriggered bool              `json:"binding_triggered,omitempty"`
-	Dispatch         *DispatchSnapshot `json:"dispatch,omitempty"`
-	Error            *AuditError       `json:"error,omitempty"`
-	Skipped          bool              `json:"skipped,omitempty"`
-	SkipReason       string            `json:"skip_reason,omitempty"`
+	Reused             bool              `json:"reused"`
+	ModelID            string            `json:"model_id"`
+	ModelName          string            `json:"model_name"`
+	Decision           Decision          `json:"decision,omitempty"`
+	Basis              string            `json:"basis"`
+	Confidence         *float64          `json:"confidence"`
+	Reason             string            `json:"reason"`
+	JointAttemptID     *int64            `json:"joint_attempt_id"`
+	Segments           []SegmentUse      `json:"segments"`
+	TargetUses         []SegmentUse      `json:"target_uses,omitempty"`
+	BindingTriggered   bool              `json:"binding_triggered,omitempty"`
+	Dispatch           *DispatchSnapshot `json:"dispatch,omitempty"`
+	Error              *AuditError       `json:"error,omitempty"`
+	Skipped            bool              `json:"skipped,omitempty"`
+	SkipReason         string            `json:"skip_reason,omitempty"`
+	BehaviorDecision   Decision          `json:"behavior_decision,omitempty"`
+	BehaviorConfidence *float64          `json:"behavior_confidence,omitempty"`
+	BehaviorReason     string            `json:"behavior_reason,omitempty"`
+	BehaviorUses       []SegmentUse      `json:"behavior_uses,omitempty"`
+	BehaviorError      *AuditError       `json:"behavior_error,omitempty"`
 }
 
 type Evaluation struct {
@@ -172,6 +179,10 @@ type Evaluation struct {
 	PartialFailure      bool          `json:"partial_failure"`
 	SourceOutcomeID     *int64        `json:"source_outcome_id"`
 	EnforcementEligible bool          `json:"enforcement_eligible"`
+	BehaviorDecision    Decision      `json:"behavior_decision,omitempty"`
+	BehaviorConfidence  *float64      `json:"behavior_confidence,omitempty"`
+	BehaviorReason      string        `json:"behavior_reason,omitempty"`
+	BehaviorUnavailable bool          `json:"behavior_unavailable,omitempty"`
 }
 
 type Outcome struct {

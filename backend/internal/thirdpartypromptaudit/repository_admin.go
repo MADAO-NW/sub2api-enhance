@@ -59,6 +59,9 @@ func outcomeView(outcome *Outcome, config *DecisionConfig) *OutcomeView {
 		if len(uses) == 0 {
 			uses = model.Segments
 		}
+		if len(model.BehaviorUses) > 0 {
+			uses = append(append([]SegmentUse(nil), uses...), model.BehaviorUses...)
+		}
 		for _, segment := range uses {
 			view.SegmentReuse.Total++
 			view.TargetReuse.Total++
@@ -115,20 +118,21 @@ const jobOutcomeSummary = `CASE WHEN o.id IS NULL THEN NULL ELSE json_build_obje
  'models',(SELECT COALESCE(json_agg(json_build_object('model_id',m->>'model_id','model_name',m->>'model_name','decision',m->>'decision','basis',m->>'basis','confidence',m->'confidence',
    'reused',m->'reused','joint_attempt_id',CASE WHEN COALESCE((m->>'reused')::boolean,false) THEN NULL ELSE m->'joint_attempt_id' END,'error',m->'error','skipped',m->'skipped','skip_reason',m->'skip_reason',
    'target_uses',COALESCE(m->'target_uses','[]'::json),'binding_triggered',m->'binding_triggered','dispatch',m->'dispatch',
-   'max_segment_confidence',(SELECT MAX((s->'result'->>'confidence')::double precision) FROM json_array_elements(COALESCE(m->'target_uses',m->'segments','[]'::json)) s))),'[]') FROM json_array_elements(o.model_results::json) m),
+   'behavior_decision',m->'behavior_decision','behavior_confidence',m->'behavior_confidence','behavior_reason',m->'behavior_reason','behavior_uses',COALESCE(m->'behavior_uses','[]'::json),'behavior_error',m->'behavior_error',
+   'max_segment_confidence',(SELECT MAX((s->'result'->>'confidence')::double precision) FROM jsonb_array_elements((COALESCE(m->'target_uses',m->'segments','[]'::json)::jsonb || COALESCE(m->'behavior_uses','[]'::json)::jsonb)) s))),'[]') FROM json_array_elements(o.model_results::json) m),
  'decision_config',json_build_object('revision',(o.config_snapshot::json->>'revision')::bigint,'review_threshold',o.config_snapshot::json->'review_threshold','block_threshold',o.config_snapshot::json->'block_threshold'),
  'segment_reuse',(SELECT json_build_object('reused',count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')),'total',count(*),
    'rate',CASE WHEN count(*)=0 THEN NULL ELSE (count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')))::double precision/count(*) END)
-   FROM json_array_elements(o.model_results::json) m CROSS JOIN LATERAL json_array_elements(COALESCE(m->'target_uses',m->'segments','[]'::json)) s),
+   FROM json_array_elements(o.model_results::json) m CROSS JOIN LATERAL jsonb_array_elements((COALESCE(m->'target_uses',m->'segments','[]'::json)::jsonb || COALESCE(m->'behavior_uses','[]'::json)::jsonb)) s),
  'target_reuse',(SELECT json_build_object('reused',count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')),'total',count(*),
    'rate',CASE WHEN count(*)=0 THEN NULL ELSE (count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')))::double precision/count(*) END,
    'by_kind',COALESCE((SELECT json_object_agg(grouped.target_kind,json_build_object('reused',grouped.reused,'total',grouped.total,
      'rate',CASE WHEN grouped.total=0 THEN NULL ELSE grouped.reused::double precision/grouped.total END)) FROM (
        SELECT COALESCE(target->>'target_kind','legacy_segment') target_kind,
          count(*) FILTER(WHERE target->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation')) reused,count(*) total
-       FROM json_array_elements(o.model_results::json) model CROSS JOIN LATERAL json_array_elements(COALESCE(model->'target_uses',model->'segments','[]'::json)) target
+       FROM json_array_elements(o.model_results::json) model CROSS JOIN LATERAL jsonb_array_elements((COALESCE(model->'target_uses',model->'segments','[]'::json)::jsonb || COALESCE(model->'behavior_uses','[]'::json)::jsonb)) target
        GROUP BY COALESCE(target->>'target_kind','legacy_segment')) grouped),'{}'::json))
-   FROM json_array_elements(o.model_results::json) m CROSS JOIN LATERAL json_array_elements(COALESCE(m->'target_uses',m->'segments','[]'::json)) s)
+   FROM json_array_elements(o.model_results::json) m CROSS JOIN LATERAL jsonb_array_elements((COALESCE(m->'target_uses',m->'segments','[]'::json)::jsonb || COALESCE(m->'behavior_uses','[]'::json)::jsonb)) s)
 ) END`
 
 func validateFilter(filter Filter) error {
@@ -383,6 +387,10 @@ func (r *Repository) JobDetail(ctx context.Context, id int64) (*JobDetail, error
 func auditStageTargets(target auditTarget) AuditStageTargets {
 	current := messageBundle{Protocol: target.Protocol, Messages: target.CurrentUser}
 	result := AuditStageTargets{TargetKindCurrentUser: {Stage: TargetKindCurrentUser, Target: current}}
+	if len(target.EffectiveBehavior) > 0 {
+		behavior := messageBundle{Protocol: target.Protocol, Messages: target.EffectiveBehavior}
+		result[TargetKindEffectiveBehavior] = auditEnvelope{Stage: TargetKindEffectiveBehavior, Target: behavior}
+	}
 	if len(target.InstructionContext) == 0 {
 		return result
 	}

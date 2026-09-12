@@ -8,7 +8,7 @@ ALTER TABLE sub2api_enhance.third_party_prompt_audit_model_attempts
         CHECK (call_kind IN ('audit', 'probe', 'health_probe')),
     ADD CONSTRAINT third_party_prompt_audit_model_attempts_stage_check
         CHECK (stage IN ('segment', 'joint', 'format_repair', 'probe',
-                         'current_user', 'instruction_context', 'intent_binding', 'health_probe')),
+                         'current_user', 'instruction_context', 'intent_binding', 'effective_behavior', 'health_probe')),
     ADD CONSTRAINT tppa_attempts_owner CHECK (
         (call_kind = 'audit' AND job_id IS NOT NULL AND evaluation_round IS NOT NULL)
         OR (call_kind IN ('probe', 'health_probe') AND job_id IS NULL)
@@ -16,8 +16,8 @@ ALTER TABLE sub2api_enhance.third_party_prompt_audit_model_attempts
 
 ALTER TABLE sub2api_enhance.third_party_prompt_audit_segment_results
     ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'legacy_segment'
-        CHECK (target_kind IN ('legacy_segment', 'current_user', 'instruction_context', 'intent_binding'));
+        CHECK (target_kind IN ('legacy_segment', 'current_user', 'instruction_context', 'intent_binding', 'effective_behavior'));
 
 ALTER TABLE sub2api_enhance.third_party_prompt_audit_outcome_segments
     ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'legacy_segment'
-        CHECK (target_kind IN ('legacy_segment', 'current_user', 'instruction_context', 'intent_binding'));
+        CHECK (target_kind IN ('legacy_segment', 'current_user', 'instruction_context', 'intent_binding', 'effective_behavior'));
