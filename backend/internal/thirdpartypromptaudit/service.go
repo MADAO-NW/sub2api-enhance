@@ -198,11 +198,8 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		job.LastErrorCode = "config_unavailable"
 		job.LastErrorMessage = configErr.Error()
 	}
-	behaviorGuard := inputErr == nil && len(target.EffectiveBehavior) > 0 && configErr == nil
-	if behaviorGuard && mode == "async" {
-		// 有效行为必须在转发前完成判断；普通用户目标仍保持异步审核语义。
-		job.Status = "processing"
-	}
+	// 异步模式只保存并排队；有效行为也不能把异步请求升级成前台审核。
+	behaviorGuard := mode == "blocking" && inputErr == nil && len(target.EffectiveBehavior) > 0 && configErr == nil
 	logger.LegacyPrintf("third_party_prompt_audit", "开始保存审核输入 request_id=%s user_id=%d mode=%s", request.RequestID, request.UserID, mode)
 	captureCtx, captureCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
 	stored, created, err := s.repo.CreateJob(captureCtx, job)

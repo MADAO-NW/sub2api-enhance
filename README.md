@@ -111,6 +111,23 @@ curl -fsSL https://raw.githubusercontent.com/MADAO-NW/sub2api-enhance/main/deplo
 - 保留 WebSocket 升级头，关闭流式缓冲与模型 POST 的代理自动重试。按实际输入大小和审核耗时配置正文限制及超时。
 - 原版业务端口只向本机/可信内网开放，避免客户端绕过审核。若原版在 Docker 中，给宿主机脚本提供受限的本机映射端口；容器内的 `127.0.0.1` 与宿主机不是同一地址。
 
+增强进程停止或启动失败时，当前示例会让模型入口返回 502，这是故障可见性和审核不绕过的默认取舍。若部署方明确接受增强服务故障时回落原版，可只给模型 API location 单独配置备用 upstream：
+
+```nginx
+upstream sub2api_api {
+    server 127.0.0.1:18081;
+    server 127.0.0.1:18080 backup;
+}
+
+location ~ ^/(v1/|v1beta/|responses(/|$)|messages/) {
+    proxy_pass http://sub2api_api;
+    proxy_next_upstream error timeout;
+    proxy_next_upstream_tries 2;
+}
+```
+
+不要把 `/enhance/` 管理入口接入备用 upstream，也不要加入 `http_503` 回落条件；增强服务返回的审核不可用 503 必须保持为 503，不能借 Nginx 回落绕过审核。启用回落前需确认原版端口只允许本机访问，并用 `nginx -t` 检查配置后再 reload。
+
 合并配置后检查并重载 Nginx：
 
 ```bash
