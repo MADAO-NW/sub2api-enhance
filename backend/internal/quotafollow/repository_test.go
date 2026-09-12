@@ -30,6 +30,21 @@ func TestObservationModeStoresEventWithoutCreatingDeliveries(t *testing.T) {
 	require.NoError(t, NewRepository(db).SaveObservation(context.Background(), cfg, sub2api.QuotaDiscovery{Accounts: []sub2api.QuotaAccount{{ID: 7}}, Users: []sub2api.QuotaUser{{ID: 9}}}, "hash", states, &boundary, boundary.Add(time.Hour), "", nil))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestAccountResetSignalsReadsLatestSuccessfulAuditPerAccount(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	since := time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC)
+	occurred := since.Add(time.Minute)
+	mock.ExpectQuery("SELECT DISTINCT ON .*openai/accounts/:id/reset-quota").WillReturnRows(sqlmock.NewRows([]string{"account_id", "created_at"}).AddRow(int64(7), occurred))
+	signals, err := NewRepository(db).AccountResetSignals(context.Background(), []int64{7, 8}, since)
+	require.NoError(t, err)
+	require.Equal(t, occurred, signals[7])
+	_, ok := signals[8]
+	require.False(t, ok)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
 func TestRecordFilterPreservesAllCallerConditions(t *testing.T) {
 	now := time.Now()
 	where, args := recordFilter(Filter{From: &now, Source: "enhance", Window: "weekly", Status: "uncertain", Keyword: "user"})

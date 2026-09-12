@@ -206,6 +206,22 @@ func observe(previous AccountState, account sub2api.QuotaAccount, usage sub2api.
 	next.UpstreamUpdatedAt = usage.UpdatedAt
 	return next
 }
+
+// applyAccountResetSignal 将原版重置卡成功审计转换为一次账号强确认候选。
+func applyAccountResetSignal(previous AccountState, signal time.Time, enabledAt time.Time, lastEvent *time.Time) AccountState {
+	next := previous
+	if lastEvent != nil && !signal.After(*lastEvent) {
+		next.CandidateResetAt = nil
+		return next
+	}
+	if !signal.After(enabledAt) || next.Error != "" {
+		return next
+	}
+	next.CandidateResetAt = &signal
+	next.BaselineRebased = false
+	return next
+}
+
 func consensus(states []AccountState) (*time.Time, error) {
 	if len(states) == 0 {
 		return nil, errors.New("分组内没有有效 OpenAI 账号")

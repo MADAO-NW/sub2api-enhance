@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
 	"strings"
 
@@ -249,9 +250,10 @@ func (r *Repository) ListJobs(ctx context.Context, filter Filter, page, pageSize
 		if err := rows.Scan(&raw); err != nil {
 			return nil, err
 		}
-		job, err := decodeJob(raw)
+		job, err := decodeJobList(raw)
 		if err != nil {
-			return nil, err
+			log.Printf("审核任务列表跳过无法解码记录 error=%v", err)
+			continue
 		}
 		result.Items = append(result.Items, *job)
 	}

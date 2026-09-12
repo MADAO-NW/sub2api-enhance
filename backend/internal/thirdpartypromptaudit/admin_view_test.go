@@ -86,6 +86,16 @@ func TestJobListIncludesLatestOutcomeAndOriginalDecision(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestJobListToleratesMalformedDisplaySnapshots(t *testing.T) {
+	record := `{"id":4,"identity_snapshot":"not-json","reuse_metrics":"not-json","status":"failed","last_error_code":"model_timeout","last_error_message":"失败"}`
+	job, err := decodeJobList([]byte(record))
+	require.NoError(t, err)
+	require.Equal(t, int64(4), job.ID)
+	require.Equal(t, "model_timeout", job.LastErrorCode)
+	require.Equal(t, "失败", job.LastErrorMessage)
+	require.Empty(t, job.Identity.Username)
+}
+
 func TestJobListDecisionAndModelFiltersUseOnlyLatestOutcome(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)

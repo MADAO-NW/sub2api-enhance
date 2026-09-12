@@ -194,11 +194,19 @@ func (s *Service) detect(ctx context.Context) error {
 			return fail(err)
 		}
 	}
-	states := make([]AccountState, 0, len(ids))
 	enabledAt := now
 	if cfg.EnabledAt != nil {
 		enabledAt = *cfg.EnabledAt
 	}
+	signalSince := enabledAt
+	if runtime.LastEventAt != nil && runtime.LastEventAt.After(signalSince) {
+		signalSince = *runtime.LastEventAt
+	}
+	accountResetSignals, err := s.repo.AccountResetSignals(ctx, ids, signalSince)
+	if err != nil {
+		return fail(err)
+	}
+	states := make([]AccountState, 0, len(ids))
 	for _, account := range discovery.Accounts {
 		usage, ok := usages[account.ID]
 		if !ok {
@@ -208,7 +216,11 @@ func (s *Service) detect(ctx context.Context) error {
 		if old.CandidateResetAt != nil && lastEvent != nil && !old.CandidateResetAt.After(*lastEvent) {
 			old.CandidateResetAt = nil
 		}
-		states = append(states, observe(old, account, usage, now, enabledAt, lastEvent))
+		state := observe(old, account, usage, now, enabledAt, lastEvent)
+		if signal, ok := accountResetSignals[account.ID]; ok {
+			state = applyAccountResetSignal(state, signal, enabledAt, lastEvent)
+		}
+		states = append(states, state)
 	}
 	boundary, consensusErr := consensus(states)
 	message := ""

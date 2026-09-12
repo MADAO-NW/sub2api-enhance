@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"log"
 	infra "sub2api-enhance/internal/pkg/errors"
 	"sub2api-enhance/internal/sub2api"
@@ -121,6 +122,38 @@ func (r *Repository) Runtime(ctx context.Context) (Runtime, error) {
 func (r *Repository) Schedule(ctx context.Context, next time.Time, message string, paused *int64) error {
 	_, err := r.db.ExecContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_runtime(singleton,next_check_at,last_checked_at,last_error,paused_revision) VALUES(true,$1,clock_timestamp(),$2,$3) ON CONFLICT(singleton) DO UPDATE SET next_check_at=$1,last_checked_at=clock_timestamp(),last_error=$2,paused_revision=$3`, next, message, paused)
 	return err
+}
+
+// AccountResetSignals 读取原版 OpenAI 账号重置卡成功审计，作为窗口轮询之外的直接重置证据。
+func (r *Repository) AccountResetSignals(ctx context.Context, accountIDs []int64, since time.Time) (map[int64]time.Time, error) {
+	result := make(map[int64]time.Time)
+	if len(accountIDs) == 0 {
+		return result, nil
+	}
+	ids := make([]string, 0, len(accountIDs))
+	for _, id := range accountIDs {
+		ids = append(ids, fmt.Sprint(id))
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT DISTINCT ON (l.extra#>>'{params,id}') (l.extra#>>'{params,id}')::bigint,l.created_at
+FROM public.audit_logs l
+WHERE l.method='POST' AND l.path='/api/v1/admin/openai/accounts/:id/reset-quota'
+  AND l.status_code BETWEEN 200 AND 299
+  AND l.created_at >= $1
+  AND l.extra#>>'{params,id}'=ANY($2::text[])
+ORDER BY l.extra#>>'{params,id}',l.created_at DESC,l.id DESC`, since, pq.Array(ids))
+	if err != nil {
+		return result, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var accountID int64
+		var occurredAt time.Time
+		if err := rows.Scan(&accountID, &occurredAt); err != nil {
+			return result, err
+		}
+		result[accountID] = occurredAt
+	}
+	return result, rows.Err()
 }
 
 // SaveObservation 提交账号证据与唯一分组事件；远端重置在事务外由交付循环执行。

@@ -127,3 +127,15 @@ func TestRegressedPastBoundaryDoesNotCreateCandidateWhenBaselineRecovers(t *test
 	next := observe(stable, account, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &later}, stableBoundary.Add(time.Minute), now.Add(-3*time.Hour), nil)
 	require.Equal(t, stableBoundary, *next.CandidateResetAt)
 }
+
+func TestAccountResetAuditSignalCreatesCandidateWithoutWindowAdvance(t *testing.T) {
+	now := time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC)
+	previousBoundary := now.Add(24 * time.Hour)
+	signal := now.Add(-time.Minute)
+	state := applyAccountResetSignal(AccountState{NextResetAt: &previousBoundary, Utilization: number("0")}, signal, now.Add(-time.Hour), nil)
+	require.Empty(t, state.Error)
+	require.Equal(t, signal, *state.CandidateResetAt)
+
+	consumed := applyAccountResetSignal(state, signal, now.Add(-time.Hour), &signal)
+	require.Nil(t, consumed.CandidateResetAt)
+}

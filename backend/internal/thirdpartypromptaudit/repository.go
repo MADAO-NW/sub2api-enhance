@@ -69,6 +69,15 @@ func jobProjection(full bool) string {
 }
 
 func decodeJob(raw []byte) (*Job, error) {
+	return decodeJobWithOptions(raw, false)
+}
+
+// decodeJobList 对列表展示字段采用容错解码，避免一条历史快照损坏拖垮整个分页接口。
+func decodeJobList(raw []byte) (*Job, error) {
+	return decodeJobWithOptions(raw, true)
+}
+
+func decodeJobWithOptions(raw []byte, tolerateSnapshotErrors bool) (*Job, error) {
 	job := &Job{}
 	record := struct {
 		*Job
@@ -90,7 +99,9 @@ func decodeJob(raw []byte) (*Job, error) {
 	} {
 		if field.raw != "" {
 			if err := json.Unmarshal([]byte(field.raw), field.target); err != nil {
-				return nil, err
+				if !tolerateSnapshotErrors {
+					return nil, err
+				}
 			}
 		}
 	}
