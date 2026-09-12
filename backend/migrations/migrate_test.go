@@ -122,8 +122,23 @@ func TestTargetHealthMigrationPreservesLegacyEvidenceAndAddsNewKinds(t *testing.
 		"'current_user'",
 		"'instruction_context'",
 		"'intent_binding'",
-		"'effective_behavior'",
 		"ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'legacy_segment'",
+	} {
+		require.Contains(t, sql, required)
+	}
+	require.NotContains(t, strings.ToUpper(sql), "DELETE FROM")
+	require.NotContains(t, strings.ToUpper(sql), "DROP COLUMN")
+}
+
+func TestEffectiveBehaviorMigrationExtendsPublishedTargetChecks(t *testing.T) {
+	raw, err := files.ReadFile("008_prompt_audit_effective_behavior.sql")
+	require.NoError(t, err)
+	sql := string(raw)
+	for _, required := range []string{
+		"third_party_prompt_audit_model_attempts_stage_check",
+		"third_party_prompt_audit_segment_results_target_kind_check",
+		"third_party_prompt_audit_outcome_segments_target_kind_check",
+		"'effective_behavior'",
 	} {
 		require.Contains(t, sql, required)
 	}
