@@ -32,7 +32,7 @@ func (s *SMTP) SendEmail(ctx context.Context, to, subject, body string) error {
 	c := s.config
 	if s.db != nil {
 		var host, port, user, password, from, fromName, useTLS string
-		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(value) FILTER (WHERE key='smtp_host'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_port'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_username'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_password'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_from'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_from_name'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_use_tls'),'false') FROM public.settings`).Scan(&host, &port, &user, &password, &from); err == nil && host != "" {
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(value) FILTER (WHERE key='smtp_host'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_port'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_username'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_password'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_from'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_from_name'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_use_tls'),'false') FROM public.settings`).Scan(&host, &port, &user, &password, &from, &fromName, &useTLS); err == nil && host != "" {
 			if n, err := strconv.Atoi(port); err == nil && n > 0 {
 				port = strconv.Itoa(n)
 			}
