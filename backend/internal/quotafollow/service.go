@@ -198,13 +198,13 @@ func (s *Service) detect(ctx context.Context) error {
 	if cfg.EnabledAt != nil {
 		enabledAt = *cfg.EnabledAt
 	}
-	signalSince := enabledAt
-	if runtime.LastEventAt != nil && runtime.LastEventAt.After(signalSince) {
-		signalSince = *runtime.LastEventAt
-	}
-	accountResetSignals, err := s.repo.AccountResetSignals(ctx, ids, signalSince)
-	if err != nil {
-		return fail(err)
+	accountResetSignals := map[int64]time.Time{}
+	if !changed && runtime.LastCheckedAt != nil {
+		// 只消费上次成功检测之后的新账号审计，首次基线不回放历史记录。
+		accountResetSignals, err = s.repo.AccountResetSignals(ctx, ids, *runtime.LastCheckedAt)
+		if err != nil {
+			return fail(err)
+		}
 	}
 	states := make([]AccountState, 0, len(ids))
 	for _, account := range discovery.Accounts {
@@ -230,7 +230,7 @@ func (s *Service) detect(ctx context.Context) error {
 	if changed {
 		boundary = nil
 	}
-	if err := s.repo.SaveObservation(ctx, cfg, discovery, hash, states, boundary, next, message, runtime.LastCheckedAt); err != nil {
+	if err := s.repo.SaveObservation(ctx, cfg, discovery, hash, states, boundary, next, message, now, runtime.LastCheckedAt); err != nil {
 		return err
 	}
 	transition, _ := json.Marshal(map[string]any{"before_accounts": runtime.Accounts, "after_accounts": discovery.Accounts, "before_states": runtime.States, "after_states": states})

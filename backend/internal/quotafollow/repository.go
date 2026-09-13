@@ -120,11 +120,11 @@ func (r *Repository) Runtime(ctx context.Context) (Runtime, error) {
 	return out, rows.Err()
 }
 func (r *Repository) Schedule(ctx context.Context, next time.Time, message string, paused *int64) error {
-	_, err := r.db.ExecContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_runtime(singleton,next_check_at,last_checked_at,last_error,paused_revision) VALUES(true,$1,clock_timestamp(),$2,$3) ON CONFLICT(singleton) DO UPDATE SET next_check_at=$1,last_checked_at=clock_timestamp(),last_error=$2,paused_revision=$3`, next, message, paused)
+	_, err := r.db.ExecContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_runtime(singleton,next_check_at,last_error,paused_revision) VALUES(true,$1,$2,$3) ON CONFLICT(singleton) DO UPDATE SET next_check_at=$1,last_error=$2,paused_revision=$3`, next, message, paused)
 	return err
 }
 
-// AccountResetSignals 读取原版 OpenAI 账号重置卡成功审计，作为窗口轮询之外的直接重置证据。
+// AccountResetSignals 读取水位之后的原版 OpenAI 账号重置卡成功审计，作为窗口轮询之外的直接重置证据。
 func (r *Repository) AccountResetSignals(ctx context.Context, accountIDs []int64, since time.Time) (map[int64]time.Time, error) {
 	result := make(map[int64]time.Time)
 	if len(accountIDs) == 0 {
@@ -138,7 +138,7 @@ func (r *Repository) AccountResetSignals(ctx context.Context, accountIDs []int64
 FROM public.audit_logs l
 WHERE l.method='POST' AND l.path='/api/v1/admin/openai/accounts/:id/reset-quota'
   AND l.status_code BETWEEN 200 AND 299
-  AND l.created_at >= $1
+  AND l.created_at > $1
   AND l.extra#>>'{params,id}'=ANY($2::text[])
 ORDER BY l.extra#>>'{params,id}',l.created_at DESC,l.id DESC`, since, pq.Array(ids))
 	if err != nil {
@@ -156,8 +156,8 @@ ORDER BY l.extra#>>'{params,id}',l.created_at DESC,l.id DESC`, since, pq.Array(i
 	return result, rows.Err()
 }
 
-// SaveObservation 提交账号证据与唯一分组事件；远端重置在事务外由交付循环执行。
-func (r *Repository) SaveObservation(ctx context.Context, cfg SavedConfig, discovery sub2api.QuotaDiscovery, hash string, states []AccountState, boundary *time.Time, next time.Time, message string, expectedCheckedAt *time.Time) error {
+// SaveObservation 提交账号证据与唯一分组事件，并保存本轮成功检测起点；远端重置在事务外由交付循环执行。
+func (r *Repository) SaveObservation(ctx context.Context, cfg SavedConfig, discovery sub2api.QuotaDiscovery, hash string, states []AccountState, boundary *time.Time, next time.Time, message string, checkedAt time.Time, expectedCheckedAt *time.Time) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -184,8 +184,8 @@ func (r *Repository) SaveObservation(ctx context.Context, cfg SavedConfig, disco
 		return errors.New("已有更新的检测结果，本轮旧证据不再提交")
 	}
 	accounts, _ := json.Marshal(discovery.Accounts)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_runtime(singleton,epoch,account_set_hash,accounts,last_event_at,next_check_at,last_checked_at,last_error) VALUES(true,$1,$2,$3,$4,$5,clock_timestamp(),$6)
- ON CONFLICT(singleton) DO UPDATE SET last_event_at=CASE WHEN sub2api_enhance.quota_follow_runtime.epoch<>$1 OR sub2api_enhance.quota_follow_runtime.account_set_hash<>$2 THEN $4 ELSE COALESCE($4,sub2api_enhance.quota_follow_runtime.last_event_at) END,epoch=$1,account_set_hash=$2,accounts=$3,next_check_at=$5,last_checked_at=clock_timestamp(),last_error=$6,paused_revision=NULL`, cfg.Epoch, hash, string(accounts), boundary, next, message); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_runtime(singleton,epoch,account_set_hash,accounts,last_event_at,next_check_at,last_checked_at,last_error) VALUES(true,$1,$2,$3,$4,$5,$7,$6)
+ ON CONFLICT(singleton) DO UPDATE SET last_event_at=CASE WHEN sub2api_enhance.quota_follow_runtime.epoch<>$1 OR sub2api_enhance.quota_follow_runtime.account_set_hash<>$2 THEN $4 ELSE COALESCE($4,sub2api_enhance.quota_follow_runtime.last_event_at) END,epoch=$1,account_set_hash=$2,accounts=$3,next_check_at=$5,last_checked_at=$7,last_error=$6,paused_revision=NULL`, cfg.Epoch, hash, string(accounts), boundary, next, message, checkedAt); err != nil {
 		return err
 	}
 	for _, state := range states {

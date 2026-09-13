@@ -27,7 +27,7 @@ func TestObservationModeStoresEventWithoutCreatingDeliveries(t *testing.T) {
 	mock.ExpectExec("INSERT INTO sub2api_enhance.quota_follow_account_states").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("INSERT INTO sub2api_enhance.quota_follow_reset_events").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 	mock.ExpectCommit()
-	require.NoError(t, NewRepository(db).SaveObservation(context.Background(), cfg, sub2api.QuotaDiscovery{Accounts: []sub2api.QuotaAccount{{ID: 7}}, Users: []sub2api.QuotaUser{{ID: 9}}}, "hash", states, &boundary, boundary.Add(time.Hour), "", nil))
+	require.NoError(t, NewRepository(db).SaveObservation(context.Background(), cfg, sub2api.QuotaDiscovery{Accounts: []sub2api.QuotaAccount{{ID: 7}}, Users: []sub2api.QuotaUser{{ID: 9}}}, "hash", states, &boundary, boundary.Add(time.Hour), "", boundary, nil))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -37,7 +37,7 @@ func TestAccountResetSignalsReadsLatestSuccessfulAuditPerAccount(t *testing.T) {
 	defer db.Close()
 	since := time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC)
 	occurred := since.Add(time.Minute)
-	mock.ExpectQuery("SELECT DISTINCT ON .*openai/accounts/:id/reset-quota").WillReturnRows(sqlmock.NewRows([]string{"account_id", "created_at"}).AddRow(int64(7), occurred))
+	mock.ExpectQuery("SELECT DISTINCT ON .*openai/accounts/:id/reset-quota.*created_at > \\$1").WillReturnRows(sqlmock.NewRows([]string{"account_id", "created_at"}).AddRow(int64(7), occurred))
 	signals, err := NewRepository(db).AccountResetSignals(context.Background(), []int64{7, 8}, since)
 	require.NoError(t, err)
 	require.Equal(t, occurred, signals[7])
@@ -45,6 +45,17 @@ func TestAccountResetSignalsReadsLatestSuccessfulAuditPerAccount(t *testing.T) {
 	require.False(t, ok)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestScheduleDoesNotAdvanceSuccessfulCheckWatermark(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	next := time.Date(2026, 9, 13, 7, 0, 0, 0, time.UTC)
+	mock.ExpectExec("INSERT INTO sub2api_enhance.quota_follow_runtime\\(singleton,next_check_at,last_error,paused_revision\\)").WithArgs(next, "检测失败", nil).WillReturnResult(sqlmock.NewResult(0, 1))
+	require.NoError(t, NewRepository(db).Schedule(context.Background(), next, "检测失败", nil))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestRecordFilterPreservesAllCallerConditions(t *testing.T) {
 	now := time.Now()
 	where, args := recordFilter(Filter{From: &now, Source: "enhance", Window: "weekly", Status: "uncertain", Keyword: "user"})
@@ -66,7 +77,7 @@ func TestStaleDetectorCannotOverwriteNewlyCommittedEvidence(t *testing.T) {
 	mock.ExpectQuery("SELECT value .* FOR SHARE").WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(string(raw)))
 	mock.ExpectQuery("SELECT last_checked_at .* FOR UPDATE").WillReturnRows(sqlmock.NewRows([]string{"last_checked_at"}).AddRow(now))
 	mock.ExpectRollback()
-	err = NewRepository(db).SaveObservation(context.Background(), cfg, sub2api.QuotaDiscovery{}, "hash", nil, nil, now, "", nil)
+	err = NewRepository(db).SaveObservation(context.Background(), cfg, sub2api.QuotaDiscovery{}, "hash", nil, nil, now, "", now, nil)
 	require.ErrorContains(t, err, "已有更新的检测结果")
 	require.NoError(t, mock.ExpectationsWereMet())
 }

@@ -211,10 +211,15 @@ func observe(previous AccountState, account sub2api.QuotaAccount, usage sub2api.
 func applyAccountResetSignal(previous AccountState, signal time.Time, enabledAt time.Time, lastEvent *time.Time) AccountState {
 	next := previous
 	if lastEvent != nil && !signal.After(*lastEvent) {
-		next.CandidateResetAt = nil
+		if next.CandidateResetAt == nil || !next.CandidateResetAt.After(*lastEvent) {
+			next.CandidateResetAt = nil
+		}
 		return next
 	}
 	if !signal.After(enabledAt) || next.Error != "" {
+		return next
+	}
+	if next.CandidateResetAt != nil && !signal.After(*next.CandidateResetAt) {
 		return next
 	}
 	next.CandidateResetAt = &signal

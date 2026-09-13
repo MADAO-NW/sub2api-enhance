@@ -139,3 +139,19 @@ func TestAccountResetAuditSignalCreatesCandidateWithoutWindowAdvance(t *testing.
 	consumed := applyAccountResetSignal(state, signal, now.Add(-time.Hour), &signal)
 	require.Nil(t, consumed.CandidateResetAt)
 }
+
+func TestAccountResetAuditSignalDoesNotReplaceNewerCandidate(t *testing.T) {
+	enabled := time.Date(2026, 9, 11, 13, 40, 0, 0, time.UTC)
+	older := enabled.Add(2 * time.Hour)
+	newer := older.Add(24 * time.Hour)
+	state := applyAccountResetSignal(AccountState{CandidateResetAt: &newer}, older, enabled, nil)
+	require.Equal(t, newer, *state.CandidateResetAt)
+}
+
+func TestConsumedAuditSignalDoesNotClearNewerCandidate(t *testing.T) {
+	enabled := time.Date(2026, 9, 11, 13, 40, 0, 0, time.UTC)
+	lastEvent := enabled.Add(2 * time.Hour)
+	newer := lastEvent.Add(24 * time.Hour)
+	state := applyAccountResetSignal(AccountState{CandidateResetAt: &newer}, lastEvent, enabled, &lastEvent)
+	require.Equal(t, newer, *state.CandidateResetAt)
+}
