@@ -17,15 +17,18 @@ type recoveryCandidate struct {
 
 func (r *Repository) recoveryCandidates(ctx context.Context, awaitingReview bool) ([]recoveryCandidate, error) {
 	condition := "((j.id IS NULL AND c.processing_status='failed') OR j.status='failed')"
+	eligibility := " AND c.eligibility_status='passed' AND COALESCE(c.request_metadata::json->>'audit_required','false')='true'"
+	userID := "c.user_id"
 	if awaitingReview {
 		condition = "j.id IS NULL AND c.processing_status='awaiting_review'"
+		eligibility = ""
+		userID = "COALESCE(c.user_id,0)"
 	}
-	query := `SELECT c.id,j.id,c.user_id,
+	query := `SELECT c.id,j.id,` + userID + `,
 		 COALESCE(j.failure_stage='result_persist' AND j.result_checkpoint IS NOT NULL,false)
 		 FROM sub2api_enhance.captures c
 		 LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs j ON j.capture_id=c.id
-		 WHERE c.snapshot_status='complete' AND c.eligibility_status='passed'
-		 AND COALESCE(c.request_metadata::json->>'audit_required','false')='true'
+		 WHERE c.snapshot_status='complete'` + eligibility + `
 		 AND COALESCE(c.request_metadata::json->>'manual_reprocess','false')<>'true'
 		 AND ` + condition + ` ORDER BY c.id`
 	rows, err := r.db.QueryContext(ctx, query)

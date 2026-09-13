@@ -3,12 +3,14 @@ package notify
 import (
 	"context"
 	"crypto/tls"
+	"database/sql"
 	"errors"
 	"fmt"
 	"mime"
 	"net"
 	"net/mail"
 	"net/smtp"
+	"strconv"
 	"strings"
 	"sub2api-enhance/internal/config"
 	"time"
@@ -20,11 +22,23 @@ var ErrNotConfigured = errors.New("尚未配置 SMTP 通知")
 type Sender interface {
 	SendEmail(context.Context, string, string, string) error
 }
-type SMTP struct{ config *config.Config }
+type SMTP struct {
+	config *config.Config
+	db     *sql.DB
+}
 
-func NewSMTP(c *config.Config) *SMTP { return &SMTP{config: c} }
+func NewSMTP(db *sql.DB, c *config.Config) *SMTP { return &SMTP{config: c, db: db} }
 func (s *SMTP) SendEmail(ctx context.Context, to, subject, body string) error {
 	c := s.config
+	if s.db != nil {
+		var host, port, user, password, from string
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(value) FILTER (WHERE key='smtp_host'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_port'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_username'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_password'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_from'),'' ) FROM public.settings`).Scan(&host, &port, &user, &password, &from); err == nil && host != "" {
+			if n, err := strconv.Atoi(port); err == nil && n > 0 {
+				port = strconv.Itoa(n)
+			}
+			c = &config.Config{SMTPHost: host, SMTPPort: port, SMTPUser: user, SMTPPassword: password, SMTPFrom: from}
+		}
+	}
 	if c == nil || c.SMTPHost == "" {
 		return ErrNotConfigured
 	}

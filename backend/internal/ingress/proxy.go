@@ -348,7 +348,8 @@ func (p *Proxy) evaluate(ctx context.Context, c *audit.Capture) *audit.IntakeDec
 	return result
 }
 func (p *Proxy) allow(w http.ResponseWriter, kind string, c *audit.Capture, d *audit.IntakeDecision) bool {
-	if d == nil || d.Kind == audit.IngressDecisionAllow || d.Kind == audit.IngressDecisionFlag {
+	// 异步审核不可用时不阻断原请求；任务状态和失败原因由后台任务记录。
+	if d == nil || d.Kind == audit.IngressDecisionAllow || d.Kind == audit.IngressDecisionFlag || (d.Mode == "async" && d.Kind == audit.IngressDecisionUnavailable) {
 		return true
 	}
 	status := 503
