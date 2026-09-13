@@ -15,16 +15,20 @@ type recoveryCandidate struct {
 	Checkpoint bool
 }
 
-func (r *Repository) recoveryCandidates(ctx context.Context) ([]recoveryCandidate, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT c.id,j.id,c.user_id,
-	 COALESCE(j.failure_stage='result_persist' AND j.result_checkpoint IS NOT NULL,false)
-	 FROM sub2api_enhance.captures c
-	 LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs j ON j.capture_id=c.id
-	 WHERE c.snapshot_status='complete' AND c.eligibility_status='passed'
-	 AND COALESCE(c.request_metadata::json->>'audit_required','false')='true'
-	 AND COALESCE(c.request_metadata::json->>'manual_reprocess','false')<>'true'
-	 AND ((j.id IS NULL AND c.processing_status='failed') OR j.status='failed')
-	 ORDER BY c.id`)
+func (r *Repository) recoveryCandidates(ctx context.Context, awaitingReview bool) ([]recoveryCandidate, error) {
+	condition := "((j.id IS NULL AND c.processing_status='failed') OR j.status='failed')"
+	if awaitingReview {
+		condition = "j.id IS NULL AND c.processing_status='awaiting_review'"
+	}
+	query := `SELECT c.id,j.id,c.user_id,
+		 COALESCE(j.failure_stage='result_persist' AND j.result_checkpoint IS NOT NULL,false)
+		 FROM sub2api_enhance.captures c
+		 LEFT JOIN sub2api_enhance.third_party_prompt_audit_jobs j ON j.capture_id=c.id
+		 WHERE c.snapshot_status='complete' AND c.eligibility_status='passed'
+		 AND COALESCE(c.request_metadata::json->>'audit_required','false')='true'
+		 AND COALESCE(c.request_metadata::json->>'manual_reprocess','false')<>'true'
+		 AND ` + condition + ` ORDER BY c.id`
+	rows, err := r.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -40,8 +44,8 @@ func (r *Repository) recoveryCandidates(ctx context.Context) ([]recoveryCandidat
 	return items, rows.Err()
 }
 
-func (s *Service) recoveryPlan(ctx context.Context) (*RecoveryResult, error) {
-	candidates, err := s.repo.recoveryCandidates(ctx)
+func (s *Service) recoveryPlan(ctx context.Context, awaitingReview bool) (*RecoveryResult, error) {
+	candidates, err := s.repo.recoveryCandidates(ctx, awaitingReview)
 	if err != nil {
 		return nil, err
 	}
@@ -94,11 +98,20 @@ func (s *Service) recoveryPlan(ctx context.Context) (*RecoveryResult, error) {
 }
 
 func (s *Service) PreviewRecoveries(ctx context.Context) (*RecoveryResult, error) {
-	return s.recoveryPlan(ctx)
+	return s.recoveryPlan(ctx, false)
+}
+func (s *Service) PreviewAwaitingReviews(ctx context.Context) (*RecoveryResult, error) {
+	return s.recoveryPlan(ctx, true)
 }
 
 func (s *Service) CreateRecoveries(ctx context.Context, actorID int64) (*RecoveryResult, error) {
-	result, err := s.recoveryPlan(ctx)
+	return s.createRecoveries(ctx, actorID, false)
+}
+func (s *Service) CreateAwaitingReviews(ctx context.Context, actorID int64) (*RecoveryResult, error) {
+	return s.createRecoveries(ctx, actorID, true)
+}
+func (s *Service) createRecoveries(ctx context.Context, actorID int64, awaitingReview bool) (*RecoveryResult, error) {
+	result, err := s.recoveryPlan(ctx, awaitingReview)
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +215,7 @@ func (s *Service) CreateRecoveries(ctx context.Context, actorID int64) (*Recover
 		} else {
 			item.Status, item.Reason = "already_running", "采集已关联任务"
 		}
-		_, _ = s.repo.db.ExecContext(ctx, `UPDATE sub2api_enhance.captures SET processing_status='done',last_error_message=NULL,updated_at=clock_timestamp() WHERE id=$1 AND processing_status='failed'`, item.CaptureID)
+		_, _ = s.repo.db.ExecContext(ctx, `UPDATE sub2api_enhance.captures SET processing_status='done',last_error_message=NULL,updated_at=clock_timestamp() WHERE id=$1 AND processing_status=$2`, item.CaptureID, map[bool]string{true: "awaiting_review", false: "failed"}[awaitingReview])
 		s.notify()
 	}
 	return result, nil

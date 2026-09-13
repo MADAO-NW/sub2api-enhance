@@ -221,6 +221,8 @@ export const thirdPartyPromptAuditAPI = {
   async reaudit(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits`, value)).data },
   async previewRecoveries() { return (await apiClient.post<RecoveryResult>(`${base}/recoveries/preview`)).data },
   async createRecoveries() { return (await apiClient.post<RecoveryResult>(`${base}/recoveries`)).data },
+  async previewAwaitingReviews() { return (await apiClient.post<RecoveryResult>(`${base}/pending-reviews/preview`)).data },
+  async createAwaitingReviews() { return (await apiClient.post<RecoveryResult>(`${base}/pending-reviews`)).data },
   async resume(id: number) { return (await apiClient.post(`${base}/jobs/${id}/resume`)).data },
   async enableAndReset(id: number) { return (await apiClient.post<{ action_id: number; execution_status: string }>(`${base}/users/${id}/enable-and-reset`)).data },
   async retryAction(id: number) { return (await apiClient.post(`${base}/actions/${id}/retry`)).data }

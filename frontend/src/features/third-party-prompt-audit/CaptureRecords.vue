@@ -34,7 +34,7 @@ const recovering = ref(false)
 const jobID = ref<number | null>(null)
 const recoveryBlocked = computed(() => !selected.value || selected.value.snapshot_status !== 'complete')
 const processing = computed(() => !!selected.value && (selected.value.processing_status === 'processing' || (['queued', 'retry'].includes(selected.value.processing_status) && selected.value.metadata?.mode === 'async' && selected.value.eligibility_status === 'passed')))
-const batchOpen = ref(false), batchLoading = ref(false), batchSubmitted = ref(false)
+const batchOpen = ref(false), batchLoading = ref(false), batchSubmitted = ref(false), batchMode = ref<'failed' | 'awaiting'>('failed')
 const batchResult = ref<RecoveryResult | null>(null), batchPage = ref(1)
 const batchItems = computed(() => batchResult.value?.items.slice((batchPage.value - 1) * 20, batchPage.value * 20) ?? [])
 watch(userID, async id => {
@@ -73,13 +73,14 @@ function apply() {
 function changePage(value: number) { page.value = value; void load() }
 function changeSize(value: number) { pageSize.value = value; page.value = 1; void load() }
 
-async function openBatchRecovery() {
+async function openBatchRecovery(mode: 'failed' | 'awaiting' = 'failed') {
+  batchMode.value = mode
   batchOpen.value = true
   batchLoading.value = true
   batchSubmitted.value = false
   batchResult.value = null
   batchPage.value = 1
-  try { batchResult.value = await api.previewRecoveries() }
+  try { batchResult.value = batchMode.value === 'awaiting' ? await api.previewAwaitingReviews() : await api.previewRecoveries() }
   catch (err) { app.showError(extractApiErrorMessage(err, label('error'))); batchOpen.value = false }
   finally { batchLoading.value = false }
 }
@@ -88,13 +89,13 @@ async function submitBatchRecovery() {
   if (batchLoading.value || !batchResult.value?.ready) return
   batchLoading.value = true
   try {
-    batchResult.value = await api.createRecoveries()
+    batchResult.value = batchMode.value === 'awaiting' ? await api.createAwaitingReviews() : await api.createRecoveries()
     batchSubmitted.value = true
     batchPage.value = 1
     const ids = batchResult.value.items.flatMap(item => item.job_id && ['created', 'requeued', 'resumed', 'already_running'].includes(item.status) ? [item.job_id] : [])
     if (ids.length) emit('recovery-created', ids)
     await load()
-    app.showSuccess(`${label('recoverySubmitted')}: ${ids.length}`)
+    app.showSuccess(`${label(batchMode.value === 'awaiting' ? 'pendingReviewSubmitted' : 'recoverySubmitted')}: ${ids.length}`)
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { batchLoading.value = false }
 }
@@ -139,7 +140,7 @@ watch(() => props.refreshKey, () => { void load() })
         <h2 class="text-xl font-semibold">{{ label('captures') }}</h2>
         <p class="mt-2 text-sm text-gray-500">{{ label('captureHint') }}</p>
       </div>
-      <div class="flex flex-wrap gap-2"><button class="btn btn-secondary" @click="openBatchRecovery">{{ label('recoverAllFailures') }}</button><button class="btn btn-secondary" @click="load">{{ label('refresh') }}</button></div>
+      <div class="flex flex-wrap gap-2"><button class="btn btn-secondary" @click="openBatchRecovery('awaiting')">{{ label('processPendingReviews') }}</button><button class="btn btn-secondary" @click="openBatchRecovery('failed')">{{ label('recoverAllFailures') }}</button><button class="btn btn-secondary" @click="load">{{ label('refresh') }}</button></div>
     </header>
     <form class="mb-5 space-y-4 rounded-xl border border-gray-100 p-4 dark:border-dark-700" @submit.prevent="apply">
       <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -190,11 +191,11 @@ watch(() => props.refreshKey, () => { void load() })
         </div>
       </template>
     </BaseDialog>
-    <BaseDialog :show="batchOpen" :title="label('recoverAllFailures')" width="wide" :show-close-button="!batchLoading" :close-on-escape="!batchLoading" :close-on-click-outside="!batchLoading" @close="closeBatchRecovery">
+    <BaseDialog :show="batchOpen" :title="label(batchMode === 'awaiting' ? 'processPendingReviews' : 'recoverAllFailures')" width="wide" :show-close-button="!batchLoading" :close-on-escape="!batchLoading" :close-on-click-outside="!batchLoading" @close="closeBatchRecovery">
       <div class="space-y-4">
-        <p class="text-sm text-gray-500">{{ label('recoveryPreviewHint') }}</p>
+        <p class="text-sm text-gray-500">{{ label(batchMode === 'awaiting' ? 'pendingReviewHint' : 'recoveryPreviewHint') }}</p>
         <p v-if="batchLoading" role="status">{{ label('loading') }}</p>
-        <template v-if="batchResult"><p>{{ label('matched') }}: {{ batchResult.matched }} · {{ label('ready') }}: {{ batchResult.ready }}</p><div class="max-h-96 overflow-auto"><div v-for="item in batchItems" :key="`${item.capture_id}-${item.job_id || 0}`" class="border-t border-gray-100 py-3 text-sm dark:border-dark-700"><span>Capture #{{ item.capture_id }}<template v-if="item.job_id"> · Job #{{ item.job_id }}</template> → {{ label(item.action) }} · {{ label(item.status) }}</span><p v-if="item.reason" class="text-gray-500">{{ item.reason }}</p></div></div><Pagination :page="batchPage" :page-size="20" :total="batchResult.items.length" :show-page-size-selector="false" @update:page="batchPage = $event" /><button v-if="!batchSubmitted" class="btn btn-primary" :disabled="batchLoading || !batchResult.ready" @click="submitBatchRecovery">{{ label('submitRecovery') }}</button><p v-else role="status">{{ label('recoverySubmitted') }}</p></template>
+        <template v-if="batchResult"><p>{{ label('matched') }}: {{ batchResult.matched }} · {{ label('ready') }}: {{ batchResult.ready }}</p><div class="max-h-96 overflow-auto"><div v-for="item in batchItems" :key="`${item.capture_id}-${item.job_id || 0}`" class="border-t border-gray-100 py-3 text-sm dark:border-dark-700"><span>Capture #{{ item.capture_id }}<template v-if="item.job_id"> · Job #{{ item.job_id }}</template> → {{ label(item.action) }} · {{ label(item.status) }}</span><p v-if="item.reason" class="text-gray-500">{{ item.reason }}</p></div></div><Pagination :page="batchPage" :page-size="20" :total="batchResult.items.length" :show-page-size-selector="false" @update:page="batchPage = $event" /><button v-if="!batchSubmitted" class="btn btn-primary" :disabled="batchLoading || !batchResult.ready" @click="submitBatchRecovery">{{ label(batchMode === 'awaiting' ? 'submitPendingReviews' : 'submitRecovery') }}</button><p v-else role="status">{{ label(batchMode === 'awaiting' ? 'pendingReviewSubmitted' : 'recoverySubmitted') }}</p></template>
       </div>
     </BaseDialog>
     <AuditDetail :id="jobID" @close="jobID = null" />

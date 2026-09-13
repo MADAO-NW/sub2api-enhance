@@ -214,6 +214,22 @@ func (h *AdminHandler) ReprocessCapture(c *gin.Context) {
 	response.Success(c, result)
 }
 
+func (h *AdminHandler) PreviewAwaitingReviews(c *gin.Context) {
+	result, err := h.service.PreviewAwaitingReviews(c.Request.Context())
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+func (h *AdminHandler) CreateAwaitingReviews(c *gin.Context) {
+	result, err := h.service.CreateAwaitingReviews(c.Request.Context(), adminActor(c))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Accepted(c, result)
+}
 func (h *AdminHandler) PreviewRecoveries(c *gin.Context) {
 	result, err := h.service.PreviewRecoveries(c.Request.Context())
 	if err != nil {

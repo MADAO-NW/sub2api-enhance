@@ -67,6 +67,8 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	a.POST("/reaudits", handler.CreateReaudits)
 	a.POST("/recoveries/preview", handler.PreviewRecoveries)
 	a.POST("/recoveries", handler.CreateRecoveries)
+	a.POST("/pending-reviews/preview", handler.PreviewAwaitingReviews)
+	a.POST("/pending-reviews", handler.CreateAwaitingReviews)
 	a.POST("/actions/:id/retry", handler.RetryAction)
 	a.GET("/captures", handler.ListCaptures)
 	a.GET("/captures/:id", handler.GetCapture)
