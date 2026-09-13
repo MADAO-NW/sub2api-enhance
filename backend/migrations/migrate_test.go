@@ -172,3 +172,20 @@ func TestRedisProjectionMigrationAddsOnlyIncrementalWatermarksAndIndexes(t *test
 	require.NotContains(t, strings.ToUpper(sql), "DELETE FROM")
 	require.NotContains(t, strings.ToUpper(sql), "DROP COLUMN")
 }
+
+func TestBatchMigrationUsesNullableTargetColumnsAndAtomicStatuses(t *testing.T) {
+	raw, err := files.ReadFile("012_prompt_audit_batches.sql")
+	require.NoError(t, err)
+	sql := string(raw)
+	require.Contains(t, sql, "batch_type IN ('pending_review','failed_recovery','reaudit_selected','reaudit_filter')")
+	require.Contains(t, sql, "CHECK ((capture_id IS NOT NULL) <> (job_id IS NOT NULL))")
+	require.Contains(t, sql, "CREATE UNIQUE INDEX third_party_prompt_audit_batch_items_capture_uniq")
+	require.Contains(t, sql, "CREATE UNIQUE INDEX third_party_prompt_audit_batch_items_job_uniq")
+	require.Contains(t, sql, "source_audit_round")
+	require.Contains(t, sql, "claim_generation")
+	require.Contains(t, sql, "request_hash")
+	require.Contains(t, sql, "third_party_prompt_audit_batches_active_request_uniq")
+	require.NotContains(t, sql, "PRIMARY KEY (batch_id, capture_id, job_id)")
+	require.NotContains(t, strings.ToUpper(sql), "DROP TABLE")
+	require.NotContains(t, strings.ToUpper(sql), "DELETE FROM")
+}

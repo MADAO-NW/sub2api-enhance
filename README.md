@@ -75,7 +75,7 @@ sudoedit /etc/sub2api-enhance/sub2api-enhance.env
 openssl rand -base64 32
 ```
 
-通知功能需要在同一环境文件填写 `SMTP_HOST`、`SMTP_PORT`、`SMTP_FROM`；需要认证时再填写 `SMTP_USER`、`SMTP_PASSWORD`。端口 465 使用隐式 TLS，其他端口要求服务器支持 STARTTLS（通常为 587）。页面里的“管理员通知邮箱”是收件人，不是发件服务配置。SMTP 环境变量在进程启动时读取。
+通知功能直接复用同一数据库中原版 Sub2API 的 SMTP 设置（`smtp_host`、`smtp_port`、`smtp_username`、`smtp_password`、`smtp_from`、`smtp_from_name`、`smtp_use_tls`），每次投递读取最新值；页面里的“管理员通知邮箱”是收件人，不是发件服务配置。增强服务环境文件中的 `SMTP_*` 仅作为本地开发回退，不作为线上唯一配置来源。
 
 ```bash
 sudo systemctl start sub2api-enhance

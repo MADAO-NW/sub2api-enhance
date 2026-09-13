@@ -31,12 +31,12 @@ func NewSMTP(db *sql.DB, c *config.Config) *SMTP { return &SMTP{config: c, db: d
 func (s *SMTP) SendEmail(ctx context.Context, to, subject, body string) error {
 	c := s.config
 	if s.db != nil {
-		var host, port, user, password, from string
-		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(value) FILTER (WHERE key='smtp_host'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_port'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_username'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_password'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_from'),'' ) FROM public.settings`).Scan(&host, &port, &user, &password, &from); err == nil && host != "" {
+		var host, port, user, password, from, fromName, useTLS string
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(value) FILTER (WHERE key='smtp_host'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_port'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_username'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_password'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_from'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_from_name'),''),COALESCE(MAX(value) FILTER (WHERE key='smtp_use_tls'),'false') FROM public.settings`).Scan(&host, &port, &user, &password, &from); err == nil && host != "" {
 			if n, err := strconv.Atoi(port); err == nil && n > 0 {
 				port = strconv.Itoa(n)
 			}
-			c = &config.Config{SMTPHost: host, SMTPPort: port, SMTPUser: user, SMTPPassword: password, SMTPFrom: from}
+			c = &config.Config{SMTPHost: host, SMTPPort: port, SMTPUser: user, SMTPPassword: password, SMTPFrom: from, SMTPFromName: fromName, SMTPUseTLS: useTLS == "true"}
 		}
 	}
 	if c == nil || c.SMTPHost == "" {
@@ -57,7 +57,7 @@ func (s *SMTP) SendEmail(ctx context.Context, to, subject, body string) error {
 	address := net.JoinHostPort(c.SMTPHost, c.SMTPPort)
 	tlsConfig := &tls.Config{ServerName: c.SMTPHost, MinVersion: tls.VersionTLS12}
 	var conn net.Conn
-	if c.SMTPPort == "465" {
+	if c.SMTPPort == "465" || c.SMTPUseTLS {
 		conn, err = (&tls.Dialer{NetDialer: &d, Config: tlsConfig}).DialContext(ctx, "tcp", address)
 	} else {
 		conn, err = d.DialContext(ctx, "tcp", address)
@@ -74,7 +74,7 @@ func (s *SMTP) SendEmail(ctx context.Context, to, subject, body string) error {
 		return err
 	}
 	defer client.Close()
-	if c.SMTPPort != "465" {
+	if c.SMTPPort != "465" && !c.SMTPUseTLS {
 		if ok, _ := client.Extension("STARTTLS"); !ok {
 			return errors.New("SMTP 服务必须支持 STARTTLS")
 		}
@@ -97,7 +97,11 @@ func (s *SMTP) SendEmail(ctx context.Context, to, subject, body string) error {
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(writer, "From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n%s", from.String(), recipient.String(), mime.QEncoding.Encode("utf-8", subject), body)
+	fromHeader := from.String()
+	if c.SMTPFromName != "" {
+		fromHeader = (&mail.Address{Name: c.SMTPFromName, Address: from.Address}).String()
+	}
+	_, err = fmt.Fprintf(writer, "From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n%s", fromHeader, recipient.String(), mime.QEncoding.Encode("utf-8", subject), body)
 	if err != nil {
 		return err
 	}

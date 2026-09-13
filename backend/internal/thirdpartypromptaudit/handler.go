@@ -372,3 +372,85 @@ func (h *AdminHandler) CreateReaudits(c *gin.Context) {
 	middleware.SetAuditExtra(c, counts)
 	response.Accepted(c, result)
 }
+
+func (h *AdminHandler) CreateBatch(c *gin.Context) {
+	var input BatchRequest
+	if err := bindStrict(c, &input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	if input.Type != BatchPendingReview && input.Type != BatchFailedRecovery && input.Type != BatchReauditSelected && input.Type != BatchReauditFilter {
+		response.BadRequest(c, "批次类型无效")
+		return
+	}
+	b, err := h.repo.CreateBatch(c.Request.Context(), input, adminActor(c))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	h.service.notify()
+	response.Accepted(c, gin.H{"batch_id": b.ID, "status": b.Status, "matched": b.Matched, "ready": b.Ready})
+}
+func (h *AdminHandler) GetBatch(c *gin.Context) {
+	id, ok := recordID(c)
+	if !ok {
+		return
+	}
+	b, err := h.repo.GetBatch(c.Request.Context(), id)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, b)
+}
+
+func (h *AdminHandler) GetBatchItems(c *gin.Context) {
+	id, ok := recordID(c)
+	if !ok {
+		return
+	}
+	limit, afterID := 50, int64(0)
+	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 {
+		limit = v
+	}
+	if value := c.Query("after_id"); value != "" {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || parsed < 0 {
+			response.BadRequest(c, "after_id 无效")
+			return
+		}
+		afterID = parsed
+	}
+	items, err := h.repo.GetBatchItems(c.Request.Context(), id, limit, afterID)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, items)
+}
+
+func (h *AdminHandler) PreviewBatch(c *gin.Context) {
+	var input BatchRequest
+	if err := bindStrict(c, &input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	p, err := h.repo.PreviewBatch(c.Request.Context(), input)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, p)
+}
+func (h *AdminHandler) ListBatches(c *gin.Context) {
+	limit := 20
+	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 {
+		limit = v
+	}
+	items, err := h.repo.ListBatches(c.Request.Context(), adminActor(c), limit)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, items)
+}

@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onUnmounted, reactive, ref, watch } from 'vue'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import Pagination from '@/components/common/Pagination.vue'
-import { thirdPartyPromptAuditAPI as api, type AuditCapture, type AuditFilter, type AuditJob, type ReauditRequest, type ReauditResult } from '@/api/admin/third-party-prompt-audit'
+import { thirdPartyPromptAuditAPI as api, type AuditCapture, type AuditFilter, type AuditJob, type ReauditRequest, type ReauditResult, type AuditBatch } from '@/api/admin/third-party-prompt-audit'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import AuditDetail from './AuditDetail.vue'
@@ -25,6 +25,7 @@ const capture = ref<AuditCapture | null>(null), captureLoadingID = ref<number | 
 const previewRequest = ref<ReauditRequest | null>(null), preview = ref<ReauditResult | null>(null)
 const reauditReuseMode = ref<'allow' | 'force'>('allow')
 const previewPage = ref(1), previewLoading = ref(false), submitted = ref(false)
+const batchID = ref<number | null>(null), batchStatus = ref(''), batchData = ref<AuditBatch | null>(null); let batchTimer: ReturnType<typeof setInterval> | null = null
 const previewItems = computed(() => preview.value?.items.slice((previewPage.value - 1) * 20, previewPage.value * 20) ?? [])
 let generation = 0
 async function load() {
@@ -65,6 +66,14 @@ async function submit() {
   if (!previewRequest.value || !preview.value?.ready) return
   previewLoading.value = true
   try {
+    if (typeof api.createBatch === 'function') {
+      const created = await api.createBatch({ batch_type: previewRequest.value.filter.ids?.length ? 'reaudit_selected' : 'reaudit_filter', filter: previewRequest.value.filter, ids: previewRequest.value.filter.ids, reuse_mode: reauditReuseMode.value })
+      batchID.value = created.batch_id; batchStatus.value = created.status; batchData.value = { ...created, id: created.batch_id, batch_type: previewRequest.value.filter.ids?.length ? 'reaudit_selected' : 'reaudit_filter', requested_by: 0, processed: 0, created: 0, requeued: 0, resumed: 0, skipped: 0, failed: 0, started_at: null, finished_at: null, created_at: null, updated_at: null } as AuditBatch; submitted.value = true
+      if (batchTimer) clearInterval(batchTimer)
+      batchTimer = setInterval(async () => { if (!batchID.value) return; try { const current = await api.batch(batchID.value); batchData.value = current; batchStatus.value = current.status; if (['completed','failed'].includes(current.status) && batchTimer) { clearInterval(batchTimer); batchTimer = null; await load() } } catch { /* 下一轮继续 */ } }, 1500)
+      app.showSuccess(`${label('createdJobs')}: #${created.batch_id}`)
+      return
+    }
 	preview.value = await api.reaudit({ ...previewRequest.value, reuse_mode: reauditReuseMode.value })
     submitted.value = true
     previewPage.value = 1
@@ -80,6 +89,7 @@ async function submit() {
 }
 function closePreview() {
   if (previewLoading.value) return
+  if (batchTimer) { clearInterval(batchTimer); batchTimer = null }
   previewRequest.value = null
   preview.value = null
   submitted.value = false
@@ -105,6 +115,7 @@ watch(() => props.initialFilter, value => {
   void load()
 }, { immediate: true })
 watch(() => props.refreshKey, () => { void load() })
+onUnmounted(() => { if (batchTimer) clearInterval(batchTimer) })
 </script>
 
 <template>
@@ -150,7 +161,7 @@ watch(() => props.refreshKey, () => { void load() })
     <AuditDetail :id="detailID" :refresh-key="refreshKey" @close="detailID = null" @changed="load" @reaudit-created="emit('reaudit-created', $event)" />
     <BaseDialog :show="!!capture" :title="label('captureDetail')" :close-on-click-outside="true" @close="capture = null"><CaptureBody v-if="capture" :capture="capture" /></BaseDialog>
     <BaseDialog :show="previewRequest !== null" :title="label('preview')" width="wide" :show-close-button="!previewLoading" :close-on-escape="!previewLoading" :close-on-click-outside="!previewLoading" @close="closePreview">
-      <div class="space-y-4"><p class="text-sm text-gray-500 dark:text-dark-400">{{ label('previewHint') }}</p><fieldset class="space-y-2"><legend class="text-sm font-medium">{{ label('reauditReuseMode') }}</legend><label class="flex items-start gap-2 text-sm"><input v-model="reauditReuseMode" type="radio" value="allow" /><span>{{ label('reuseAllow') }}<span class="block text-xs text-gray-500">{{ label('reuseAllowHint') }}</span></span></label><label class="flex items-start gap-2 text-sm"><input v-model="reauditReuseMode" type="radio" value="force" /><span>{{ label('reuseForce') }}<span class="block text-xs text-gray-500">{{ label('reuseForceHint') }}</span></span></label></fieldset><p v-if="previewLoading" role="status">{{ label('loading') }}</p><template v-if="preview"><p>{{ label('matched') }}: {{ preview.matched }} · {{ label('ready') }}: {{ preview.ready }}</p><div class="max-h-96 overflow-auto"><div v-for="item in previewItems" :key="item.job_id" class="border-t border-gray-100 py-3 text-sm dark:border-dark-700"><span>Job #{{ item.job_id }} → {{ label(item.status === 'requeued' ? 'submitted' : item.status) }}</span><p class="text-gray-500 dark:text-dark-400">{{ item.reason }}</p></div></div><Pagination :page="previewPage" :page-size="20" :total="preview.items.length" :show-page-size-selector="false" @update:page="previewPage = $event" /><button v-if="!submitted" class="btn btn-primary" :disabled="previewLoading || !preview.ready" @click="submit">{{ label('submitReaudit') }}</button><p v-else role="status"><span v-for="state in ['requeued', 'already_running', 'skipped', 'failed']" :key="state" class="mr-4">{{ label(state === 'requeued' ? 'createdJobs' : state) }}: {{ preview.items.filter(item => item.status === state).length }}</span></p></template></div>
+      <div class="space-y-4"><p class="text-sm text-gray-500 dark:text-dark-400">{{ label('previewHint') }}</p><fieldset class="space-y-2"><legend class="text-sm font-medium">{{ label('reauditReuseMode') }}</legend><label class="flex items-start gap-2 text-sm"><input v-model="reauditReuseMode" type="radio" value="allow" /><span>{{ label('reuseAllow') }}<span class="block text-xs text-gray-500">{{ label('reuseAllowHint') }}</span></span></label><label class="flex items-start gap-2 text-sm"><input v-model="reauditReuseMode" type="radio" value="force" /><span>{{ label('reuseForce') }}<span class="block text-xs text-gray-500">{{ label('reuseForceHint') }}</span></span></label></fieldset><p v-if="previewLoading" role="status">{{ label('loading') }}</p><template v-if="preview"><p>{{ label('matched') }}: {{ preview.matched }} · {{ label('ready') }}: {{ preview.ready }}</p><div class="max-h-96 overflow-auto"><div v-for="item in previewItems" :key="item.job_id" class="border-t border-gray-100 py-3 text-sm dark:border-dark-700"><span>Job #{{ item.job_id }} → {{ label(item.status === 'requeued' ? 'submitted' : item.status) }}</span><p class="text-gray-500 dark:text-dark-400">{{ item.reason }}</p></div></div><Pagination :page="previewPage" :page-size="20" :total="preview.items.length" :show-page-size-selector="false" @update:page="previewPage = $event" /><button v-if="!submitted" class="btn btn-primary" :disabled="previewLoading || !preview.ready" @click="submit">{{ label('submitReaudit') }}</button><p v-else role="status">{{ label('submitted') }} · #{{ batchID }} · {{ batchStatus }}<template v-if="batchData"> · {{ label('processed') }}: {{ batchData.processed }}/{{ batchData.matched }} · {{ label('createdJobs') }}: {{ batchData.created }} · {{ label('requeued') }}: {{ batchData.requeued }} · {{ label('resumed') }}: {{ batchData.resumed }} · {{ label('skipped') }}: {{ batchData.skipped }} · {{ label('failed') }}: {{ batchData.failed }}</template></p></template></div>
     </BaseDialog>
   </div>
 </template>

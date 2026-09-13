@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { apiClient } from '@/api/client'
-import { thirdPartyPromptAuditAPI as api, type AuditCapture, type AuditUser, type CaptureFilter, type RecoveryResult } from '@/api/admin/third-party-prompt-audit'
+import { thirdPartyPromptAuditAPI as api, type AuditCapture, type AuditUser, type CaptureFilter, type RecoveryResult, type AuditBatch } from '@/api/admin/third-party-prompt-audit'
 import AuditDetail from './AuditDetail.vue'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import { useAppStore } from '@/stores/app'
@@ -36,6 +36,7 @@ const recoveryBlocked = computed(() => !selected.value || selected.value.snapsho
 const processing = computed(() => !!selected.value && (selected.value.processing_status === 'processing' || (['queued', 'retry'].includes(selected.value.processing_status) && selected.value.metadata?.mode === 'async' && selected.value.eligibility_status === 'passed')))
 const batchOpen = ref(false), batchLoading = ref(false), batchSubmitted = ref(false), batchMode = ref<'failed' | 'awaiting'>('failed')
 const batchResult = ref<RecoveryResult | null>(null), batchPage = ref(1)
+const batchID = ref<number | null>(null), batchStatus = ref<string>(''), batchData = ref<AuditBatch | null>(null), batchPollTimer = ref<ReturnType<typeof setInterval> | null>(null)
 const batchItems = computed(() => batchResult.value?.items.slice((batchPage.value - 1) * 20, batchPage.value * 20) ?? [])
 watch(userID, async id => {
   manualKeyID.value = undefined
@@ -86,22 +87,35 @@ async function openBatchRecovery(mode: 'failed' | 'awaiting' = 'failed') {
 }
 
 async function submitBatchRecovery() {
+  const submittedMode = batchMode.value
   if (batchLoading.value || !batchResult.value?.ready) return
   batchLoading.value = true
   try {
-    batchResult.value = batchMode.value === 'awaiting' ? await api.createAwaitingReviews() : await api.createRecoveries()
-    batchSubmitted.value = true
-    batchPage.value = 1
+    if (typeof api.createBatch === 'function') {
+      const created = await api.createBatch({ batch_type: batchMode.value === 'awaiting' ? 'pending_review' : 'failed_recovery' })
+      batchID.value = created.batch_id
+      batchStatus.value = created.status
+      batchData.value = { ...created, id: created.batch_id, batch_type: batchMode.value === 'awaiting' ? 'pending_review' : 'failed_recovery', requested_by: 0, processed: 0, created: 0, requeued: 0, resumed: 0, skipped: 0, failed: 0, started_at: null, finished_at: null, created_at: null, updated_at: null } as AuditBatch
+      batchSubmitted.value = true
+      if (batchPollTimer.value) clearInterval(batchPollTimer.value)
+      batchPollTimer.value = setInterval(async () => {
+        if (!batchID.value) return
+        try { const current = await api.batch(batchID.value); batchData.value = current; batchStatus.value = current.status; if (['completed','failed'].includes(current.status)) { if (batchPollTimer.value) clearInterval(batchPollTimer.value); batchPollTimer.value = null; await load() } } catch { /* 下一轮继续 */ }
+      }, 1500)
+      app.showSuccess(`${label(submittedMode === 'awaiting' ? 'pendingReviewSubmitted' : 'recoverySubmitted')}: ${created.batch_id}`)
+      return
+    }
+    if (batchMode.value === 'awaiting') { await api.createAwaitingReviews(); batchSubmitted.value = true; await load(); app.showSuccess(label('pendingReviewSubmitted')); return }
+    batchResult.value = await api.createRecoveries(); batchSubmitted.value = true; batchPage.value = 1
     const ids = batchResult.value.items.flatMap(item => item.job_id && ['created', 'requeued', 'resumed', 'already_running'].includes(item.status) ? [item.job_id] : [])
-    if (ids.length) emit('recovery-created', ids)
-    await load()
-    app.showSuccess(`${label(batchMode.value === 'awaiting' ? 'pendingReviewSubmitted' : 'recoverySubmitted')}: ${ids.length}`)
+    if (ids.length) emit('recovery-created', ids); await load(); app.showSuccess(`${label(submittedMode === 'awaiting' ? 'pendingReviewSubmitted' : 'recoverySubmitted')}: ${ids.length}`)
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { batchLoading.value = false }
 }
 
 function closeBatchRecovery() {
   if (batchLoading.value) return
+  if (batchPollTimer.value) { clearInterval(batchPollTimer.value); batchPollTimer.value = null }
   batchOpen.value = false
   batchResult.value = null
   batchSubmitted.value = false
@@ -130,6 +144,7 @@ async function reprocess(id: number) {
 }
 
 onMounted(load)
+onUnmounted(() => { if (batchPollTimer.value) clearInterval(batchPollTimer.value) })
 watch(() => props.refreshKey, () => { void load() })
 </script>
 
@@ -195,7 +210,7 @@ watch(() => props.refreshKey, () => { void load() })
       <div class="space-y-4">
         <p class="text-sm text-gray-500">{{ label(batchMode === 'awaiting' ? 'pendingReviewHint' : 'recoveryPreviewHint') }}</p>
         <p v-if="batchLoading" role="status">{{ label('loading') }}</p>
-        <template v-if="batchResult"><p>{{ label('matched') }}: {{ batchResult.matched }} · {{ label('ready') }}: {{ batchResult.ready }}</p><div class="max-h-96 overflow-auto"><div v-for="item in batchItems" :key="`${item.capture_id}-${item.job_id || 0}`" class="border-t border-gray-100 py-3 text-sm dark:border-dark-700"><span>Capture #{{ item.capture_id }}<template v-if="item.job_id"> · Job #{{ item.job_id }}</template> → {{ label(item.action) }} · {{ label(item.status) }}</span><p v-if="item.reason" class="text-gray-500">{{ item.reason }}</p></div></div><Pagination :page="batchPage" :page-size="20" :total="batchResult.items.length" :show-page-size-selector="false" @update:page="batchPage = $event" /><button v-if="!batchSubmitted" class="btn btn-primary" :disabled="batchLoading || !batchResult.ready" @click="submitBatchRecovery">{{ label(batchMode === 'awaiting' ? 'submitPendingReviews' : 'submitRecovery') }}</button><p v-else role="status">{{ label(batchMode === 'awaiting' ? 'pendingReviewSubmitted' : 'recoverySubmitted') }}</p></template>
+        <template v-if="batchResult"><p>{{ label('matched') }}: {{ batchResult.matched }} · {{ label('ready') }}: {{ batchResult.ready }}</p><div class="max-h-96 overflow-auto"><div v-for="item in batchItems" :key="`${item.capture_id}-${item.job_id || 0}`" class="border-t border-gray-100 py-3 text-sm dark:border-dark-700"><span>Capture #{{ item.capture_id }}<template v-if="item.job_id"> · Job #{{ item.job_id }}</template> → {{ label(item.action) }} · {{ label(item.status) }}</span><p v-if="item.reason" class="text-gray-500">{{ item.reason }}</p></div></div><Pagination :page="batchPage" :page-size="20" :total="batchResult.items.length" :show-page-size-selector="false" @update:page="batchPage = $event" /><button v-if="!batchSubmitted" class="btn btn-primary" :disabled="batchLoading || !batchResult.ready" @click="submitBatchRecovery">{{ label(batchMode === 'awaiting' ? 'submitPendingReviews' : 'submitRecovery') }}</button><p v-else role="status">{{ label(batchMode === 'awaiting' ? 'pendingReviewSubmitted' : 'recoverySubmitted') }}<template v-if="batchID"> · #{{ batchID }} · {{ batchStatus }}<template v-if="batchData"> · {{ label('processed') }}: {{ batchData.processed }}/{{ batchData.matched }} · {{ label('createdJobs') }}: {{ batchData.created }} · {{ label('requeued') }}: {{ batchData.requeued }} · {{ label('resumed') }}: {{ batchData.resumed }} · {{ label('skipped') }}: {{ batchData.skipped }} · {{ label('failed') }}: {{ batchData.failed }}</template></template></p></template>
       </div>
     </BaseDialog>
     <AuditDetail :id="jobID" @close="jobID = null" />

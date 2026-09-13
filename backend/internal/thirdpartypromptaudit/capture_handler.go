@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"sub2api-enhance/internal/pkg/response"
-	"sub2api-enhance/internal/server/middleware"
 	"sub2api-enhance/internal/sub2api"
 	"time"
 )
@@ -223,12 +222,13 @@ func (h *AdminHandler) PreviewAwaitingReviews(c *gin.Context) {
 	response.Success(c, result)
 }
 func (h *AdminHandler) CreateAwaitingReviews(c *gin.Context) {
-	result, err := h.service.CreateAwaitingReviews(c.Request.Context(), adminActor(c))
+	batch, err := h.repo.CreateBatch(c.Request.Context(), BatchRequest{Type: BatchPendingReview}, adminActor(c))
 	if err != nil {
 		respondError(c, err)
 		return
 	}
-	response.Accepted(c, result)
+	h.service.notify()
+	response.Accepted(c, gin.H{"batch_id": batch.ID, "status": batch.Status, "matched": batch.Matched, "ready": batch.Ready})
 }
 func (h *AdminHandler) PreviewRecoveries(c *gin.Context) {
 	result, err := h.service.PreviewRecoveries(c.Request.Context())
@@ -240,19 +240,13 @@ func (h *AdminHandler) PreviewRecoveries(c *gin.Context) {
 }
 
 func (h *AdminHandler) CreateRecoveries(c *gin.Context) {
-	result, err := h.service.CreateRecoveries(c.Request.Context(), adminActor(c))
+	batch, err := h.repo.CreateBatch(c.Request.Context(), BatchRequest{Type: BatchFailedRecovery}, adminActor(c))
 	if err != nil {
 		respondError(c, err)
 		return
 	}
-	counts := map[string]any{"matched_count": result.Matched, "ready_count": result.Ready}
-	for _, item := range result.Items {
-		key := item.Status + "_count"
-		count, _ := counts[key].(int)
-		counts[key] = count + 1
-	}
-	middleware.SetAuditExtra(c, counts)
-	response.Accepted(c, result)
+	h.service.notify()
+	response.Accepted(c, gin.H{"batch_id": batch.ID, "status": batch.Status, "matched": batch.Matched, "ready": batch.Ready})
 }
 
 func (h *AdminHandler) EnableAndReset(c *gin.Context) {

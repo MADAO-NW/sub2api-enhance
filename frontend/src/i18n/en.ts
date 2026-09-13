@@ -358,6 +358,7 @@ export default {
     "already_disabled": "Account already disabled",
     "no_new_block": "No newly established violation",
     "action_already_pending": "A disable action or state confirmation is pending",
+    "processed": "Processed",
     "matched": "Matched sources",
     "ready": "Ready to reaudit",
     "submitReaudit": "Submit reaudits",

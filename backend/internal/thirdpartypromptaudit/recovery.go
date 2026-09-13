@@ -47,7 +47,7 @@ func (r *Repository) recoveryCandidates(ctx context.Context, awaitingReview bool
 	return items, rows.Err()
 }
 
-func (s *Service) recoveryPlan(ctx context.Context, awaitingReview bool) (*RecoveryResult, error) {
+func (s *Service) recoveryPlan(ctx context.Context, awaitingReview bool, validateInput bool) (*RecoveryResult, error) {
 	candidates, err := s.repo.recoveryCandidates(ctx, awaitingReview)
 	if err != nil {
 		return nil, err
@@ -72,6 +72,11 @@ func (s *Service) recoveryPlan(ctx context.Context, awaitingReview bool) (*Recov
 			item.Status, item.Reason = "skipped", "用户当前已设置为不审核"
 		case candidate.Checkpoint:
 		default:
+			if !validateInput {
+				result.Ready++
+				result.Items = append(result.Items, item)
+				continue
+			}
 			capture, readErr := store.Get(ctx, candidate.CaptureID)
 			if readErr != nil {
 				item.Status, item.Reason = "skipped", readErr.Error()
@@ -101,20 +106,25 @@ func (s *Service) recoveryPlan(ctx context.Context, awaitingReview bool) (*Recov
 }
 
 func (s *Service) PreviewRecoveries(ctx context.Context) (*RecoveryResult, error) {
-	return s.recoveryPlan(ctx, false)
+	return s.recoveryPlan(ctx, false, false)
 }
 func (s *Service) PreviewAwaitingReviews(ctx context.Context) (*RecoveryResult, error) {
-	return s.recoveryPlan(ctx, true)
+	return s.recoveryPlan(ctx, true, false)
 }
 
 func (s *Service) CreateRecoveries(ctx context.Context, actorID int64) (*RecoveryResult, error) {
 	return s.createRecoveries(ctx, actorID, false)
 }
 func (s *Service) CreateAwaitingReviews(ctx context.Context, actorID int64) (*RecoveryResult, error) {
-	return s.createRecoveries(ctx, actorID, true)
+	batch, err := s.repo.CreateBatch(ctx, BatchRequest{Type: BatchPendingReview}, actorID)
+	if err != nil {
+		return nil, err
+	}
+	s.notify()
+	return &RecoveryResult{Matched: batch.Matched, Ready: batch.Ready, Items: []RecoveryItem{}}, nil
 }
 func (s *Service) createRecoveries(ctx context.Context, actorID int64, awaitingReview bool) (*RecoveryResult, error) {
-	result, err := s.recoveryPlan(ctx, awaitingReview)
+	result, err := s.recoveryPlan(ctx, awaitingReview, true)
 	if err != nil {
 		return nil, err
 	}
@@ -222,4 +232,63 @@ func (s *Service) createRecoveries(ctx context.Context, actorID int64, awaitingR
 		s.notify()
 	}
 	return result, nil
+}
+
+// processRecoveryItem 只处理批次快照中的单条失败采集，保持检查点、原任务和采集唯一性语义。
+func (s *Service) processRecoveryItem(ctx context.Context, item BatchItem, actorID int64) (string, string, *int64) {
+	if item.CaptureID == nil {
+		return "skipped", "批次缺少采集记录", nil
+	}
+	capture, err := NewCaptureStore(s.repo.db).Get(ctx, *item.CaptureID)
+	if err != nil {
+		return "failed", err.Error(), nil
+	}
+	if item.JobID != nil {
+		var stage string
+		var checkpoint bool
+		if err := s.repo.db.QueryRowContext(ctx, `SELECT failure_stage,result_checkpoint IS NOT NULL FROM sub2api_enhance.third_party_prompt_audit_jobs WHERE id=$1 AND capture_id=$2`, *item.JobID, *item.CaptureID).Scan(&stage, &checkpoint); err != nil {
+			return "failed", err.Error(), nil
+		}
+		if checkpoint && stage == "result_persist" {
+			if err := s.repo.ResumeResult(ctx, *item.JobID); err != nil {
+				return "failed", err.Error(), nil
+			}
+			id := *item.JobID
+			return "resumed", "", &id
+		}
+		protocol, body, e := captureAuditBody(capture)
+		if e != nil {
+			return "failed", e.Error(), nil
+		}
+		input, e := CaptureInput(protocol, body)
+		if e != nil {
+			return "failed", e.Error(), nil
+		}
+		snap, e := s.config.Active()
+		if e != nil {
+			return "failed", e.Error(), nil
+		}
+		cfg := snap
+		cfg.Config = effectiveConfigForUser(snap.Config, capture.Identity.UserID)
+		encodedInput, _ := json.Marshal(input)
+		encodedCfg, _ := json.Marshal(cfg)
+		var id int64
+		e = s.repo.db.QueryRowContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs SET audit_round=audit_round+1,current_run_kind='reaudit',current_requested_by=$1,config_revision=$2,config_snapshot=$3,full_input_snapshot=$4,protocol=$5,snapshot_status='complete',reuse_mode='allow',status='queued',attempts=0,max_attempts=$6,claim_generation=claim_generation+1,lease_until=NULL,next_attempt_at=clock_timestamp(),result_checkpoint=NULL,failure_stage=NULL,last_error_code=NULL,last_error_message=NULL,started_at=NULL,finished_at=NULL,input_manifest=NULL,input_hash=NULL,target_hash=NULL,evaluation_hash=NULL,updated_at=clock_timestamp() WHERE id=$7 AND capture_id=$8 AND status='failed' AND ($9::int IS NULL OR audit_round=$9) RETURNING id`, actorID, cfg.Revision, string(encodedCfg), string(encodedInput), protocol, MaxEvaluationAttempts, *item.JobID, *item.CaptureID, item.SourceAuditRound).Scan(&id)
+		if errors.Is(e, sql.ErrNoRows) {
+			return "already_running", "任务状态已改变", nil
+		}
+		if e != nil {
+			return "failed", e.Error(), nil
+		}
+		return "requeued", "", &id
+	}
+	capture.Metadata["background"] = "true"
+	d, e := s.AuditCapture(ctx, capture)
+	if e != nil {
+		return "failed", e.Error(), nil
+	}
+	if d == nil || d.JobID <= 0 {
+		return "skipped", "无法创建审核任务", nil
+	}
+	return "created", "", &d.JobID
 }

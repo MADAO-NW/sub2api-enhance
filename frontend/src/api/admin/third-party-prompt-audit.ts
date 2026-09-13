@@ -56,6 +56,9 @@ export interface SavedConfig extends AuditConfig {
 export interface KeyUpdate { model_id: string; action: 'keep' | 'replace' | 'clear'; api_key?: string }
 export interface ConfigUpdate { expected_revision: number; config: AuditConfig; keys: KeyUpdate[] }
 export interface Contract { default_policy: string; version: string; output_contract: string }
+export interface AuditBatch { id: number; batch_type: 'pending_review' | 'failed_recovery' | 'reaudit_selected' | 'reaudit_filter'; requested_by: number; status: 'queued' | 'processing' | 'completed' | 'failed'; matched: number; ready: number; processed: number; created: number; requeued: number; resumed: number; skipped: number; failed: number; last_error?: string; started_at: string | null; finished_at: string | null; created_at: string | null; updated_at: string | null }
+export interface AuditBatchItem { id: number; batch_id: number; capture_id?: number; job_id?: number; source_audit_round?: number; status: string; reason?: string; result_job_id?: number; processed_at?: string | null }
+
 export interface DecisionConfig { revision: number; review_threshold: number | null; block_threshold: number | null }
 export interface AuditError { code: string; message: string; stage: string; retryable: boolean }
 export interface Score { confidence: number; reason: string }
@@ -223,6 +226,11 @@ export const thirdPartyPromptAuditAPI = {
   async createRecoveries() { return (await apiClient.post<RecoveryResult>(`${base}/recoveries`)).data },
   async previewAwaitingReviews() { return (await apiClient.post<RecoveryResult>(`${base}/pending-reviews/preview`)).data },
   async createAwaitingReviews() { return (await apiClient.post<RecoveryResult>(`${base}/pending-reviews`)).data },
+  async previewBatch(value: { batch_type: 'pending_review' | 'failed_recovery' | 'reaudit_selected' | 'reaudit_filter'; filter?: AuditFilter; ids?: number[]; reuse_mode?: 'allow' | 'force' }) { return (await apiClient.post<{ matched: number; ready: number }>(`${base}/batches/preview`, value)).data },
+  async listBatches(limit = 20) { return (await apiClient.get<AuditBatch[]>(`${base}/batches`, { params: { limit } })).data },
+  async createBatch(value: { batch_type: 'pending_review' | 'failed_recovery' | 'reaudit_selected' | 'reaudit_filter'; filter?: AuditFilter; ids?: number[]; reuse_mode?: 'allow' | 'force' }) { return (await apiClient.post<{ batch_id: number; status: string; matched: number; ready: number }>(`${base}/batches`, value)).data },
+  async batch(id: number) { return (await apiClient.get<AuditBatch>(`${base}/batches/${id}`)).data },
+  async batchItems(id: number, limit = 50, afterId = 0) { return (await apiClient.get<AuditBatchItem[]>(`${base}/batches/${id}/items`, { params: { limit, after_id: afterId } })).data },
   async resume(id: number) { return (await apiClient.post(`${base}/jobs/${id}/resume`)).data },
   async enableAndReset(id: number) { return (await apiClient.post<{ action_id: number; execution_status: string }>(`${base}/users/${id}/enable-and-reset`)).data },
   async retryAction(id: number) { return (await apiClient.post(`${base}/actions/${id}/retry`)).data }

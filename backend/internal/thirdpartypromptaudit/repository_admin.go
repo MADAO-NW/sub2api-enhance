@@ -570,8 +570,8 @@ func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest,
 	if err != nil {
 		return nil, err
 	}
-	batchID := ""
-	if request.ReuseMode == ReuseModeForce {
+	batchID := request.BatchID
+	if request.ReuseMode == ReuseModeForce && batchID == "" {
 		batchID = uuid.NewString()
 	}
 	for i := range result.Items {

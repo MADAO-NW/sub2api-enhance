@@ -265,6 +265,7 @@ type Page[T any] struct {
 
 type ReauditRequest struct {
 	ReuseMode string `json:"reuse_mode" binding:"omitempty,oneof=allow force"`
+	BatchID   string `json:"-"`
 	Filter    Filter `json:"filter"`
 }
 

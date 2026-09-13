@@ -358,6 +358,7 @@ export default {
     "already_disabled": "账号已经停用",
     "no_new_block": "没有新增违规结论",
     "action_already_pending": "已有停用动作或状态待确认",
+    "processed": "已处理",
     "matched": "匹配来源",
     "ready": "可重新审核",
     "submitReaudit": "提交重新审核",

@@ -88,6 +88,9 @@ func (s *Service) Start(parent context.Context) error {
 	}
 	s.ctx, s.cancel = context.WithCancel(parent)
 	s.repo.SetProjectionContext(s.ctx)
+	if err := s.repo.RecoverBatches(s.ctx); err != nil {
+		s.noteError("batch_recovery_failed", err)
+	}
 	s.repo.WarmStatsProjections(s.ctx)
 	s.closing = false
 	err := s.config.upgradeLegacyDefaultPolicy(s.ctx)
@@ -102,6 +105,7 @@ func (s *Service) Start(parent context.Context) error {
 	s.running.Store(true)
 	go s.run()
 	go s.runHealthProbes()
+	s.StartBatchWorker()
 	return err
 }
 
