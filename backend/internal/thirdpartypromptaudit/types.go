@@ -208,6 +208,7 @@ type ModelAttempt struct {
 	CallKind          string          `json:"call_kind"`
 	EvaluationRound   *int            `json:"evaluation_round"`
 	AuditRound        int             `json:"audit_round"`
+	TargetHash        string          `json:"target_hash,omitempty"`
 	ModelID           string          `json:"model_id"`
 	ModelSnapshot     ModelConfig     `json:"model_snapshot"`
 	Stage             string          `json:"stage"`

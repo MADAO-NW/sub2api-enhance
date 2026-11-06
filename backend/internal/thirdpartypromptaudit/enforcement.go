@@ -3,13 +3,13 @@ package thirdpartypromptaudit
 import "time"
 
 type EnforcementState struct {
-	UserID                      int64      `json:"user_id"`
-	WarningRuleHash             string     `json:"warning_rule_hash"`
-	WarningWindowAfterOutcomeID int64      `json:"warning_window_after_outcome_id"`
-	WarningArmed                bool       `json:"warning_armed"`
-	DisableViolationCount       int64      `json:"disable_violation_count"`
-	DisableResetAt              *time.Time `json:"disable_reset_at"`
-	LastOutcomeID               *int64     `json:"last_outcome_id"`
+	UserID                  int64      `json:"user_id"`
+	WarningRuleHash         string     `json:"warning_rule_hash"`
+	WarningWindowAfterJobID int64      `json:"warning_window_after_job_id"`
+	WarningArmed            bool       `json:"warning_armed"`
+	DisableViolationCount   int64      `json:"disable_violation_count"`
+	DisableResetAt          *time.Time `json:"disable_reset_at"`
+	LastJobID               *int64     `json:"last_job_id"`
 }
 
 type EnforcementUser struct {
@@ -44,7 +44,7 @@ type Action struct {
 	CompletedAt        *time.Time       `json:"completed_at"`
 	ID                 int64            `json:"id"`
 	UserID             int64            `json:"user_id"`
-	OutcomeID          *int64           `json:"outcome_id"`
+	JobID              *int64           `json:"job_id"`
 	ActorUserID        *int64           `json:"actor_user_id"`
 	ActionType         string           `json:"action_type"`
 	RuleSnapshot       map[string]any   `json:"rule_snapshot"`

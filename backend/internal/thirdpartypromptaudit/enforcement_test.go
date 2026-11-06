@@ -58,7 +58,7 @@ func TestWarningRearmsOnlyAfterWindowFallsBelowLimit(t *testing.T) {
 
 func TestBlockingNoticeRecipientsAreIndependentAndDeduplicated(t *testing.T) {
 	outcomeID := int64(9)
-	action := Action{ActionType: "blocking_notice", OutcomeID: &outcomeID}
+	action := Action{ActionType: "blocking_notice", JobID: &outcomeID}
 	user := EnforcementUser{Username: "user", Email: "user@example.invalid"}
 	deliveries := actionDeliveries(action, user, "admin@example.invalid")
 	require.Len(t, deliveries, 2)
@@ -80,7 +80,7 @@ func TestNotificationWorkerSendsAdminAndUserDeliveriesIndependently(t *testing.T
 	service := &Service{repo: NewRepository(db), email: sender, metrics: NewRuntimeMetrics()}
 	outcomeID := int64(9)
 	leaseUntil := time.Now().Add(time.Minute)
-	action := &Action{ID: 3, UserID: 7, OutcomeID: &outcomeID, ActionType: "warning", ExecutionStatus: "succeeded", NotificationStatus: "pending", BusinessSnapshot: map[string]any{}, RuleSnapshot: map[string]any{}, ClaimGeneration: 1, LeaseUntil: &leaseUntil, Deliveries: []Delivery{
+	action := &Action{ID: 3, UserID: 7, JobID: &outcomeID, ActionType: "warning", ExecutionStatus: "succeeded", NotificationStatus: "pending", BusinessSnapshot: map[string]any{}, RuleSnapshot: map[string]any{}, ClaimGeneration: 1, LeaseUntil: &leaseUntil, Deliveries: []Delivery{
 		{Recipient: "admin@example.invalid", Kind: "admin", Status: "pending", Attempts: []DeliveryAttempt{}},
 		{Recipient: "user@example.invalid", Kind: "user", Status: "pending", Attempts: []DeliveryAttempt{}},
 	}}

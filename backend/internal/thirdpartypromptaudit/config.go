@@ -103,6 +103,7 @@ type Config struct {
 	Disable             DisableConfig    `json:"disable"`
 	UserRules           []UserRuleConfig `json:"user_rules"`
 	AdminEmail          string           `json:"admin_email"`
+	RetentionDays       int              `json:"retention_days"`
 }
 
 type ConfigSnapshot struct {
@@ -235,7 +236,15 @@ func DefaultConfig() Config {
 		Aggregation: "any_block", WorkerCount: 4,
 		CaptureWhenAuditOff: true,
 		Warning:             WarningConfig{Window: defaultWarningWindow, Limit: defaultWarningLimit},
-		Disable:             DisableConfig{Limit: defaultDisableLimit}, UserRules: []UserRuleConfig{}}
+		Disable:             DisableConfig{Limit: defaultDisableLimit}, UserRules: []UserRuleConfig{},
+		RetentionDays: RetentionDefaultDays}
+}
+
+// normalizeRetention 为未填写保留天数的配置补齐默认值。
+func normalizeRetention(config *Config) {
+	if config != nil && config.RetentionDays == 0 {
+		config.RetentionDays = RetentionDefaultDays
+	}
 }
 
 // normalizeModelConcurrency 为旧配置和旧任务快照补齐节点默认并发。
@@ -398,6 +407,9 @@ func validateConfig(config Config, activating bool) error {
 	if config.Disable.Enabled && config.Disable.Limit < 1 {
 		return errors.New("自动停用累计阈值必须大于 0")
 	}
+	if config.RetentionDays < retentionMinDays || config.RetentionDays > retentionMaxDays {
+		return fmt.Errorf("审计记录保留天数必须在 %d 到 %d 之间", retentionMinDays, retentionMaxDays)
+	}
 	if config.AdminEmail != "" {
 		if _, err := mail.ParseAddress(config.AdminEmail); err != nil {
 			return errors.New("管理员通知邮箱格式无效")
@@ -493,6 +505,7 @@ func (m *ConfigManager) Reload(ctx context.Context) (loadErr error) {
 	normalizeModelConcurrency(&stored.Config)
 	normalizeAuditScope(&stored.Config)
 	normalizeUserRuleModes(&stored.Config)
+	normalizeRetention(&stored.Config)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.expectedMode = stored.Mode
@@ -690,6 +703,7 @@ func publicConfig(stored storedConfig) PublicConfig {
 		keys[id] = encrypted != ""
 	}
 	display := stored.Config
+	normalizeRetention(&display)
 	display.Models = append([]ModelConfig(nil), stored.Models...)
 	normalizeModelNames(&display)
 	normalizeModelConcurrency(&display)
@@ -709,6 +723,7 @@ func publicConfig(stored storedConfig) PublicConfig {
 
 func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID int64) (PublicConfig, error) {
 	normalizeModelNames(&input.Config)
+	normalizeRetention(&input.Config)
 	normalizeUserRuleModes(&input.Config)
 	normalizeAuditScope(&input.Config)
 	if err := validateConfig(input.Config, input.Config.Mode != "off"); err != nil {
@@ -862,4 +877,14 @@ func (m *ConfigManager) WorkerCapacity() int {
 		return m.active.Stored.WorkerCount
 	}
 	return DefaultConfig().WorkerCount
+}
+
+// RetentionDays 返回已应用的审计记录保留天数；配置不可用时使用默认值。
+func (m *ConfigManager) RetentionDays() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.active != nil && m.active.Stored.RetentionDays > 0 {
+		return m.active.Stored.RetentionDays
+	}
+	return RetentionDefaultDays
 }

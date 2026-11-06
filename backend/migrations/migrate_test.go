@@ -189,3 +189,134 @@ func TestBatchMigrationUsesNullableTargetColumnsAndAtomicStatuses(t *testing.T) 
 	require.NotContains(t, strings.ToUpper(sql), "DROP TABLE")
 	require.NotContains(t, strings.ToUpper(sql), "DELETE FROM")
 }
+
+// expectMigrationFile 期望一个迁移文件在单独事务中整体执行并登记台账。
+func expectMigrationFile(mock sqlmock.Sqlmock, name, content string) {
+	mock.ExpectQuery("SELECT checksum FROM sub2api_enhance.schema_migrations WHERE filename=$1").WithArgs(name).WillReturnRows(sqlmock.NewRows([]string{"checksum"}))
+	mock.ExpectBegin()
+	mock.ExpectExec(content).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO sub2api_enhance.schema_migrations(filename,checksum) VALUES($1,$2)").WithArgs(name, sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+}
+
+func embeddedMigrations(t *testing.T) ([]string, map[string]string) {
+	t.Helper()
+	entries, err := files.ReadDir(".")
+	require.NoError(t, err)
+	names := make([]string, 0, len(entries))
+	contents := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		raw, err := files.ReadFile(entry.Name())
+		require.NoError(t, err)
+		names = append(names, entry.Name())
+		contents[entry.Name()] = strings.TrimSpace(string(raw))
+	}
+	return names, contents
+}
+
+func TestPromptAuditV3MigrationRunsLastOnEmptyDatabase(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	require.NoError(t, err)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	names, contents := embeddedMigrations(t)
+	require.Equal(t, "013_prompt_audit_v3.sql", names[len(names)-1])
+	mock.ExpectQuery("SELECT pg_try_advisory_lock($1)").WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(true))
+	mock.ExpectExec(`CREATE SCHEMA IF NOT EXISTS sub2api_enhance; CREATE TABLE IF NOT EXISTS sub2api_enhance.schema_migrations(filename TEXT PRIMARY KEY,checksum TEXT NOT NULL,applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`).WillReturnResult(sqlmock.NewResult(0, 0))
+	// 空库新安装：001 到 013 按文件名顺序逐个事务执行。
+	for _, name := range names {
+		expectMigrationFile(mock, name, contents[name])
+	}
+	mock.ExpectQuery("SELECT pg_advisory_unlock($1)").WillReturnRows(sqlmock.NewRows([]string{"released"}).AddRow(true))
+	require.NoError(t, Run(context.Background(), db))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPromptAuditV3MigrationUpgradesFrom012(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	require.NoError(t, err)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	names, contents := embeddedMigrations(t)
+	mock.ExpectQuery("SELECT pg_try_advisory_lock($1)").WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(true))
+	mock.ExpectExec(`CREATE SCHEMA IF NOT EXISTS sub2api_enhance; CREATE TABLE IF NOT EXISTS sub2api_enhance.schema_migrations(filename TEXT PRIMARY KEY,checksum TEXT NOT NULL,applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`).WillReturnResult(sqlmock.NewResult(0, 0))
+	// v0.2.6 已执行 001–012：只校验校验和，不重复执行。
+	for _, name := range names[:len(names)-1] {
+		checksum := fmt.Sprintf("%x", sha256.Sum256([]byte(contents[name])))
+		mock.ExpectQuery("SELECT checksum FROM sub2api_enhance.schema_migrations WHERE filename=$1").WithArgs(name).WillReturnRows(sqlmock.NewRows([]string{"checksum"}).AddRow(checksum))
+	}
+	last := names[len(names)-1]
+	expectMigrationFile(mock, last, contents[last])
+	mock.ExpectQuery("SELECT pg_advisory_unlock($1)").WillReturnRows(sqlmock.NewRows([]string{"released"}).AddRow(true))
+	require.NoError(t, Run(context.Background(), db))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPromptAuditV3MigrationFailureRollsBackWholeFile(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	require.NoError(t, err)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	names, contents := embeddedMigrations(t)
+	mock.ExpectQuery("SELECT pg_try_advisory_lock($1)").WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(true))
+	mock.ExpectExec(`CREATE SCHEMA IF NOT EXISTS sub2api_enhance; CREATE TABLE IF NOT EXISTS sub2api_enhance.schema_migrations(filename TEXT PRIMARY KEY,checksum TEXT NOT NULL,applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`).WillReturnResult(sqlmock.NewResult(0, 0))
+	for _, name := range names[:len(names)-1] {
+		checksum := fmt.Sprintf("%x", sha256.Sum256([]byte(contents[name])))
+		mock.ExpectQuery("SELECT checksum FROM sub2api_enhance.schema_migrations WHERE filename=$1").WithArgs(name).WillReturnRows(sqlmock.NewRows([]string{"checksum"}).AddRow(checksum))
+	}
+	last := names[len(names)-1]
+	// 前置检查发现未完成处置动作时 RAISE EXCEPTION：整个文件回滚，不登记台账。
+	mock.ExpectQuery("SELECT checksum FROM sub2api_enhance.schema_migrations WHERE filename=$1").WithArgs(last).WillReturnRows(sqlmock.NewRows([]string{"checksum"}))
+	mock.ExpectBegin()
+	mock.ExpectExec(contents[last]).WillReturnError(errors.New("提示词审计存在未完成的处置动作或通知"))
+	mock.ExpectRollback()
+	mock.ExpectQuery("SELECT pg_advisory_unlock($1)").WillReturnRows(sqlmock.NewRows([]string{"released"}).AddRow(true))
+	err = Run(context.Background(), db)
+	require.ErrorContains(t, err, "013_prompt_audit_v3.sql")
+	require.ErrorContains(t, err, "未完成的处置动作")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPromptAuditV3MigrationOrdersPrecheckDropsAndRebuilds(t *testing.T) {
+	raw, err := files.ReadFile("013_prompt_audit_v3.sql")
+	require.NoError(t, err)
+	sql := string(raw)
+	order := []string{
+		"RAISE EXCEPTION",
+		"DROP COLUMN last_outcome_id",
+		"RENAME COLUMN warning_window_after_outcome_id TO warning_window_after_job_id",
+		"SET warning_window_after_job_id = 0",
+		"DROP COLUMN outcome_id",
+		"'breaker_notice'",
+		"DROP TABLE",
+		"CREATE TABLE sub2api_enhance.prompt_texts",
+		"CREATE TABLE sub2api_enhance.audit_jobs",
+		"CREATE TABLE sub2api_enhance.prompt_reviews",
+		"CREATE TABLE sub2api_enhance.prompt_trust",
+		"CREATE TABLE sub2api_enhance.audit_job_rounds",
+		"CREATE TABLE sub2api_enhance.audit_job_targets",
+		"CREATE TABLE sub2api_enhance.model_attempts",
+		"CREATE TABLE sub2api_enhance.instruction_violation_marks",
+		"CREATE TABLE sub2api_enhance.instruction_breakers",
+		"ADD COLUMN last_job_id BIGINT REFERENCES sub2api_enhance.audit_jobs(id) ON DELETE SET NULL",
+		"ADD COLUMN job_id BIGINT REFERENCES sub2api_enhance.audit_jobs(id) ON DELETE SET NULL",
+		"UNIQUE (job_id, action_type)",
+		"'retention_days', 30",
+	}
+	position := -1
+	for _, fragment := range order {
+		index := strings.Index(sql, fragment)
+		require.Greater(t, index, position, fragment)
+		position = index
+	}
+	for _, table := range []string{"captures", "third_party_prompt_audit_jobs", "third_party_prompt_audit_outcomes", "third_party_prompt_audit_segment_results",
+		"third_party_prompt_audit_outcome_segments", "third_party_prompt_audit_targets", "third_party_prompt_audit_job_targets",
+		"third_party_prompt_audit_batches", "third_party_prompt_audit_batch_items", "third_party_prompt_audit_model_attempts"} {
+		require.True(t, strings.Contains(sql, "sub2api_enhance."+table+",") || strings.Contains(sql, "sub2api_enhance."+table+";"), table)
+	}
+	// 处置状态与处置动作只改造、不删除。
+	require.NotContains(t, sql, "DROP TABLE sub2api_enhance.third_party_prompt_audit_enforcement")
+	require.NotContains(t, strings.ToUpper(sql), "DELETE FROM")
+	require.Contains(t, sql, "execution_status IN ('pending', 'processing', 'unknown')")
+	require.Contains(t, sql, "notification_status IN ('pending', 'processing', 'retry')")
+}

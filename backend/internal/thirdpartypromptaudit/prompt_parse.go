@@ -61,11 +61,13 @@ func newPromptText(kind, text string) PromptText {
 	return PromptText{Kind: kind, Text: text, Hash: hex.EncodeToString(digest[:])}
 }
 
-// normalizePromptText 统一换行并去掉首尾空白，保证同一内容得到同一哈希。
+// normalizePromptText 统一换行并去掉首尾空白，保证同一内容得到同一哈希；
+// NUL 字符无法写入 PostgreSQL TEXT，统一替换为 U+FFFD，使哈希与入库正文一致。
 func normalizePromptText(text string) string {
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
-	return strings.TrimSpace(text)
+	text = strings.ReplaceAll(text, "\x00", "\uFFFD")
+	return strings.TrimSpace(strings.ToValidUTF8(text, "\uFFFD"))
 }
 
 // turnFingerprint 由有序指令块哈希和用户提示词哈希组成，回合键据此去重和绑定续跑。

@@ -441,7 +441,7 @@ func (r *Repository) enforcementExplanation(ctx context.Context, detail *JobDeta
 			return false
 		}
 		for _, action := range detail.Actions {
-			if action.ActionType == kind && action.OutcomeID != nil && *action.OutcomeID == detail.Outcome.ID {
+			if action.ActionType == kind && action.JobID != nil && *action.JobID == detail.Outcome.ID {
 				return true
 			}
 		}

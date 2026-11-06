@@ -101,10 +101,11 @@ func (s *Service) Start(parent context.Context) error {
 	if err != nil {
 		s.noteError("config_load_failed", err)
 	}
-	s.wg.Add(2)
+	s.wg.Add(3)
 	s.running.Store(true)
 	go s.run()
 	go s.runHealthProbes()
+	go s.runRetention()
 	s.StartBatchWorker()
 	return err
 }

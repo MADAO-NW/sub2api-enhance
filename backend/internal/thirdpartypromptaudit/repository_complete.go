@@ -70,7 +70,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 	}
 	state := EnforcementState{UserID: job.UserID}
 	err = tx.QueryRowContext(ctx, `SELECT warning_rule_hash,warning_window_after_outcome_id,warning_armed,disable_violation_count,disable_reset_at,last_outcome_id FROM sub2api_enhance.third_party_prompt_audit_enforcement_states WHERE user_id=$1 FOR UPDATE`, job.UserID).Scan(
-		&state.WarningRuleHash, &state.WarningWindowAfterOutcomeID, &state.WarningArmed, &state.DisableViolationCount, &state.DisableResetAt, &state.LastOutcomeID)
+		&state.WarningRuleHash, &state.WarningWindowAfterJobID, &state.WarningArmed, &state.DisableViolationCount, &state.DisableResetAt, &state.LastJobID)
 	if err != nil {
 		return nil, err
 	}
@@ -171,14 +171,14 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 		}
 		if state.WarningRuleHash != ruleHash {
 			state.WarningRuleHash = ruleHash
-			state.WarningWindowAfterOutcomeID = 0
-			if state.LastOutcomeID != nil {
-				state.WarningWindowAfterOutcomeID = *state.LastOutcomeID
+			state.WarningWindowAfterJobID = 0
+			if state.LastJobID != nil {
+				state.WarningWindowAfterJobID = *state.LastJobID
 			}
 			state.WarningArmed = true
 		}
 		if current.Warning.Enabled {
-			rows, err := tx.QueryContext(ctx, `SELECT latest.decision FROM sub2api_enhance.third_party_prompt_audit_jobs root JOIN LATERAL (SELECT first.id,first.enforcement_eligible FROM sub2api_enhance.third_party_prompt_audit_outcomes first WHERE first.job_id=root.id ORDER BY first.audit_round,first.id LIMIT 1) original ON original.enforcement_eligible JOIN LATERAL (SELECT current.decision FROM sub2api_enhance.third_party_prompt_audit_outcomes current WHERE current.job_id=root.id ORDER BY current.audit_round DESC,current.id DESC LIMIT 1) latest ON true WHERE root.user_id=$1 AND original.id>$2 ORDER BY root.id DESC LIMIT $3`, job.UserID, state.WarningWindowAfterOutcomeID, current.Warning.Window)
+			rows, err := tx.QueryContext(ctx, `SELECT latest.decision FROM sub2api_enhance.third_party_prompt_audit_jobs root JOIN LATERAL (SELECT first.id,first.enforcement_eligible FROM sub2api_enhance.third_party_prompt_audit_outcomes first WHERE first.job_id=root.id ORDER BY first.audit_round,first.id LIMIT 1) original ON original.enforcement_eligible JOIN LATERAL (SELECT current.decision FROM sub2api_enhance.third_party_prompt_audit_outcomes current WHERE current.job_id=root.id ORDER BY current.audit_round DESC,current.id DESC LIMIT 1) latest ON true WHERE root.user_id=$1 AND original.id>$2 ORDER BY root.id DESC LIMIT $3`, job.UserID, state.WarningWindowAfterJobID, current.Warning.Window)
 			if err != nil {
 				return nil, err
 			}
@@ -219,14 +219,14 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 	}
 	oldStatus := user.Status
 	if outcome.EnforcementEligible {
-		next.LastOutcomeID = &outcome.ID
+		next.LastJobID = &outcome.ID
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_enforcement_states SET warning_rule_hash=$2,warning_window_after_outcome_id=$3,warning_armed=$4,disable_violation_count=$5,last_outcome_id=$6,updated_at=clock_timestamp() WHERE user_id=$1`, job.UserID, next.WarningRuleHash, next.WarningWindowAfterOutcomeID, next.WarningArmed, next.DisableViolationCount, next.LastOutcomeID)
+	_, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_enforcement_states SET warning_rule_hash=$2,warning_window_after_outcome_id=$3,warning_armed=$4,disable_violation_count=$5,last_outcome_id=$6,updated_at=clock_timestamp() WHERE user_id=$1`, job.UserID, next.WarningRuleHash, next.WarningWindowAfterJobID, next.WarningArmed, next.DisableViolationCount, next.LastJobID)
 	if err != nil {
 		return nil, err
 	}
 	for _, actionType := range actionTypes {
-		action := Action{UserID: job.UserID, OutcomeID: &outcome.ID, ActionType: actionType, NotificationStatus: "pending", AuthCacheStatus: "not_required", RuleSnapshot: map[string]any{"audit_revision": job.Config.Revision, "enforcement_revision": current.Revision, "warning": current.Warning, "disable": current.Disable, "decision": outcome.Decision}, BusinessSnapshot: map[string]any{"user": user, "old_user_status": oldStatus, "new_user_status": user.Status, "before_state": before, "after_state": next, "window": window}}
+		action := Action{UserID: job.UserID, JobID: &outcome.ID, ActionType: actionType, NotificationStatus: "pending", AuthCacheStatus: "not_required", RuleSnapshot: map[string]any{"audit_revision": job.Config.Revision, "enforcement_revision": current.Revision, "warning": current.Warning, "disable": current.Disable, "decision": outcome.Decision}, BusinessSnapshot: map[string]any{"user": user, "old_user_status": oldStatus, "new_user_status": user.Status, "before_state": before, "after_state": next, "window": window}}
 		action.ExecutionStatus = "succeeded"
 		now := time.Now().UTC()
 		action.AppliedAt, action.CompletedAt = &now, &now
@@ -242,7 +242,7 @@ func (r *Repository) Complete(ctx context.Context, job *Job, evaluation *Evaluat
 	}
 	if foreground && job.ExecutionMode == "blocking" && outcome.EnforcementEligible && outcome.Decision == DecisionBlock {
 		now := time.Now().UTC()
-		action := Action{UserID: job.UserID, OutcomeID: &outcome.ID, ActionType: "blocking_notice", ExecutionStatus: "succeeded", AppliedAt: &now, CompletedAt: &now,
+		action := Action{UserID: job.UserID, JobID: &outcome.ID, ActionType: "blocking_notice", ExecutionStatus: "succeeded", AppliedAt: &now, CompletedAt: &now,
 			NotificationStatus: "pending", AuthCacheStatus: "not_required", RuleSnapshot: map[string]any{"audit_revision": job.Config.Revision, "decision": outcome.Decision},
 			BusinessSnapshot: map[string]any{"user": user, "request_id": job.RequestID, "conversation_key": job.ConversationKey}}
 		action.Deliveries = actionDeliveries(action, user, current.AdminEmail)
@@ -291,7 +291,7 @@ func actionDeliveries(action Action, user EnforcementUser, adminEmail string) []
 	} else if action.ActionType == "disable" {
 		subject = "第三方提示词审计：账号已停用"
 	}
-	body := fmt.Sprintf("<p>%s</p><p>用户：%s</p><p>分类记录：%d</p><p>请在管理后台的第三方模型提示词审计页面查看完整依据。</p>", html.EscapeString(subject), html.EscapeString(user.Username), *action.OutcomeID)
+	body := fmt.Sprintf("<p>%s</p><p>用户：%s</p><p>分类记录：%d</p><p>请在管理后台的第三方模型提示词审计页面查看完整依据。</p>", html.EscapeString(subject), html.EscapeString(user.Username), *action.JobID)
 	deliveries := []Delivery{}
 	if adminEmail != "" {
 		deliveries = append(deliveries, Delivery{Recipient: adminEmail, Kind: "admin", Subject: subject, Body: body, Status: "pending", Attempts: []DeliveryAttempt{}})
@@ -315,6 +315,6 @@ func insertAction(ctx context.Context, tx *sql.Tx, action *Action) error {
 	if err != nil {
 		return err
 	}
-	return tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_enforcement_actions(user_id,outcome_id,actor_user_id,action_type,rule_snapshot,business_snapshot,notification_status,deliveries,auth_cache_status,execution_status,applied_at,completed_at)
- VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id,applied_at`, action.UserID, action.OutcomeID, action.ActorUserID, action.ActionType, string(rule), string(business), action.NotificationStatus, string(deliveries), action.AuthCacheStatus, action.ExecutionStatus, action.AppliedAt, action.CompletedAt).Scan(&action.ID, &action.AppliedAt)
+	return tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_enforcement_actions(user_id,job_id,actor_user_id,action_type,rule_snapshot,business_snapshot,notification_status,deliveries,auth_cache_status,execution_status,applied_at,completed_at)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id,applied_at`, action.UserID, action.JobID, action.ActorUserID, action.ActionType, string(rule), string(business), action.NotificationStatus, string(deliveries), action.AuthCacheStatus, action.ExecutionStatus, action.AppliedAt, action.CompletedAt).Scan(&action.ID, &action.AppliedAt)
 }
