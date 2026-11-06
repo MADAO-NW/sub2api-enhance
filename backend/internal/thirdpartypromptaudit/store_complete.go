@@ -174,8 +174,8 @@ func (r *Repository) CompleteAuditJob(ctx context.Context, job *AuditJob, foregr
 		}
 	}
 	update, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.audit_jobs SET status='done',decision=$3,trigger_hash=$4,trigger_kind=$5,enforcement_eligible=$6,
- violation_counted=$7,disable_counted=$8,finished_at=clock_timestamp(),lease_until=NULL,failure_stage=NULL,last_error_code=NULL,last_error_message=NULL,updated_at=clock_timestamp()
- WHERE id=$1 AND claim_generation=$2 AND status='processing'`, job.ID, job.ClaimGeneration, decision, trigger.Hash, trigger.Kind, eligible, violation, disableCounted)
+ violation_counted=$7,disable_counted=$8,blocking_wait_ms=COALESCE($9,blocking_wait_ms),finished_at=clock_timestamp(),lease_until=NULL,failure_stage=NULL,last_error_code=NULL,last_error_message=NULL,updated_at=clock_timestamp()
+ WHERE id=$1 AND claim_generation=$2 AND status='processing'`, job.ID, job.ClaimGeneration, decision, trigger.Hash, trigger.Kind, eligible, violation, disableCounted, job.BlockingWaitMS)
 	if err := checkLeaseUpdate(update, err); err != nil {
 		return nil, err
 	}

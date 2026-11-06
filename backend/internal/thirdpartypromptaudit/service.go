@@ -401,8 +401,7 @@ func (s *Service) processJob(parent context.Context, job *AuditJob, foreground b
 		if err := s.repo.BeginForegroundAuditJob(ctx, job); err != nil {
 			return nil, s.finishFailure(ctx, job, persistenceFailure(err, "evaluation_start_failed"))
 		}
-		wait := time.Since(job.CreatedAt).Milliseconds()
-		job.BlockingWaitMS = &wait
+		// 同步等待耗时在建任务到得出结论之间统计，收尾时写入任务记录。
 	}
 	started := time.Now()
 	var binding ConfigSnapshot
@@ -476,6 +475,10 @@ func (s *Service) processJob(parent context.Context, job *AuditJob, foreground b
 			// 已有 block 即可确定任务裁决，剩余目标不再消耗模型调用。
 			break
 		}
+	}
+	if foreground && job.Mode == "blocking" {
+		wait := time.Since(job.CreatedAt).Milliseconds()
+		job.BlockingWaitMS = &wait
 	}
 	persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
 	completion, err := s.repo.CompleteAuditJob(persistCtx, job, foreground && ctx.Err() == nil)
