@@ -32,4 +32,3 @@ export function formatTime(value: string | null | undefined): string {
 export function formatMS(value: number | null | undefined): string {
   return value == null ? '—' : `${Math.round(value).toLocaleString()} ms`
 }
-
