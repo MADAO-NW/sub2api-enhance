@@ -129,7 +129,7 @@ func (s *IdentityStore) lookup(ctx context.Context, key string, id int64, ip str
 	return v, nil
 }
 func (s *IdentityStore) Groups(ctx context.Context) ([]map[string]any, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,platform FROM public.groups WHERE deleted_at IS NULL AND status='active' ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,platform,subscription_type FROM public.groups WHERE deleted_at IS NULL AND status='active' ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -137,11 +137,11 @@ func (s *IdentityStore) Groups(ctx context.Context) ([]map[string]any, error) {
 	out := []map[string]any{}
 	for rows.Next() {
 		var id int64
-		var name, platform string
-		if err := rows.Scan(&id, &name, &platform); err != nil {
+		var name, platform, subscriptionType string
+		if err := rows.Scan(&id, &name, &platform, &subscriptionType); err != nil {
 			return nil, err
 		}
-		out = append(out, map[string]any{"id": id, "name": name, "platform": platform})
+		out = append(out, map[string]any{"id": id, "name": name, "platform": platform, "subscription_type": subscriptionType})
 	}
 	return out, rows.Err()
 }

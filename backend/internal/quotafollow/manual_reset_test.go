@@ -2,62 +2,64 @@ package quotafollow
 
 import (
 	"context"
-	"errors"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/require"
-	"sub2api-enhance/internal/sub2api"
 	"testing"
 )
 
-type immediateResetSource struct {
-	users []sub2api.QuotaUser
-}
-
-func (s immediateResetSource) Discover(context.Context, int64) (sub2api.QuotaDiscovery, error) {
-	return sub2api.QuotaDiscovery{Users: s.users}, nil
-}
-func (immediateResetSource) Accounts(context.Context, int64) ([]sub2api.QuotaAccount, error) {
-	return nil, nil
-}
-func (immediateResetSource) Snapshot(context.Context, int64, int64) (*sub2api.QuotaSnapshot, error) {
-	return nil, nil
-}
-
-type immediateResetAPI struct {
-	calls []string
-}
-
-func (immediateResetAPI) Configured() bool { return true }
-func (immediateResetAPI) AccountUsageBatch(context.Context, []int64) (map[int64]sub2api.AccountUsage, error) {
-	return nil, nil
-}
-func (a *immediateResetAPI) ResetQuota(_ context.Context, userID int64, window, requestID string) sub2api.QuotaResetReply {
-	a.calls = append(a.calls, requestID+":"+window)
-	if userID == 2 {
-		return sub2api.QuotaResetReply{HTTPStatus: 500, Error: errors.New("上游失败")}
-	}
-	return sub2api.QuotaResetReply{HTTPStatus: 200}
-}
-
-func TestImmediateResetCallsOriginalAPIForEachSelectedUserAndWindow(t *testing.T) {
-	api := &immediateResetAPI{}
-	service := &Service{api: api, source: immediateResetSource{users: []sub2api.QuotaUser{{ID: 1, Username: "one"}, {ID: 2, Username: "two"}}}}
-	result, err := service.ImmediateReset(context.Background(), ImmediateResetRequest{GroupID: 7, Windows: []string{"weekly", "daily", "weekly"}})
+func TestManualResetReplaysSameEventWithoutCallingOriginalAgain(t *testing.T) {
+	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
-	require.Equal(t, int64(7), result.GroupID)
-	require.Equal(t, []string{"weekly", "daily"}, result.Windows)
-	require.Equal(t, 4, result.Total)
-	require.Equal(t, 2, result.Succeeded)
-	require.Equal(t, 2, result.NonSuccess)
-	require.Len(t, api.calls, 4)
-	require.Equal(t, "succeeded", result.Items[0].Status)
-	require.Equal(t, "uncertain", result.Items[2].Status)
-	require.NotEmpty(t, result.Items[0].RequestID)
+	defer db.Close()
+	mock.ExpectQuery("SELECT id,group_id,status").WillReturnRows(sqlmock.NewRows([]string{"id", "group_id", "status", "revision"}).AddRow(99, 7, "completed", 3))
+	api := &fakeAPI{}
+	s := &Service{repo: NewRepository(db), api: api}
+	v, err := s.ImmediateReset(context.Background(), ImmediateResetRequest{GroupID: 7, ExpectedRevision: 3, RequestID: "b85ee0b8-dd18-423c-bd6b-a38679fb4414"})
+	require.NoError(t, err)
+	require.Equal(t, int64(99), v.EventID)
+	require.Zero(t, api.resetCalls)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+func TestManualResetRejectsReusedKeyForDifferentRevision(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	mock.ExpectQuery("SELECT id,group_id,status").WillReturnRows(sqlmock.NewRows([]string{"id", "group_id", "status", "revision"}).AddRow(99, 7, "completed", 2))
+	s := &Service{repo: NewRepository(db)}
+	_, err = s.ImmediateReset(context.Background(), ImmediateResetRequest{GroupID: 7, ExpectedRevision: 3, RequestID: "b85ee0b8-dd18-423c-bd6b-a38679fb4414"})
+	require.Error(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+func TestManualResetRejectsInvalidRequestBeforeAnySideEffect(t *testing.T) {
+	s := &Service{}
+	_, err := s.ImmediateReset(context.Background(), ImmediateResetRequest{GroupID: 7, ExpectedRevision: 1, RequestID: "bad"})
+	require.Error(t, err)
 }
 
-func TestImmediateResetRejectsEmptyOrInvalidWindow(t *testing.T) {
-	service := &Service{api: &immediateResetAPI{}, source: immediateResetSource{}}
-	_, err := service.ImmediateReset(context.Background(), ImmediateResetRequest{GroupID: 7})
-	require.ErrorIs(t, err, errImmediateResetNoWindow)
-	_, err = service.ImmediateReset(context.Background(), ImmediateResetRequest{GroupID: 7, Windows: []string{"monthly"}})
-	require.ErrorIs(t, err, errImmediateResetWindow)
+func TestAcknowledgementUnblocksWithoutChangingUncertainSubscriptionOutcomes(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT status .* FOR UPDATE").WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("uncertain"))
+	mock.ExpectExec("UPDATE .*quota_reset_records SET evidence=").WithArgs(int64(4), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec("UPDATE .*quota_follow_subscription_batches SET status='reviewed'").WithArgs(int64(4)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	api := &fakeAPI{}
+	err = (&Service{repo: NewRepository(db), api: api}).AcknowledgeUncertain(context.Background(), 4, 7, "已核对原版记录，允许后续轮次继续")
+	require.NoError(t, err)
+	require.Zero(t, api.resetCalls)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+func TestRetryReturnsExistingSupplementaryEventWithoutResending(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	mock.ExpectQuery("SELECT id,group_id,status").WithArgs("subscription-retry:7").WillReturnRows(sqlmock.NewRows([]string{"id", "group_id", "status"}).AddRow(99, 5, "completed"))
+	api := &fakeAPI{}
+	out, err := (&Service{repo: NewRepository(db), api: api}).RetryFailed(context.Background(), 7)
+	require.NoError(t, err)
+	require.Equal(t, int64(99), out.EventID)
+	require.Zero(t, api.resetCalls)
+	require.NoError(t, mock.ExpectationsWereMet())
 }

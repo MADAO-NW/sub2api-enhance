@@ -2,52 +2,85 @@ package sub2api
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
+	"errors"
 	"fmt"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/require"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"sub2api-enhance/internal/config"
-	"sync/atomic"
 	"testing"
+	"time"
 )
 
-func TestQuotaBatchPreservesPerAccountErrorsAndOriginalPercentage(t *testing.T) {
-	original := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/api/v1/admin/accounts/usage/batch", r.URL.Path)
-		var req struct {
-			IDs   []int64 `json:"account_ids"`
-			Force bool    `json:"force"`
-		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
-		require.True(t, req.Force)
-		require.Equal(t, []int64{7, 8}, req.IDs)
-		fmt.Fprint(w, `{"code":0,"data":{"usage":{"7":{"seven_day":{"utilization":0.123456789,"resets_at":"2026-09-08T00:00:00Z"}}},"errors":{"8":"上游拒绝"}}}`)
-	}))
-	defer original.Close()
-	result, err := NewClient(&config.Config{OfficialURL: original.URL, AdminKey: "unit-test"}).AccountUsageBatch(context.Background(), []int64{7, 8})
-	require.NoError(t, err)
-	require.Equal(t, "0.123456789", result[7].Utilization.String())
-	require.Equal(t, "上游拒绝", result[8].Error)
+func TestQuotaDiscoveryReturnsAllEligibleUsersAndRollsBackIncompleteReads(t *testing.T) {
+	for _, readFails := range []bool{false, true} {
+		t.Run(fmt.Sprint("readFails=", readFails), func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			defer db.Close()
+			mock.ExpectBegin()
+			mock.ExpectQuery("SELECT name FROM public.groups").WithArgs(int64(2)).WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("openai"))
+			mock.ExpectQuery("SELECT DISTINCT a.id,a.name,a.type").WithArgs(int64(2)).WillReturnRows(sqlmock.NewRows([]string{"id", "name", "type"}).AddRow(1, "account", "oauth"))
+			rows := sqlmock.NewRows([]string{"id", "username", "email"})
+			for _, id := range []int64{4, 6, 7, 8, 9} {
+				rows.AddRow(id, fmt.Sprint("user-", id), fmt.Sprintf("user-%d@example.com", id))
+			}
+			readErr := errors.New("读取用户失败")
+			if readFails {
+				rows.RowError(2, readErr)
+			}
+			// 公开访问分支必须与显式授权并列，且不能再用关系表内连接提前排除用户。
+			mock.ExpectQuery(`SELECT DISTINCT u.id,u.username,u.email FROM public.users u JOIN public.user_platform_quotas .*u.role='user' AND u.status='active' AND u.deleted_at IS NULL AND \(\(NOT g.is_exclusive AND NOT u.restrict_public_groups\) OR EXISTS\(SELECT 1 FROM public.user_allowed_groups ug WHERE ug.user_id=u.id AND ug.group_id=g.id\)\) ORDER BY u.id`).
+				WithArgs(int64(2)).WillReturnRows(rows).RowsWillBeClosed()
+			if !readFails {
+				mock.ExpectCommit()
+			} else {
+				mock.ExpectRollback()
+			}
+			got, err := NewQuotaData(db).Discover(context.Background(), 2)
+			if readFails {
+				require.ErrorIs(t, err, readErr)
+			} else {
+				require.NoError(t, err)
+				ids := make([]int64, 0, len(got.Users))
+				for _, user := range got.Users {
+					ids = append(ids, user.ID)
+				}
+				require.Equal(t, []int64{4, 6, 7, 8, 9}, ids)
+			}
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
 }
-func TestQuotaResetUsesExactWindowAndRequestIDWithoutRetry(t *testing.T) {
-	var calls atomic.Int64
-	original := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		require.Equal(t, "POST", r.Method)
-		require.Equal(t, "/api/v1/admin/users/7/platform-quotas/reset", r.URL.Path)
-		require.Equal(t, "unit-correlation", r.Header.Get("X-Request-ID"))
-		raw, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
-		require.JSONEq(t, `{"platform":"openai","window":"weekly"}`, string(raw))
-		w.WriteHeader(500)
-		fmt.Fprint(w, "response unknown")
-	}))
-	defer original.Close()
-	reply := NewClient(&config.Config{OfficialURL: original.URL, AdminKey: "unit-test"}).ResetQuota(context.Background(), 7, "weekly", "unit-correlation")
-	require.Error(t, reply.Error)
-	require.Equal(t, 500, reply.HTTPStatus)
-	require.Equal(t, "response unknown", reply.Raw)
-	require.EqualValues(t, 1, calls.Load())
+
+func TestQuotaSnapshotRechecksAccessAndPreservesUnavailableAndErrorResults(t *testing.T) {
+	readErr := errors.New("配额查询失败")
+	for _, queryErr := range []error{nil, sql.ErrNoRows, readErr} {
+		t.Run(fmt.Sprint(queryErr), func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			defer db.Close()
+			query := mock.ExpectQuery(`SELECT u.id.*u.role='user' AND u.status='active' AND u.deleted_at IS NULL AND q.platform='openai' AND q.deleted_at IS NULL AND EXISTS\(SELECT 1 FROM public.groups g WHERE g.id=\$2 AND g.status='active' AND g.deleted_at IS NULL AND \(\(NOT g.is_exclusive AND NOT u.restrict_public_groups\) OR EXISTS\(SELECT 1 FROM public.user_allowed_groups ug WHERE ug.user_id=u.id AND ug.group_id=g.id\)\)\)`).WithArgs(int64(7), int64(2))
+			now := time.Date(2026, 9, 26, 8, 0, 0, 0, time.UTC)
+			if queryErr != nil {
+				query.WillReturnError(queryErr)
+			} else {
+				query.WillReturnRows(sqlmock.NewRows([]string{"id", "username", "daily", "weekly", "daily_start", "weekly_start", "observed_at"}).AddRow(7, "user", "0.0000000001", "500.1234567890", nil, now, now))
+			}
+			got, err := NewQuotaData(db).Snapshot(context.Background(), 7, 2)
+			switch queryErr {
+			case nil:
+				require.NoError(t, err)
+				require.Equal(t, "0.0000000001", got.DailyUsage)
+				require.Equal(t, "500.1234567890", got.WeeklyUsage)
+				require.Nil(t, got.DailyStart)
+			case sql.ErrNoRows:
+				require.NoError(t, err)
+				require.Nil(t, got)
+			default:
+				require.ErrorIs(t, err, readErr)
+				require.Nil(t, got)
+			}
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
 }

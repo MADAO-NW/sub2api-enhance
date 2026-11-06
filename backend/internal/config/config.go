@@ -15,7 +15,7 @@ import (
 )
 
 type Config struct {
-	EnhanceRedisURL, QuotaRedisURL, QuotaTimezone, QuotaFlusherEnabled      string
+	EnhanceRedisURL                                                         string
 	Listen, DatabaseURL, OfficialURL, PublicOrigin, AdminKey, EncryptionKey string
 	TrustedProxies                                                          []string
 	DatabaseConnections, IngressConnections                                 int
@@ -25,7 +25,7 @@ type Config struct {
 }
 
 func Load() (*Config, error) {
-	c := &Config{Listen: os.Getenv("ENHANCE_LISTEN"), DatabaseURL: os.Getenv("ENHANCE_DATABASE_URL"), OfficialURL: os.Getenv("SUB2API_INTERNAL_URL"), PublicOrigin: os.Getenv("ENHANCE_PUBLIC_ORIGIN"), AdminKey: os.Getenv("SUB2API_ADMIN_API_KEY"), EncryptionKey: os.Getenv("ENHANCE_ENCRYPTION_KEY"), SMTPHost: os.Getenv("SMTP_HOST"), SMTPPort: os.Getenv("SMTP_PORT"), SMTPUser: os.Getenv("SMTP_USER"), SMTPPassword: os.Getenv("SMTP_PASSWORD"), SMTPFrom: os.Getenv("SMTP_FROM"), SMTPFromName: os.Getenv("SMTP_FROM_NAME"), SMTPUseTLS: strings.EqualFold(os.Getenv("SMTP_USE_TLS"), "true"), EnhanceRedisURL: os.Getenv("ENHANCE_REDIS_URL"), QuotaRedisURL: os.Getenv("QUOTA_FOLLOW_REDIS_URL"), QuotaTimezone: os.Getenv("SUB2API_TIMEZONE"), QuotaFlusherEnabled: os.Getenv("SUB2API_USER_PLATFORM_QUOTA_FLUSHER_ENABLED")}
+	c := &Config{Listen: os.Getenv("ENHANCE_LISTEN"), DatabaseURL: os.Getenv("ENHANCE_DATABASE_URL"), OfficialURL: os.Getenv("SUB2API_INTERNAL_URL"), PublicOrigin: os.Getenv("ENHANCE_PUBLIC_ORIGIN"), AdminKey: os.Getenv("SUB2API_ADMIN_API_KEY"), EncryptionKey: os.Getenv("ENHANCE_ENCRYPTION_KEY"), SMTPHost: os.Getenv("SMTP_HOST"), SMTPPort: os.Getenv("SMTP_PORT"), SMTPUser: os.Getenv("SMTP_USER"), SMTPPassword: os.Getenv("SMTP_PASSWORD"), SMTPFrom: os.Getenv("SMTP_FROM"), SMTPFromName: os.Getenv("SMTP_FROM_NAME"), SMTPUseTLS: strings.EqualFold(os.Getenv("SMTP_USE_TLS"), "true"), EnhanceRedisURL: os.Getenv("ENHANCE_REDIS_URL")}
 	if c.Listen == "" {
 		c.Listen = "127.0.0.1:18081"
 	}

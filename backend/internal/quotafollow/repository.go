@@ -6,16 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
-	"github.com/lib/pq"
 	"log"
 	infra "sub2api-enhance/internal/pkg/errors"
 	"sub2api-enhance/internal/sub2api"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-// configLock 串行首次保存与配置修订，不与提示词审计共用业务锁。
-const configLock int64 = 579147893221901942
+// configLock 串行化配置首次创建与修订，避免多管理员覆盖。
+const configLock int64 = 748239516309715
 
 type Repository struct{ db *sql.DB }
 
@@ -42,7 +42,7 @@ func (r *Repository) SaveConfig(ctx context.Context, input ConfigUpdate, actor i
 		return SavedConfig{}, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, configLock); err != nil {
+	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, configLock); err != nil {
 		return SavedConfig{}, err
 	}
 	old := DefaultConfig()
@@ -52,193 +52,352 @@ func (r *Repository) SaveConfig(ctx context.Context, input ConfigUpdate, actor i
 		return old, err
 	}
 	if err == nil {
-		if err := json.Unmarshal(raw, &old); err != nil {
+		if err = json.Unmarshal(raw, &old); err != nil {
 			return old, err
 		}
 	}
 	if old.Revision != input.ExpectedRevision {
 		return old, infra.Conflict("quota_follow_config_conflict", "配置已改变，请刷新后重新保存")
 	}
-	next := old
-	next.Config = input.Config
-	next.Revision++
-	next.UpdatedBy = actor
-	next.UpdatedAt = time.Now().UTC()
-	if newEpochRequired(old.Config, next.Config) || next.Epoch == "" {
-		next.Epoch = uuid.NewString()
-		if next.Enabled {
-			now := next.UpdatedAt
-			next.EnabledAt = &now
+	next := SavedConfig{Config: input.Config, Revision: old.Revision + 1, UpdatedBy: actor, UpdatedAt: time.Now().UTC()}
+	for i := range next.Groups {
+		g := &next.Groups[i]
+		before, exists := old.Group(g.GroupID)
+		// 客户端不能指定轮次或启用时间；只有真实业务范围变化才重建该组基线。
+		g.Epoch = before.Epoch
+		g.EnabledAt = before.EnabledAt
+		if !exists || newEpochRequired(before, *g) || old.Enabled != next.Enabled || g.Epoch == "" {
+			g.Epoch = uuid.NewString()
+			at := next.UpdatedAt
+			g.EnabledAt = &at
 		}
 	}
 	raw, err = json.Marshal(next)
 	if err != nil {
 		return next, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.settings(key,value,updated_at) VALUES($1,$2,clock_timestamp()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at`, settingKey, string(raw)); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.settings(key,value,updated_at) VALUES($1,$2,clock_timestamp()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at`, settingKey, string(raw)); err != nil {
 		return next, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_runtime(singleton) VALUES(true) ON CONFLICT(singleton) DO UPDATE SET next_check_at=clock_timestamp(),paused_revision=NULL,last_error='',carryover_snapshot_at=CASE WHEN $1 THEN NULL ELSE quota_follow_runtime.carryover_snapshot_at END,carryover_checked_week=CASE WHEN $1 THEN NULL ELSE quota_follow_runtime.carryover_checked_week END`, old.Epoch != next.Epoch); err != nil {
-		return next, err
-	}
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		return next, err
 	}
 	transition, _ := json.Marshal(map[string]any{"before": old, "after": next})
-	log.Printf("额度跟随配置已保存 actor_user_id=%d transition=%s", actor, transition)
+	log.Printf("订阅跟随配置已保存 actor_user_id=%d transition=%s", actor, transition)
 	return next, nil
 }
-func (r *Repository) Runtime(ctx context.Context) (Runtime, error) {
-	out := Runtime{Accounts: []sub2api.QuotaAccount{}, States: []AccountState{}}
+func (r *Repository) Runtime(ctx context.Context, groupID int64) (Runtime, error) {
+	out := Runtime{GroupID: groupID, States: []AccountState{}}
 	var raw []byte
-	err := r.db.QueryRowContext(ctx, `SELECT epoch,account_set_hash,accounts,last_event_at,last_checked_at,next_check_at,last_error,paused_revision FROM sub2api_enhance.quota_follow_runtime WHERE singleton=true`).Scan(&out.Epoch, &out.AccountSetHash, &raw, &out.LastEventAt, &out.LastCheckedAt, &out.NextCheckAt, &out.LastError, &out.PausedRevision)
+	err := r.db.QueryRowContext(ctx, `SELECT snapshot FROM sub2api_enhance.quota_follow_group_runtime WHERE group_id=$1`, groupID).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, nil
 	}
 	if err != nil {
 		return out, err
 	}
-	if err := json.Unmarshal(raw, &out.Accounts); err != nil {
-		return out, err
-	}
-	rows, err := r.db.QueryContext(ctx, `SELECT snapshot FROM sub2api_enhance.quota_follow_account_states WHERE epoch=$1 AND account_set_hash=$2 ORDER BY account_id`, out.Epoch, out.AccountSetHash)
-	if err != nil {
-		return out, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var raw []byte
-		var state AccountState
-		if err := rows.Scan(&raw); err != nil {
-			return out, err
-		}
-		if err := json.Unmarshal(raw, &state); err != nil {
-			return out, err
-		}
-		out.States = append(out.States, state)
-	}
-	return out, rows.Err()
-}
-func (r *Repository) Schedule(ctx context.Context, next time.Time, message string, paused *int64) error {
-	_, err := r.db.ExecContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_runtime(singleton,next_check_at,last_error,paused_revision) VALUES(true,$1,$2,$3) ON CONFLICT(singleton) DO UPDATE SET next_check_at=$1,last_error=$2,paused_revision=$3`, next, message, paused)
-	return err
+	err = json.Unmarshal(raw, &out)
+	return out, err
 }
 
-// AccountResetSignals 读取水位之后的原版 OpenAI 账号重置卡成功审计，作为窗口轮询之外的直接重置证据。
-func (r *Repository) AccountResetSignals(ctx context.Context, accountIDs []int64, since time.Time) (map[int64]time.Time, error) {
-	result := make(map[int64]time.Time)
-	if len(accountIDs) == 0 {
-		return result, nil
-	}
-	ids := make([]string, 0, len(accountIDs))
-	for _, id := range accountIDs {
-		ids = append(ids, fmt.Sprint(id))
-	}
-	rows, err := r.db.QueryContext(ctx, `SELECT DISTINCT ON (l.extra#>>'{params,id}') (l.extra#>>'{params,id}')::bigint,l.created_at
-FROM public.audit_logs l
-WHERE l.method='POST' AND l.path='/api/v1/admin/openai/accounts/:id/reset-quota'
-  AND l.status_code BETWEEN 200 AND 299
-  AND l.created_at > $1
-  AND l.extra#>>'{params,id}'=ANY($2::text[])
-ORDER BY l.extra#>>'{params,id}',l.created_at DESC,l.id DESC`, since, pq.Array(ids))
-	if err != nil {
-		return result, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var accountID int64
-		var occurredAt time.Time
-		if err := rows.Scan(&accountID, &occurredAt); err != nil {
-			return result, err
-		}
-		result[accountID] = occurredAt
-	}
-	return result, rows.Err()
-}
-
-// SaveObservation 提交账号证据与唯一分组事件，并保存本轮成功检测起点；远端重置在事务外由交付循环执行。
-func (r *Repository) SaveObservation(ctx context.Context, cfg SavedConfig, discovery sub2api.QuotaDiscovery, hash string, states []AccountState, boundary *time.Time, next time.Time, message string, checkedAt time.Time, expectedCheckedAt *time.Time) error {
+// SaveObservation 将账号进度、分组事件、固定订阅清单与批次原子提交；远程调用不占数据库事务。
+func (r *Repository) SaveObservation(ctx context.Context, cfg SavedConfig, rule GroupRule, discovery sub2api.SubscriptionDiscovery, next Runtime, previous Runtime, boundary *time.Time) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var currentRaw []byte
-	if err := tx.QueryRowContext(ctx, `SELECT value FROM sub2api_enhance.settings WHERE key=$1 FOR SHARE`, settingKey).Scan(&currentRaw); err != nil {
+	if err = checkConfig(ctx, tx, cfg.Revision); err != nil {
 		return err
 	}
-	var current SavedConfig
-	if err := json.Unmarshal(currentRaw, &current); err != nil {
+	// 为首次观测也建立行锁，随后比较上次成功提交时间，防止失去会话锁的旧进程覆盖新证据。
+	initial, _ := json.Marshal(Runtime{GroupID: rule.GroupID, States: []AccountState{}})
+	if _, err = tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_group_runtime(group_id,snapshot) VALUES($1,$2) ON CONFLICT(group_id) DO NOTHING`, rule.GroupID, string(initial)); err != nil {
 		return err
 	}
-	if current.Revision != cfg.Revision {
-		return errors.New("检测期间配置已变化，放弃本轮提交")
-	}
-	// 即使会话锁因断连丢失，旧检测也不能覆盖另一实例已经提交的新证据。
-	var actualCheckedAt *time.Time
-	err = tx.QueryRowContext(ctx, `SELECT last_checked_at FROM sub2api_enhance.quota_follow_runtime WHERE singleton=true FOR UPDATE`).Scan(&actualCheckedAt)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	var raw []byte
+	var actual Runtime
+	if err = tx.QueryRowContext(ctx, `SELECT snapshot FROM sub2api_enhance.quota_follow_group_runtime WHERE group_id=$1 FOR UPDATE`, rule.GroupID).Scan(&raw); err != nil {
 		return err
 	}
-	if (actualCheckedAt == nil) != (expectedCheckedAt == nil) || (actualCheckedAt != nil && !actualCheckedAt.Equal(*expectedCheckedAt)) {
-		return errors.New("已有更新的检测结果，本轮旧证据不再提交")
-	}
-	accounts, _ := json.Marshal(discovery.Accounts)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_runtime(singleton,epoch,account_set_hash,accounts,last_event_at,next_check_at,last_checked_at,last_error) VALUES(true,$1,$2,$3,$4,$5,$7,$6)
- ON CONFLICT(singleton) DO UPDATE SET last_event_at=CASE WHEN sub2api_enhance.quota_follow_runtime.epoch<>$1 OR sub2api_enhance.quota_follow_runtime.account_set_hash<>$2 THEN $4 ELSE COALESCE($4,sub2api_enhance.quota_follow_runtime.last_event_at) END,epoch=$1,account_set_hash=$2,accounts=$3,next_check_at=$5,last_checked_at=$7,last_error=$6,paused_revision=NULL`, cfg.Epoch, hash, string(accounts), boundary, next, message, checkedAt); err != nil {
+	if err = json.Unmarshal(raw, &actual); err != nil {
 		return err
 	}
-	for _, state := range states {
-		raw, err := json.Marshal(state)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_account_states(account_id,epoch,account_set_hash,snapshot) VALUES($1,$2,$3,$4) ON CONFLICT(account_id) DO UPDATE SET epoch=$2,account_set_hash=$3,snapshot=$4,updated_at=clock_timestamp()`, state.Account.ID, cfg.Epoch, hash, string(raw)); err != nil {
-			return err
-		}
+	if !sameTime(actual.LastCheckedAt, previous.LastCheckedAt) || actual.Epoch != previous.Epoch {
+		return errors.New("已有更新的分组状态，本轮旧检测不再提交")
 	}
 	if boundary != nil {
-		key := cfg.Epoch + ":" + hash + ":" + boundary.UTC().Format(time.RFC3339Nano)
-		accountEvidence, _ := json.Marshal(states)
-		users, _ := json.Marshal(discovery.Users)
-		configRaw, _ := json.Marshal(cfg)
-		status := "pending"
-		if cfg.ObserveOnly {
-			status = "observed"
-		}
-		var eventID int64
-		err := tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_reset_events(event_key,epoch,account_set_hash,reset_at,accounts,users,config_snapshot,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(event_key) DO NOTHING RETURNING id`, key, cfg.Epoch, hash, boundary, string(accountEvidence), string(users), string(configRaw), status).Scan(&eventID)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		evidence, _ := json.Marshal(next.States)
+		key := fmt.Sprintf("subscription:%d:%s:%s:%s", rule.GroupID, rule.Epoch, next.AccountSetHash, boundary.UTC().Format(time.RFC3339Nano))
+		if _, err = r.createEvent(ctx, tx, key, "automatic", rule, next.AccountSetHash, discovery, evidence, *boundary, cfg.Revision); err != nil {
 			return err
 		}
-		if err == nil && !cfg.ObserveOnly {
-			windows := []string{}
-			if cfg.ResetWeekly {
-				windows = append(windows, "weekly")
+		consume(next.States)
+		next.LastEventAt = boundary
+	}
+	raw, err = json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_follow_group_runtime SET snapshot=$2,updated_at=clock_timestamp() WHERE group_id=$1`, rule.GroupID, string(raw)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+func sameTime(a, b *time.Time) bool {
+	return (a == nil && b == nil) || (a != nil && b != nil && a.Equal(*b))
+}
+func checkConfig(ctx context.Context, tx *sql.Tx, revision int64) error {
+	var raw []byte
+	if err := tx.QueryRowContext(ctx, `SELECT value FROM sub2api_enhance.settings WHERE key=$1 FOR SHARE`, settingKey).Scan(&raw); err != nil {
+		return err
+	}
+	var cfg SavedConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return err
+	}
+	if cfg.Revision != revision {
+		return infra.Conflict("quota_follow_config_conflict", "操作期间配置已改变，请刷新后重试")
+	}
+	return nil
+}
+
+// createEvent 的目标名单在事件产生时冻结，观察模式同样消费账号轮次，但不创建交付批次。
+func (r *Repository) createEvent(ctx context.Context, tx *sql.Tx, key, trigger string, rule GroupRule, hash string, d sub2api.SubscriptionDiscovery, evidence []byte, at time.Time, revision int64) (int64, error) {
+	status := "pending"
+	if trigger == "automatic" && rule.ObserveOnly {
+		status = "observed"
+	} else if len(d.Subscriptions) == 0 {
+		status = "completed"
+	}
+	configRaw, _ := json.Marshal(struct {
+		GroupRule
+		Revision int64 `json:"revision"`
+	}{rule, revision})
+	targets, _ := json.Marshal(d.Subscriptions)
+	recordEvidence, _ := json.Marshal(map[string]any{"accounts": json.RawMessage(evidence), "trigger": trigger})
+	var id int64
+	err := tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_reset_events(event_key,epoch,account_set_hash,reset_at,accounts,users,config_snapshot,status,group_id,trigger_type,subscriptions) VALUES($1,$2,$3,$4,$5,'[]',$6,$7,$8,$9,$10) RETURNING id`, key, rule.Epoch, hash, at, string(evidence), string(configRaw), status, rule.GroupID, trigger, string(targets)).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+	if status != "pending" {
+		return id, nil
+	}
+	if trigger == "automatic" {
+		if _, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_follow_subscription_batches b SET status='skipped',error_message='已有更新的账号重置轮次，旧待发送事件不再补发',completed_at=clock_timestamp() FROM sub2api_enhance.quota_follow_reset_events e WHERE b.event_id=e.id AND b.group_id=$1 AND b.event_id<>$2 AND e.trigger_type='automatic' AND b.status='pending'`, rule.GroupID, id); err != nil {
+			return 0, err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_follow_subscription_items i SET status='skipped',error_message=b.error_message FROM sub2api_enhance.quota_follow_subscription_batches b WHERE i.batch_id=b.id AND b.group_id=$1 AND b.status='skipped' AND i.status='pending'`, rule.GroupID); err != nil {
+			return 0, err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_reset_records r SET status='skipped',error_message=i.error_message FROM sub2api_enhance.quota_follow_subscription_items i WHERE r.subscription_item_id=i.id AND i.group_id=$1 AND i.status='skipped' AND r.status='pending'`, rule.GroupID); err != nil {
+			return 0, err
+		}
+	}
+	for offset := 0; offset < len(d.Subscriptions); offset += sub2api.SubscriptionBatchLimit {
+		end := min(offset+sub2api.SubscriptionBatchLimit, len(d.Subscriptions))
+		items := d.Subscriptions[offset:end]
+		req := sub2api.SubscriptionResetRequest{IDs: []int64{}, Action: "reset_quota", Daily: rule.ResetDaily, Weekly: rule.ResetWeekly}
+		for _, v := range items {
+			req.IDs = append(req.IDs, v.ID)
+		}
+		body, _ := json.Marshal(req)
+		requestID := uuid.NewString()
+		var batchID int64
+		if err = tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_subscription_batches(event_id,group_id,request_id,request_body) VALUES($1,$2,$3,$4) RETURNING id`, id, rule.GroupID, requestID, string(body)).Scan(&batchID); err != nil {
+			return 0, err
+		}
+		for _, v := range items {
+			var itemID int64
+			if err = tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_subscription_items(event_id,batch_id,subscription_id,user_id,group_id,username) VALUES($1,$2,$3,$4,$5,$6) RETURNING id`, id, batchID, v.ID, v.UserID, rule.GroupID, v.Username).Scan(&itemID); err != nil {
+				return 0, err
 			}
-			if cfg.ResetDaily {
-				windows = append(windows, "daily")
-			}
-			for _, user := range discovery.Users {
-				for _, window := range windows {
-					requestID := uuid.NewString()
-					body, _ := json.Marshal(map[string]string{"platform": "openai", "window": window})
-					var id int64
-					if err := tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_reset_deliveries(event_id,user_id,"window",request_id,request_body) VALUES($1,$2,$3,$4,$5) RETURNING id`, eventID, user.ID, window, requestID, string(body)).Scan(&id); err != nil {
-						return err
-					}
-					evidence, _ := json.Marshal(map[string]any{"trigger": "OpenAI 账号一致重置", "account_set_hash": hash})
-					if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.quota_reset_records(record_key,source,source_detail,evidence_type,user_id,username,"window",occurred_at,status,event_id,delivery_id,request_id,evidence) VALUES($1,'enhance','openai_consensus','confirmed',$2,$3,$4,$5,'pending',$6,$7,$8,$9)`, fmt.Sprintf("delivery:%d", id), user.ID, user.Username, window, boundary, eventID, id, requestID, string(evidence)); err != nil {
-						return err
-					}
-				}
-			}
-			if len(discovery.Users) == 0 {
-				if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_follow_reset_events SET status='completed',completed_at=clock_timestamp() WHERE id=$1`, eventID); err != nil {
-					return err
+			for _, window := range selectedWindows(rule) {
+				if _, err = tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.quota_reset_records(record_key,source,source_detail,evidence_type,user_id,username,"window",occurred_at,status,event_id,request_id,evidence,group_id,subscription_id,subscription_item_id,batch_id) VALUES($1,'enhance',$2,'confirmed',$3,$4,$5,$6,'pending',$7,$8,$9,$10,$11,$12,$13)`, fmt.Sprintf("subscription:%d:%s", itemID, window), trigger, v.UserID, v.Username, window, at, id, requestID, string(recordEvidence), rule.GroupID, v.ID, itemID, batchID); err != nil {
+					return 0, err
 				}
 			}
 		}
+	}
+	return id, nil
+}
+func selectedWindows(g GroupRule) []string {
+	out := []string{}
+	if g.ResetDaily {
+		out = append(out, "daily")
+	}
+	if g.ResetWeekly {
+		out = append(out, "weekly")
+	}
+	return out
+}
+
+func (r *Repository) Batch(ctx context.Context, id int64) (*Batch, error) {
+	b := &Batch{Items: []BatchItem{}}
+	var raw []byte
+	err := r.db.QueryRowContext(ctx, `SELECT b.id,b.event_id,b.group_id,b.request_id,b.request_body,b.status,b.response_body,b.error_message,b.http_status,b.started_at,b.completed_at,e.config_snapshot,e.account_set_hash,e.trigger_type FROM sub2api_enhance.quota_follow_subscription_batches b JOIN sub2api_enhance.quota_follow_reset_events e ON e.id=b.event_id WHERE b.id=$1`, id).Scan(&b.ID, &b.EventID, &b.GroupID, &b.RequestID, &b.Body, &b.Status, &b.Response, &b.Error, &b.HTTPStatus, &b.StartedAt, &b.CompletedAt, &raw, &b.AccountSetHash, &b.Trigger)
+	if err != nil {
+		return nil, err
+	}
+	if err = json.Unmarshal(raw, &b.Rule); err != nil {
+		return nil, err
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT id,subscription_id,user_id,group_id,username,status,error_message,before_snapshot,after_snapshot FROM sub2api_enhance.quota_follow_subscription_items WHERE batch_id=$1 ORDER BY id`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var v BatchItem
+		var before, after []byte
+		if err = rows.Scan(&v.ID, &v.SubscriptionID, &v.UserID, &v.GroupID, &v.Username, &v.Status, &v.Error, &before, &after); err != nil {
+			return nil, err
+		}
+		if len(before) > 0 {
+			if err = json.Unmarshal(before, &v.Before); err != nil {
+				return nil, err
+			}
+		}
+		if len(after) > 0 {
+			if err = json.Unmarshal(after, &v.After); err != nil {
+				return nil, err
+			}
+		}
+		b.Items = append(b.Items, v)
+	}
+	return b, rows.Err()
+}
+func (r *Repository) PendingBatches(ctx context.Context) ([]int64, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT id FROM sub2api_enhance.quota_follow_subscription_batches WHERE status='pending' ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []int64{}
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ClaimBatch 在发送前持久化固定正文与逐项资格结果，已发出的正文永不重组。
+func (r *Repository) ClaimBatch(ctx context.Context, b *Batch, revision int64) (bool, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if err = checkConfig(ctx, tx, revision); err != nil {
+		return false, err
+	}
+	// 会话锁断连后仍通过分组行锁串行领取；持久化 inflight 后才允许释放行锁和发出请求。
+	initial, _ := json.Marshal(Runtime{GroupID: b.GroupID, States: []AccountState{}})
+	if _, err = tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.quota_follow_group_runtime(group_id,snapshot) VALUES($1,$2) ON CONFLICT(group_id) DO NOTHING`, b.GroupID, string(initial)); err != nil {
+		return false, err
+	}
+	var groupID int64
+	if err = tx.QueryRowContext(ctx, `SELECT group_id FROM sub2api_enhance.quota_follow_group_runtime WHERE group_id=$1 FOR UPDATE`, b.GroupID).Scan(&groupID); err != nil {
+		return false, err
+	}
+	var blocked bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sub2api_enhance.quota_follow_subscription_batches WHERE group_id=$1 AND id<>$2 AND status IN ('inflight','uncertain'))`, b.GroupID, b.ID).Scan(&blocked); err != nil {
+		return false, err
+	}
+	if blocked {
+		return false, nil
+	}
+	var status string
+	if err = tx.QueryRowContext(ctx, `SELECT status FROM sub2api_enhance.quota_follow_subscription_batches WHERE id=$1 FOR UPDATE`, b.ID).Scan(&status); err != nil {
+		return false, err
+	}
+	if status != "pending" {
+		return false, nil
+	}
+	ids := []int64{}
+	for _, v := range b.Items {
+		if v.Status == "pending" {
+			ids = append(ids, v.SubscriptionID)
+		}
+	}
+	req := sub2api.SubscriptionResetRequest{IDs: ids, Action: "reset_quota", Daily: b.Rule.ResetDaily, Weekly: b.Rule.ResetWeekly}
+	body, _ := json.Marshal(req)
+	b.Body = string(body)
+	b.Status = "inflight"
+	if len(ids) == 0 {
+		b.Status = "skipped"
+	}
+	for i := range b.Items {
+		v := &b.Items[i]
+		if v.Status == "pending" {
+			v.Status = "inflight"
+		}
+		raw, _ := json.Marshal(v.Before)
+		if _, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_follow_subscription_items SET status=$2,before_snapshot=$3,error_message=$4 WHERE id=$1`, v.ID, v.Status, string(raw), v.Error); err != nil {
+			return false, err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_reset_records SET status=$2,before_snapshot=$3,error_message=$4 WHERE subscription_item_id=$1`, v.ID, v.Status, string(raw), v.Error); err != nil {
+			return false, err
+		}
+	}
+	if err = tx.QueryRowContext(ctx, `UPDATE sub2api_enhance.quota_follow_subscription_batches SET status=$2,request_body=$3,started_at=clock_timestamp(),completed_at=CASE WHEN $2='skipped' THEN clock_timestamp() END WHERE id=$1 RETURNING started_at`, b.ID, b.Status, b.Body).Scan(&b.StartedAt); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return len(ids) > 0, nil
+}
+func (r *Repository) FinishBatch(ctx context.Context, b *Batch) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, v := range b.Items {
+		raw, _ := json.Marshal(v.After)
+		if _, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_follow_subscription_items SET status=$2,after_snapshot=$3,error_message=$4 WHERE id=$1`, v.ID, v.Status, string(raw), v.Error); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_reset_records SET status=$2,after_snapshot=$3,error_message=$4 WHERE subscription_item_id=$1`, v.ID, v.Status, string(raw), v.Error); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_follow_subscription_batches SET status=$2,response_body=$3,http_status=$4,error_message=$5,completed_at=clock_timestamp() WHERE id=$1`, b.ID, b.Status, b.Response, b.HTTPStatus, b.Error); err != nil {
+		return err
+	}
+	if err = finishEvents(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+func finishEvents(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_follow_reset_events e SET status=CASE WHEN EXISTS(SELECT 1 FROM sub2api_enhance.quota_follow_subscription_batches b WHERE b.event_id=e.id AND b.status IN ('uncertain','reviewed')) THEN 'uncertain' WHEN EXISTS(SELECT 1 FROM sub2api_enhance.quota_follow_subscription_batches b WHERE b.event_id=e.id AND b.status IN ('partial','failed')) THEN 'partial' ELSE 'completed' END,completed_at=clock_timestamp() WHERE e.trigger_type<>'legacy' AND e.status='pending' AND NOT EXISTS(SELECT 1 FROM sub2api_enhance.quota_follow_subscription_batches b WHERE b.event_id=e.id AND b.status IN ('pending','inflight'))`)
+	return err
+}
+
+// RecoverInflight 只收拢超过原版执行时限的未知调用；不能把租约到期当成允许再次清零。
+func (r *Repository) RecoverInflight(ctx context.Context) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_follow_subscription_batches SET status='uncertain',error_message='上次调用结果未持久确认，请只读核对；禁止换键重发',completed_at=clock_timestamp() WHERE status='inflight' AND started_at<clock_timestamp()-interval '3 minutes'`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_follow_subscription_items i SET status='uncertain',error_message=b.error_message FROM sub2api_enhance.quota_follow_subscription_batches b WHERE i.batch_id=b.id AND b.status='uncertain' AND i.status='inflight'`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE sub2api_enhance.quota_reset_records r SET status=i.status,error_message=i.error_message FROM sub2api_enhance.quota_follow_subscription_items i WHERE r.subscription_item_id=i.id AND r.status='inflight' AND i.status='uncertain'`); err != nil {
+		return err
+	}
+	if err = finishEvents(ctx, tx); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

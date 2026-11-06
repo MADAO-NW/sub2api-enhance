@@ -9,149 +9,121 @@ import (
 	"time"
 )
 
-func number(value string) *json.Number { v := json.Number(value); return &v }
-func TestBaselineAndPercentageDropDoNotReset(t *testing.T) {
-	now := time.Date(2026, 9, 7, 8, 0, 0, 0, time.UTC)
-	next := now.Add(time.Hour)
-	account := sub2api.QuotaAccount{ID: 7, Type: "oauth"}
-	baseline := observe(AccountState{}, account, sub2api.AccountUsage{Utilization: number("80"), ResetsAt: &next}, now, now.Add(-time.Hour), nil)
-	require.Nil(t, baseline.CandidateResetAt)
-	dropped := observe(baseline, account, sub2api.AccountUsage{Utilization: number("0.123456789"), ResetsAt: &next}, now.Add(time.Minute), now.Add(-time.Hour), nil)
+func number(v string) *json.Number { n := json.Number(v); return &n }
+func weeklyQuota(at, reset time.Time, percent string) sub2api.AccountQuota {
+	return sub2api.AccountQuota{FetchedAt: at.Unix(), Windows: &sub2api.QuotaWindows{Primary: &sub2api.QuotaWindow{UsedPercent: number(percent), Seconds: 604800, ResetAt: reset.Unix()}}}
+}
+func TestBaselineDropAndTimeAloneNeverReset(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	reset := now.Add(time.Hour)
+	a := sub2api.SubscriptionAccount{ID: 1, Type: "oauth"}
+	state := observe(AccountState{}, a, weeklyQuota(now, reset, "90"), nil, now, now)
+	require.Nil(t, state.CandidateResetAt)
+	dropped := observe(state, a, weeklyQuota(now.Add(time.Minute), reset, "0"), nil, now.Add(time.Minute), now)
 	require.True(t, dropped.SuspectedDrop)
 	require.Nil(t, dropped.CandidateResetAt)
-	require.Equal(t, "0.123456789", dropped.Utilization.String())
+	expired := observe(dropped, a, weeklyQuota(reset, reset, "0"), nil, reset, now)
+	require.Nil(t, expired.CandidateResetAt)
+	fresh := observe(expired, a, weeklyQuota(reset.Add(time.Second), reset.Add(weeklyPeriod), "3"), nil, reset.Add(time.Second), now)
+	require.Equal(t, reset, *fresh.CandidateResetAt)
 }
-func TestStrongResetRequiresPassedBoundaryAndForwardProgress(t *testing.T) {
-	boundary := time.Date(2026, 9, 7, 8, 0, 0, 0, time.UTC)
-	later := boundary.Add(7 * 24 * time.Hour)
-	a := sub2api.QuotaAccount{ID: 7}
-	previous := AccountState{Account: a, NextResetAt: &boundary, Utilization: number("90")}
+func TestStaggeredAccountsConsumeOneRoundWithoutBankingExtraResets(t *testing.T) {
+	now := time.Now().UTC()
+	a := now
+	b := now.Add(3 * 24 * time.Hour)
+	latestA := now.Add(2 * 24 * time.Hour)
+	states := []AccountState{{CandidateResetAt: &a, FetchedAt: &b}, {FetchedAt: &b}}
+	boundary, err := consensus(states)
+	require.NoError(t, err)
+	require.Nil(t, boundary)
+	states[0].CandidateResetAt = &latestA
+	states[1].CandidateResetAt = &b
+	boundary, err = consensus(states)
+	require.NoError(t, err)
+	require.Equal(t, b, *boundary)
+	consume(states)
+	boundary, err = consensus(states)
+	require.NoError(t, err)
+	require.Nil(t, boundary)
+	require.Equal(t, latestA, *states[0].ConsumedResetAt)
+	require.Nil(t, states[0].CandidateResetAt)
+	states[1].CandidateResetAt = timePointer(b.Add(weeklyPeriod))
+	boundary, err = consensus(states)
+	require.NoError(t, err)
+	require.Nil(t, boundary)
+}
+func TestBadEvidencePreservesTrustedStateAndBlocksGroup(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	reset := now.Add(time.Hour)
+	a := sub2api.SubscriptionAccount{ID: 1, Type: "oauth"}
+	old := observe(AccountState{}, a, weeklyQuota(now, reset, "85"), nil, now, now)
 	for _, test := range []struct {
-		name               string
-		now, enabled, next time.Time
-		last               *time.Time
-		expect             bool
-	}{{"到达并推进", boundary, boundary.Add(-time.Hour), later, nil, true}, {"尚未到达", boundary.Add(-time.Second), boundary.Add(-time.Hour), later, nil, false}, {"边界未推进", boundary, boundary.Add(-time.Hour), boundary, nil, false}, {"早于启用周期", boundary.Add(time.Hour), boundary.Add(time.Minute), later, nil, false}, {"已消费事件", boundary, boundary.Add(-time.Hour), later, &boundary, false}} {
+		name string
+		q    sub2api.AccountQuota
+		err  error
+	}{{"upstream error", weeklyQuota(now.Add(time.Minute), reset, "0"), errors.New("失败")}, {"old sample", weeklyQuota(now.Add(-time.Minute), reset, "0"), nil}, {"no windows", sub2api.AccountQuota{FetchedAt: now.Add(time.Minute).Unix()}, nil}, {"missing absolute reset", weeklyQuota(now.Add(time.Minute), time.Unix(0, 0), "0"), nil}} {
 		t.Run(test.name, func(t *testing.T) {
-			state := observe(previous, a, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &test.next}, test.now, test.enabled, test.last)
-			require.Equal(t, test.expect, state.CandidateResetAt != nil)
+			state := observe(old, a, test.q, test.err, now.Add(time.Minute), now)
+			require.NotEmpty(t, state.Error)
+			require.Equal(t, old.NextResetAt, state.NextResetAt)
+			require.Equal(t, "85", state.Utilization.String())
+			_, err := consensus([]AccountState{state})
+			require.Error(t, err)
 		})
 	}
 }
-func TestConsensusRequiresEveryAccountWithinFiveMinutes(t *testing.T) {
-	first := time.Now().UTC()
-	edge := first.Add(consensusTolerance)
-	tooLate := edge.Add(time.Nanosecond)
-	boundary, err := consensus([]AccountState{{CandidateResetAt: &first}, {CandidateResetAt: &edge}})
-	require.NoError(t, err)
-	require.Equal(t, edge, *boundary)
-	_, err = consensus([]AccountState{{CandidateResetAt: &first}, {CandidateResetAt: &tooLate}})
-	require.Error(t, err)
-	boundary, err = consensus([]AccountState{{CandidateResetAt: &first}, {}})
-	require.NoError(t, err)
-	require.Nil(t, boundary)
-	_, err = consensus([]AccountState{{CandidateResetAt: &first}, {CandidateResetAt: &edge, Error: "查询失败"}})
-	require.Error(t, err)
-}
-func TestConfigAndAccountChangesRebuildOnlyRequiredBaselines(t *testing.T) {
-	original := DefaultConfig().Config
-	group := int64(7)
-	original.GroupID = &group
-	original.Enabled = true
-	next := original
-	next.MinInterval = 11
-	require.False(t, newEpochRequired(original, next))
-	next.ObserveOnly = false
-	require.True(t, newEpochRequired(original, next))
-	accounts := []sub2api.QuotaAccount{{ID: 1, Type: "oauth"}, {ID: 2, Type: "oauth"}}
-	require.Equal(t, accountSetHash(accounts), accountSetHash([]sub2api.QuotaAccount{accounts[1], accounts[0]}))
-	changed := append([]sub2api.QuotaAccount{}, accounts...)
-	changed[1].Type = "api_key"
-	require.NotEqual(t, accountSetHash(accounts), accountSetHash(changed))
-	require.False(t, DefaultConfig().Enabled)
-	require.True(t, DefaultConfig().ObserveOnly)
-}
-func TestDeliveryClassificationNeverTreatsUncertainResultAsRetryable(t *testing.T) {
-	for _, test := range []struct {
-		status   int
-		err      error
-		expected string
-	}{{200, nil, "succeeded"}, {200, errors.New("incomplete body"), "uncertain"}, {404, errors.New("missing"), "skipped"}, {403, errors.New("forbidden"), "failed"}, {500, errors.New("server error"), "uncertain"}, {0, errors.New("timeout"), "uncertain"}} {
-		require.Equal(t, test.expected, deliveryStatus(sub2api.QuotaResetReply{HTTPStatus: test.status, Error: test.err}))
-	}
-}
-func TestNaturalBoundaryUsesOriginalTimezoneAndMonday(t *testing.T) {
-	location, err := time.LoadLocation("Asia/Shanghai")
-	require.NoError(t, err)
-	observed := time.Date(2026, 9, 9, 10, 0, 0, 0, location)
-	monday := time.Date(2026, 9, 7, 0, 0, 0, 0, location)
-	require.True(t, naturalBoundary(monday, observed, "weekly", location))
-	require.False(t, naturalBoundary(monday.Add(time.Hour), observed, "weekly", location))
-	require.False(t, naturalBoundary(monday, observed, "weekly", nil))
-}
-
-func TestRegressedResetBoundaryRebuildsBaselineBeforeNextStableObservation(t *testing.T) {
-	now := time.Date(2026, 9, 7, 8, 0, 0, 0, time.UTC)
-	known := now.Add(time.Hour)
-	regressed := now.Add(time.Minute)
-	account := sub2api.QuotaAccount{ID: 7}
-	state := observe(AccountState{NextResetAt: &known}, account, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &regressed}, now, now.Add(-time.Hour), nil)
-	require.Empty(t, state.Error)
-	require.Equal(t, regressed, *state.NextResetAt)
-	require.True(t, state.BaselineRebased)
-	require.Nil(t, state.CandidateResetAt)
-
-	stable := observe(state, account, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &regressed}, now.Add(time.Minute), now.Add(-time.Hour), nil)
-	require.Empty(t, stable.Error)
+func TestRegressedBoundaryRequiresStableNewBaseline(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	oldReset := now.Add(time.Hour)
+	earlier := now.Add(time.Minute)
+	a := sub2api.SubscriptionAccount{ID: 1, Type: "oauth"}
+	old := observe(AccountState{}, a, weeklyQuota(now, oldReset, "20"), nil, now, now)
+	regressed := observe(old, a, weeklyQuota(now.Add(time.Second), earlier, "20"), nil, now.Add(time.Second), now)
+	require.True(t, regressed.BaselineRebased)
+	stable := observe(regressed, a, weeklyQuota(now.Add(2*time.Second), earlier, "20"), nil, now.Add(2*time.Second), now)
 	require.False(t, stable.BaselineRebased)
 	require.Nil(t, stable.CandidateResetAt)
 }
-
-func TestRegressedPastBoundaryDoesNotCreateCandidateWhenBaselineRecovers(t *testing.T) {
-	now := time.Date(2026, 9, 7, 8, 0, 0, 0, time.UTC)
-	known := now.Add(-time.Hour)
-	regressed := now.Add(-2 * time.Hour)
-	account := sub2api.QuotaAccount{ID: 7}
-	rebased := observe(AccountState{NextResetAt: &known}, account, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &regressed}, now, now.Add(-3*time.Hour), nil)
-	require.True(t, rebased.BaselineRebased)
-
-	pastStable := observe(rebased, account, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &regressed}, now.Add(time.Minute), now.Add(-3*time.Hour), nil)
-	require.True(t, pastStable.BaselineRebased)
-
-	stableBoundary := now.Add(time.Hour)
-	stable := observe(pastStable, account, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &stableBoundary}, now.Add(2*time.Minute), now.Add(-3*time.Hour), nil)
-	require.False(t, stable.BaselineRebased)
-	require.Nil(t, stable.CandidateResetAt)
-
-	later := stableBoundary.Add(7 * 24 * time.Hour)
-	next := observe(stable, account, sub2api.AccountUsage{Utilization: number("0"), ResetsAt: &later}, stableBoundary.Add(time.Minute), now.Add(-3*time.Hour), nil)
-	require.Equal(t, stableBoundary, *next.CandidateResetAt)
+func TestShadowUsesFeatureWindowAndMissingFeatureIsNotZero(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	a := sub2api.SubscriptionAccount{ID: 2, Type: "oauth", IsShadow: true}
+	q := weeklyQuota(now, now.Add(time.Hour), "80")
+	bad := observe(AccountState{}, a, q, nil, now, now)
+	require.NotEmpty(t, bad.Error)
+	require.Nil(t, bad.Utilization)
+	require.NoError(t, json.Unmarshal([]byte(`{"rate_limit":{"primary_window":{"used_percent":80,"limit_window_seconds":604800,"reset_at":`+jsonNumber(now.Add(time.Hour).Unix())+`}},"additional_rate_limits":[{"metered_feature":"codex_bengalfox","rate_limit":{"secondary_window":{"used_percent":12,"limit_window_seconds":604800,"reset_at":`+jsonNumber(now.Add(time.Hour).Unix())+`}}}],"fetched_at":`+jsonNumber(now.Unix())+`}`), &q))
+	good := observe(AccountState{}, a, q, nil, now, now)
+	require.Empty(t, good.Error)
+	require.Equal(t, "12", good.Utilization.String())
+}
+func jsonNumber(v int64) string { raw, _ := json.Marshal(v); return string(raw) }
+func TestChangingOneRuleDoesNotRebuildAnotherGroup(t *testing.T) {
+	a := GroupRule{GroupID: 1, Enabled: true, ResetWeekly: true}
+	b := a
+	require.False(t, newEpochRequired(a, b))
+	b.ResetDaily = true
+	require.True(t, newEpochRequired(a, b))
+	cfg := DefaultConfig()
+	cfg.Groups = []GroupRule{a, a}
+	require.Error(t, cfg.Validate())
+	cfg.Groups[1].GroupID = 2
+	require.NoError(t, cfg.Validate())
+}
+func TestNextDetectionChecksBoundaryAndBacksOffFailures(t *testing.T) {
+	now := time.Now()
+	cfg := DefaultConfig().Config
+	boundary := now.Add(time.Minute)
+	next := nextDetection(now, cfg, []AccountState{{NextResetAt: &boundary}}, false)
+	require.Equal(t, boundary.Add(time.Second), next)
+	require.Equal(t, now.Add(15*time.Minute), nextDetection(now, cfg, nil, true))
 }
 
-func TestAccountResetAuditSignalCreatesCandidateWithoutWindowAdvance(t *testing.T) {
-	now := time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC)
-	previousBoundary := now.Add(24 * time.Hour)
-	signal := now.Add(-time.Minute)
-	state := applyAccountResetSignal(AccountState{NextResetAt: &previousBoundary, Utilization: number("0")}, signal, now.Add(-time.Hour), nil)
-	require.Empty(t, state.Error)
-	require.Equal(t, signal, *state.CandidateResetAt)
-
-	consumed := applyAccountResetSignal(state, signal, now.Add(-time.Hour), &signal)
-	require.Nil(t, consumed.CandidateResetAt)
-}
-
-func TestAccountResetAuditSignalDoesNotReplaceNewerCandidate(t *testing.T) {
-	enabled := time.Date(2026, 9, 11, 13, 40, 0, 0, time.UTC)
-	older := enabled.Add(2 * time.Hour)
-	newer := older.Add(24 * time.Hour)
-	state := applyAccountResetSignal(AccountState{CandidateResetAt: &newer}, older, enabled, nil)
-	require.Equal(t, newer, *state.CandidateResetAt)
-}
-
-func TestConsumedAuditSignalDoesNotClearNewerCandidate(t *testing.T) {
-	enabled := time.Date(2026, 9, 11, 13, 40, 0, 0, time.UTC)
-	lastEvent := enabled.Add(2 * time.Hour)
-	newer := lastEvent.Add(24 * time.Hour)
-	state := applyAccountResetSignal(AccountState{CandidateResetAt: &newer}, lastEvent, enabled, &lastEvent)
-	require.Equal(t, newer, *state.CandidateResetAt)
+func TestConfigRequiresAnArrayButAllowsNoGroupsWhenDisabled(t *testing.T) {
+	cfg := DefaultConfig().Config
+	require.NoError(t, cfg.Validate())
+	cfg.Groups = nil
+	require.ErrorContains(t, cfg.Validate(), "数组")
+	cfg.Groups = []GroupRule{}
+	cfg.Enabled = true
+	require.ErrorContains(t, cfg.Validate(), "添加一个分组")
 }

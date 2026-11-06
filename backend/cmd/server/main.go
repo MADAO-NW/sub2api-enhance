@@ -122,23 +122,7 @@ func run(info systemupdate.BuildInfo) error {
 	defer quotaLocks.Close()
 	quotaLocks.SetMaxOpenConns(3)
 	quotaRepo := quotafollow.NewRepository(db)
-	cache, cacheErr := quotafollow.NewRedisCache(cfg.QuotaRedisURL)
-	if cacheErr != nil {
-		log.Printf("额度 Redis 初始化失败：%v", cacheErr)
-	}
-	var cacheReader quotafollow.CacheReader
-	if cache != nil {
-		cacheReader = cache
-		defer cache.Close()
-	}
-	var quotaLocation *time.Location
-	if cfg.QuotaTimezone != "" {
-		quotaLocation, err = time.LoadLocation(cfg.QuotaTimezone)
-		if err != nil {
-			log.Printf("额度原版时区无效，自然窗口暂不归因")
-		}
-	}
-	quotaService := quotafollow.NewService(quotaRepo, sub2api.NewQuotaData(db), client, cacheReader, quotaLocation, quotaLocks, cfg.QuotaFlusherEnabled)
+	quotaService := quotafollow.NewService(quotaRepo, sub2api.NewQuotaData(db), client, quotaLocks)
 	quotaHandler := quotafollow.NewHandler(quotaService, quotaRepo)
 	executable, err := os.Executable()
 	if err != nil {

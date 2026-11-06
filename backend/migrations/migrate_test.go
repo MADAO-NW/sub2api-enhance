@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/require"
+	"regexp"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -188,4 +189,38 @@ func TestBatchMigrationUsesNullableTargetColumnsAndAtomicStatuses(t *testing.T) 
 	require.NotContains(t, sql, "PRIMARY KEY (batch_id, capture_id, job_id)")
 	require.NotContains(t, strings.ToUpper(sql), "DROP TABLE")
 	require.NotContains(t, strings.ToUpper(sql), "DELETE FROM")
+}
+
+// 两条部署路径都通过实际迁移执行器校验顺序、校验和和事务边界；SQLmock 不替代真实 PostgreSQL DDL 验收。
+func TestSubscriptionFollowMigrationFreshAndUpgradePaths(t *testing.T) {
+	for _, upgrade := range []bool{false, true} {
+		t.Run(fmt.Sprintf("upgrade=%v", upgrade), func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			defer db.Close()
+			db.SetMaxOpenConns(1)
+			mock.ExpectQuery("SELECT pg_try_advisory_lock").WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(true))
+			mock.ExpectExec("CREATE SCHEMA").WillReturnResult(sqlmock.NewResult(0, 0))
+			entries, err := files.ReadDir(".")
+			require.NoError(t, err)
+			for _, entry := range entries {
+				raw, err := files.ReadFile(entry.Name())
+				require.NoError(t, err)
+				sql := strings.TrimSpace(string(raw))
+				checksum := fmt.Sprintf("%x", sha256.Sum256([]byte(sql)))
+				if upgrade && entry.Name() != "013_subscription_quota_follow.sql" {
+					mock.ExpectQuery("SELECT checksum").WithArgs(entry.Name()).WillReturnRows(sqlmock.NewRows([]string{"checksum"}).AddRow(checksum))
+					continue
+				}
+				mock.ExpectQuery("SELECT checksum").WithArgs(entry.Name()).WillReturnRows(sqlmock.NewRows([]string{"checksum"}))
+				mock.ExpectBegin()
+				mock.ExpectExec(regexp.QuoteMeta(sql)).WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectExec("INSERT INTO .*schema_migrations").WithArgs(entry.Name(), checksum).WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectCommit()
+			}
+			mock.ExpectQuery("SELECT pg_advisory_unlock").WillReturnRows(sqlmock.NewRows([]string{"released"}).AddRow(true))
+			require.NoError(t, Run(context.Background(), db))
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
 }

@@ -11,28 +11,35 @@ import (
 	"time"
 )
 
-// consensusTolerance 是已确认的多账号重置边界最大差值。
-const consensusTolerance = 5 * time.Minute
-
-// settingKey 将额度配置与审计配置分离。
+// settingKey 延用既有额度配置入口，迁移负责单分组到多分组的转换。
 const settingKey = "quota_follow_config"
 
+// weeklyPeriod 是上游周窗口的已知时长，不将短窗口当作日窗口。
+const weeklyPeriod = 7 * 24 * time.Hour
+
+// quotaSampleClockTolerance 覆盖管理 API 查询耗时及秒级时钟误差，过旧或明显超前的采样不能作证据。
+const quotaSampleClockTolerance = time.Minute
+
+type GroupRule struct {
+	GroupID     int64      `json:"group_id"`
+	Enabled     bool       `json:"enabled"`
+	ObserveOnly bool       `json:"observe_only"`
+	ResetDaily  bool       `json:"reset_daily_enabled"`
+	ResetWeekly bool       `json:"reset_weekly_enabled"`
+	Epoch       string     `json:"epoch"`
+	EnabledAt   *time.Time `json:"enabled_at"`
+}
 type Config struct {
-	Enabled     bool   `json:"enabled"`
-	GroupID     *int64 `json:"group_id"`
-	ResetWeekly bool   `json:"reset_weekly_enabled"`
-	ResetDaily  bool   `json:"reset_daily_enabled"`
-	MinInterval int    `json:"min_interval_minutes"`
-	MaxInterval int    `json:"max_interval_minutes"`
-	ObserveOnly bool   `json:"observe_only"`
+	Enabled     bool        `json:"enabled"`
+	MinInterval int         `json:"min_interval_minutes"`
+	MaxInterval int         `json:"max_interval_minutes"`
+	Groups      []GroupRule `json:"groups"`
 }
 type SavedConfig struct {
 	Config
-	Revision  int64      `json:"revision"`
-	Epoch     string     `json:"epoch"`
-	EnabledAt *time.Time `json:"enabled_at"`
-	UpdatedBy int64      `json:"updated_by"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	Revision  int64     `json:"revision"`
+	UpdatedBy int64     `json:"updated_by"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 type ConfigUpdate struct {
 	ExpectedRevision int64  `json:"expected_revision" binding:"required,min=1"`
@@ -40,100 +47,74 @@ type ConfigUpdate struct {
 }
 
 func DefaultConfig() SavedConfig {
-	return SavedConfig{Config: Config{ResetWeekly: true, MinInterval: 10, MaxInterval: 15, ObserveOnly: true}, Revision: 1}
+	return SavedConfig{Config: Config{MinInterval: 10, MaxInterval: 15, Groups: []GroupRule{}}, Revision: 1}
 }
 func (c Config) Validate() error {
-	if c.GroupID != nil && *c.GroupID <= 0 {
-		return errors.New("目标分组 ID 必须大于 0")
-	}
-	if c.Enabled && c.GroupID == nil {
-		return errors.New("启用前必须选择目标分组")
+	if c.Groups == nil {
+		return errors.New("分组规则必须提供数组，可为空")
 	}
 	if c.MinInterval <= 0 || c.MaxInterval < c.MinInterval || int64(c.MaxInterval) > int64((1<<63-1)/time.Minute) {
 		return errors.New("检测间隔必须为有效正分钟数，且上限不小于下限")
 	}
+	seen := map[int64]bool{}
+	for _, g := range c.Groups {
+		if g.GroupID <= 0 || seen[g.GroupID] {
+			return errors.New("分组 ID 必须有效且不能重复")
+		}
+		seen[g.GroupID] = true
+		if g.Enabled && !g.ResetDaily && !g.ResetWeekly {
+			return errors.New("启用分组前至少选择一个订阅重置窗口")
+		}
+	}
+	if c.Enabled && len(c.Groups) == 0 {
+		return errors.New("启用前至少添加一个分组")
+	}
 	return nil
 }
-func newEpochRequired(a, b Config) bool {
-	return (!a.Enabled && b.Enabled) || !sameID(a.GroupID, b.GroupID) || a.ResetDaily != b.ResetDaily || a.ResetWeekly != b.ResetWeekly || a.ObserveOnly != b.ObserveOnly
+func (c Config) Group(id int64) (GroupRule, bool) {
+	for _, g := range c.Groups {
+		if g.GroupID == id {
+			return g, true
+		}
+	}
+	return GroupRule{}, false
 }
-func sameID(a, b *int64) bool { return (a == nil && b == nil) || (a != nil && b != nil && *a == *b) }
+func newEpochRequired(a, b GroupRule) bool {
+	return a.GroupID != b.GroupID || a.Enabled != b.Enabled || a.ObserveOnly != b.ObserveOnly || a.ResetDaily != b.ResetDaily || a.ResetWeekly != b.ResetWeekly
+}
 
 type AccountState struct {
-	Account           sub2api.QuotaAccount `json:"account"`
-	Utilization       *json.Number         `json:"utilization"`
-	NextResetAt       *time.Time           `json:"next_reset_at"`
-	CandidateResetAt  *time.Time           `json:"candidate_reset_at"`
-	BaselineRebased   bool                 `json:"baseline_rebased"`
-	ObservedAt        *time.Time           `json:"observed_at"`
-	UpstreamUpdatedAt *time.Time           `json:"upstream_updated_at"`
-	SuspectedDrop     bool                 `json:"suspected_drop"`
-	Error             string               `json:"error"`
+	Account            sub2api.SubscriptionAccount `json:"account"`
+	Utilization        *json.Number                `json:"utilization"`
+	NextResetAt        *time.Time                  `json:"next_reset_at"`
+	CandidateResetAt   *time.Time                  `json:"candidate_reset_at"`
+	ConsumedResetAt    *time.Time                  `json:"consumed_reset_at"`
+	BaselineRebased    bool                        `json:"baseline_rebased"`
+	ObservedAt         *time.Time                  `json:"observed_at"`
+	FetchedAt          *time.Time                  `json:"fetched_at"`
+	ConsumedObservedAt *time.Time                  `json:"consumed_observed_at"`
+	LastAuditID        int64                       `json:"last_audit_id"`
+	SuspectedDrop      bool                        `json:"suspected_drop"`
+	Error              string                      `json:"error"`
 }
 type Runtime struct {
-	CarryoverError   string                 `json:"carryover_error"`
-	Epoch            string                 `json:"epoch"`
-	AccountSetHash   string                 `json:"account_set_hash"`
-	Accounts         []sub2api.QuotaAccount `json:"accounts"`
-	States           []AccountState         `json:"account_states"`
-	LastEventAt      *time.Time             `json:"last_event_at"`
-	LastCheckedAt    *time.Time             `json:"last_checked_at"`
-	NextCheckAt      *time.Time             `json:"next_check_at"`
-	LastError        string                 `json:"last_error"`
-	PausedRevision   *int64                 `json:"paused_revision"`
-	RedisStatus      string                 `json:"redis_status"`
-	CollectorError   string                 `json:"collector_error"`
-	OriginalTimezone string                 `json:"original_timezone"`
-}
-type Delivery struct {
-	CacheBefore    map[string]string      `json:"before_cache_snapshot"`
-	ID             int64                  `json:"id"`
-	EventID        int64                  `json:"event_id"`
-	UserID         int64                  `json:"user_id"`
-	Window         string                 `json:"window"`
-	RequestID      string                 `json:"request_id"`
-	Status         string                 `json:"status"`
-	Epoch          string                 `json:"epoch"`
-	Config         SavedConfig            `json:"config_snapshot"`
-	Before         *sub2api.QuotaSnapshot `json:"before_snapshot"`
-	After          *sub2api.QuotaSnapshot `json:"after_snapshot"`
-	Cache          map[string]string      `json:"cache_snapshot"`
-	DatabaseStatus string                 `json:"database_status"`
-	CacheStatus    string                 `json:"cache_status"`
-	HTTPStatus     *int                   `json:"http_status"`
-	Response       string                 `json:"response_body"`
-	Error          string                 `json:"error_message"`
-	StartedAt      *time.Time             `json:"started_at"`
-	CompletedAt    *time.Time             `json:"completed_at"`
-	AuditLogID     *int64                 `json:"audit_log_id"`
-}
-type Record struct {
-	ActionType   string                 `json:"action_type"`
-	BeforeUsage  *string                `json:"before_usage_usd"`
-	AfterUsage   *string                `json:"after_usage_usd"`
-	Accounts     []sub2api.QuotaAccount `json:"accounts"`
-	ID           int64                  `json:"id"`
-	Source       string                 `json:"source"`
-	SourceDetail string                 `json:"source_detail"`
-	EvidenceType string                 `json:"evidence_type"`
-	UserID       int64                  `json:"user_id"`
-	Username     string                 `json:"username"`
-	Window       *string                `json:"window"`
-	OccurredAt   time.Time              `json:"occurred_at"`
-	DetectedAt   time.Time              `json:"detected_at"`
-	Status       string                 `json:"status"`
-	Before       json.RawMessage        `json:"before_snapshot"`
-	After        json.RawMessage        `json:"after_snapshot"`
-	Evidence     json.RawMessage        `json:"evidence"`
-	EventID      *int64                 `json:"event_id"`
-	DeliveryID   *int64                 `json:"delivery_id"`
-	AuditLogID   *int64                 `json:"audit_log_id"`
-	RequestID    string                 `json:"request_id"`
-	Error        string                 `json:"error_message"`
+	GroupID           int64          `json:"group_id"`
+	GroupName         string         `json:"group_name"`
+	Epoch             string         `json:"epoch"`
+	AccountSetHash    string         `json:"account_set_hash"`
+	States            []AccountState `json:"account_states"`
+	SubscriptionCount int            `json:"subscription_count"`
+	LastEventAt       *time.Time     `json:"last_event_at"`
+	LastCheckedAt     *time.Time     `json:"last_checked_at"`
+	NextCheckAt       *time.Time     `json:"next_check_at"`
+	LastError         string         `json:"last_error"`
+	PausedRevision    *int64         `json:"paused_revision"`
+	BaselineAt        *time.Time     `json:"baseline_at"`
 }
 type Filter struct {
 	From, To                                *time.Time
 	Source, Detail, Window, Status, Keyword string
+	GroupID                                 *int64
 	Page, PageSize                          int
 }
 type Page[T any] struct {
@@ -142,112 +123,150 @@ type Page[T any] struct {
 	Page     int   `json:"page"`
 	PageSize int   `json:"page_size"`
 }
+type Batch struct {
+	ID             int64       `json:"id"`
+	EventID        int64       `json:"event_id"`
+	GroupID        int64       `json:"group_id"`
+	RequestID      string      `json:"request_id"`
+	Body           string      `json:"request_body"`
+	Status         string      `json:"status"`
+	Response       string      `json:"response_body"`
+	Error          string      `json:"error_message"`
+	HTTPStatus     *int        `json:"http_status"`
+	StartedAt      *time.Time  `json:"started_at"`
+	CompletedAt    *time.Time  `json:"completed_at"`
+	Rule           GroupRule   `json:"config_snapshot"`
+	AccountSetHash string      `json:"account_set_hash"`
+	Trigger        string      `json:"trigger_type"`
+	Items          []BatchItem `json:"items"`
+}
+type BatchItem struct {
+	ID             int64                         `json:"id"`
+	SubscriptionID int64                         `json:"subscription_id"`
+	UserID         int64                         `json:"user_id"`
+	GroupID        int64                         `json:"group_id"`
+	Username       string                        `json:"username"`
+	Status         string                        `json:"status"`
+	Error          string                        `json:"error_message"`
+	Before         *sub2api.SubscriptionSnapshot `json:"before_snapshot"`
+	After          *sub2api.SubscriptionSnapshot `json:"after_snapshot"`
+}
 
-func accountSetHash(accounts []sub2api.QuotaAccount) string {
-	identities := make([]struct {
-		ID   int64
-		Type string
-	}, 0, len(accounts))
-	for _, a := range accounts {
-		identities = append(identities, struct {
-			ID   int64
-			Type string
-		}{a.ID, a.Type})
-	}
+func accountSetHash(accounts []sub2api.SubscriptionAccount) string {
+	identities := append([]sub2api.SubscriptionAccount{}, accounts...)
 	sort.Slice(identities, func(i, j int) bool { return identities[i].ID < identities[j].ID })
+	for i := range identities {
+		identities[i].Name = ""
+	}
 	raw, _ := json.Marshal(identities)
 	hash := sha256.Sum256(raw)
 	return hex.EncodeToString(hash[:])
 }
-func observe(previous AccountState, account sub2api.QuotaAccount, usage sub2api.AccountUsage, now time.Time, enabledAt time.Time, lastEvent *time.Time) AccountState {
+
+// observe 仅接受本轮真实配额采样；自然重置要求旧边界已跨过且新窗口确实进入未来。
+func observe(previous AccountState, account sub2api.SubscriptionAccount, quota sub2api.AccountQuota, queryErr error, now, baseline time.Time) AccountState {
 	next := previous
 	next.Account = account
-	next.Error = usage.Error
+	next.Error = ""
 	next.SuspectedDrop = false
-	if usage.Error != "" {
+	if queryErr != nil {
+		next.Error = queryErr.Error()
 		return next
 	}
-	if usage.ResetsAt == nil || usage.ResetsAt.IsZero() || usage.Utilization == nil {
-		next.Error = "账号缺少有效 seven_day 窗口"
+	if account.Type != "oauth" {
+		next.Error = "该账号类型不支持官方周窗口查询"
 		return next
 	}
-	value, ok := new(big.Rat).SetString(usage.Utilization.String())
+	windows := quota.Windows
+	if account.IsShadow {
+		windows = nil
+		for _, v := range quota.Additional {
+			if v.Feature == "codex_bengalfox" {
+				windows = v.Windows
+				break
+			}
+		}
+	}
+	if windows == nil {
+		next.Error = "账号缺少对应的官方配额窗口"
+		return next
+	}
+	var weekly *sub2api.QuotaWindow
+	for _, w := range []*sub2api.QuotaWindow{windows.Primary, windows.Secondary} {
+		if w != nil && w.Seconds == int64(weeklyPeriod/time.Second) {
+			if weekly != nil {
+				next.Error = "账号返回多个周窗口，不能确定监控目标"
+				return next
+			}
+			weekly = w
+		}
+	}
+	if weekly == nil || weekly.UsedPercent == nil || weekly.ResetAt <= 0 || quota.FetchedAt <= 0 {
+		next.Error = "账号缺少完整周窗口或绝对重置时间"
+		return next
+	}
+	value, ok := new(big.Rat).SetString(weekly.UsedPercent.String())
 	if !ok || value.Sign() < 0 {
-		next.Error = "账号利用率格式无效"
+		next.Error = "账号周利用率无效"
 		return next
 	}
-	if previous.UpstreamUpdatedAt != nil && usage.UpdatedAt != nil && usage.UpdatedAt.Before(*previous.UpstreamUpdatedAt) {
-		next.Error = "账号用量快照早于上次观测来源"
+	sampled := time.Unix(quota.FetchedAt, 0).UTC()
+	boundary := time.Unix(weekly.ResetAt, 0).UTC()
+	if sampled.After(now.Add(quotaSampleClockTolerance)) || now.Sub(sampled) > quotaSampleClockTolerance || (previous.FetchedAt != nil && !sampled.After(*previous.FetchedAt)) {
+		next.Error = "账号采样时间无效或没有更新"
 		return next
 	}
 	if previous.Utilization != nil {
-		if before, ok := new(big.Rat).SetString(previous.Utilization.String()); ok && value.Cmp(before) < 0 {
+		if old, ok := new(big.Rat).SetString(previous.Utilization.String()); ok && value.Cmp(old) < 0 {
 			next.SuspectedDrop = true
 		}
 	}
 	if previous.NextResetAt != nil {
-		if usage.ResetsAt.Before(*previous.NextResetAt) {
-			// 上游窗口可能因账号窗口修正而提前，接受新边界但要求下一次稳定观测后再确认重置。
-			next.NextResetAt = usage.ResetsAt
+		if boundary.Before(*previous.NextResetAt) {
 			next.CandidateResetAt = nil
 			next.BaselineRebased = true
 		} else if previous.BaselineRebased {
 			next.CandidateResetAt = nil
-			// 回退到过去的边界时，必须等到新的边界重新落在未来，避免回升被误判为重置。
-			next.BaselineRebased = usage.ResetsAt.Before(now)
-		} else if !now.Before(*previous.NextResetAt) && usage.ResetsAt.After(*previous.NextResetAt) && !previous.NextResetAt.Before(enabledAt) && (lastEvent == nil || previous.NextResetAt.After(*lastEvent)) {
-			boundary := *previous.NextResetAt
-			next.CandidateResetAt = &boundary
+			next.BaselineRebased = !boundary.After(sampled)
+		} else if !sampled.Before(*previous.NextResetAt) && boundary.After(sampled) && boundary.Sub(*previous.NextResetAt) > weeklyPeriod/2 && !previous.NextResetAt.Before(baseline) {
+			// 忽略秒级边界抖动；跨越多个周窗口仅记最新一轮，不补发停机期间额度。
+			reset := *previous.NextResetAt
+			if boundary.Sub(reset) > weeklyPeriod {
+				reset = boundary.Add(-weeklyPeriod)
+			}
+			if previous.ConsumedResetAt == nil || reset.After(*previous.ConsumedResetAt) {
+				next.CandidateResetAt = &reset
+			}
 		}
 	}
-	next.Utilization = usage.Utilization
-	next.NextResetAt = usage.ResetsAt
+	next.Utilization = weekly.UsedPercent
+	next.NextResetAt = &boundary
+	next.FetchedAt = &sampled
 	next.ObservedAt = &now
-	next.UpstreamUpdatedAt = usage.UpdatedAt
 	return next
 }
-
-// applyAccountResetSignal 将原版重置卡成功审计转换为一次账号强确认候选。
-func applyAccountResetSignal(previous AccountState, signal time.Time, enabledAt time.Time, lastEvent *time.Time) AccountState {
-	next := previous
-	if lastEvent != nil && !signal.After(*lastEvent) {
-		if next.CandidateResetAt == nil || !next.CandidateResetAt.After(*lastEvent) {
-			next.CandidateResetAt = nil
-		}
-		return next
-	}
-	if !signal.After(enabledAt) || next.Error != "" {
-		return next
-	}
-	if next.CandidateResetAt != nil && !signal.After(*next.CandidateResetAt) {
-		return next
-	}
-	next.CandidateResetAt = &signal
-	next.BaselineRebased = false
-	return next
-}
-
 func consensus(states []AccountState) (*time.Time, error) {
 	if len(states) == 0 {
 		return nil, errors.New("分组内没有有效 OpenAI 账号")
 	}
-	var first, last time.Time
+	var last time.Time
 	for _, s := range states {
-		if s.Error != "" {
-			return nil, errors.New("部分账号用量不可用，本轮不形成一致事件")
+		if s.Error != "" || s.BaselineRebased {
+			return nil, errors.New("部分账号证据不可用，等待本组全部账号确认")
 		}
-		if s.CandidateResetAt == nil {
+		if s.CandidateResetAt == nil || (s.ConsumedResetAt != nil && !s.CandidateResetAt.After(*s.ConsumedResetAt)) {
 			return nil, nil
 		}
-		if first.IsZero() || s.CandidateResetAt.Before(first) {
-			first = *s.CandidateResetAt
-		}
-		if last.IsZero() || s.CandidateResetAt.After(last) {
+		if s.CandidateResetAt.After(last) {
 			last = *s.CandidateResetAt
 		}
 	}
-	if last.Sub(first) > consensusTolerance {
-		return nil, errors.New("账号重置边界差值超过五分钟")
-	}
 	return &last, nil
+}
+func consume(states []AccountState) {
+	for i := range states {
+		states[i].ConsumedResetAt = states[i].CandidateResetAt
+		states[i].ConsumedObservedAt = states[i].FetchedAt
+		states[i].CandidateResetAt = nil
+	}
 }

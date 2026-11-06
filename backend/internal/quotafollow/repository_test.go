@@ -10,90 +10,118 @@ import (
 	"time"
 )
 
-func TestObservationModeStoresEventWithoutCreatingDeliveries(t *testing.T) {
+func TestObservationModeConsumesGroupRoundWithoutCreatingDeliveries(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
 	cfg := DefaultConfig()
-	cfg.Epoch = "epoch"
 	cfg.Enabled = true
-	configRaw, _ := json.Marshal(cfg)
+	g := GroupRule{GroupID: 7, Enabled: true, ObserveOnly: true, ResetWeekly: true, Epoch: "epoch"}
+	cfg.Groups = []GroupRule{g}
+	raw, _ := json.Marshal(cfg)
 	boundary := time.Now().UTC()
-	states := []AccountState{{Account: sub2api.QuotaAccount{ID: 7}, CandidateResetAt: &boundary}}
+	previous := Runtime{GroupID: 7}
+	previousRaw, _ := json.Marshal(previous)
+	next := Runtime{GroupID: 7, Epoch: g.Epoch, LastCheckedAt: &boundary, States: []AccountState{{CandidateResetAt: &boundary, FetchedAt: &boundary}}}
 	mock.ExpectBegin()
-	mock.ExpectQuery("SELECT value .* FOR SHARE").WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(string(configRaw)))
-	mock.ExpectQuery("SELECT last_checked_at .* FOR UPDATE").WillReturnRows(sqlmock.NewRows([]string{"last_checked_at"}).AddRow(nil))
-	mock.ExpectExec("INSERT INTO sub2api_enhance.quota_follow_runtime").WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO sub2api_enhance.quota_follow_account_states").WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectQuery("INSERT INTO sub2api_enhance.quota_follow_reset_events").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
+	mock.ExpectQuery("SELECT value .* FOR SHARE").WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(raw))
+	mock.ExpectExec("INSERT INTO .*quota_follow_group_runtime").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT snapshot .* FOR UPDATE").WillReturnRows(sqlmock.NewRows([]string{"snapshot"}).AddRow(previousRaw))
+	mock.ExpectQuery("INSERT INTO .*quota_follow_reset_events").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
+	mock.ExpectExec("UPDATE .*quota_follow_group_runtime").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
-	require.NoError(t, NewRepository(db).SaveObservation(context.Background(), cfg, sub2api.QuotaDiscovery{Accounts: []sub2api.QuotaAccount{{ID: 7}}, Users: []sub2api.QuotaUser{{ID: 9}}}, "hash", states, &boundary, boundary.Add(time.Hour), "", boundary, nil))
+	require.NoError(t, NewRepository(db).SaveObservation(context.Background(), cfg, g, sub2api.SubscriptionDiscovery{Subscriptions: []sub2api.SubscriptionSnapshot{{ID: 9}}}, next, previous, &boundary))
+	require.Nil(t, next.States[0].CandidateResetAt)
+	require.Equal(t, boundary, *next.States[0].ConsumedResetAt)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
-
-func TestAccountResetSignalsReadsLatestSuccessfulAuditPerAccount(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	require.NoError(t, err)
-	defer db.Close()
-	since := time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC)
-	occurred := since.Add(time.Minute)
-	mock.ExpectQuery("SELECT DISTINCT ON .*openai/accounts/:id/reset-quota.*created_at > \\$1").WillReturnRows(sqlmock.NewRows([]string{"account_id", "created_at"}).AddRow(int64(7), occurred))
-	signals, err := NewRepository(db).AccountResetSignals(context.Background(), []int64{7, 8}, since)
-	require.NoError(t, err)
-	require.Equal(t, occurred, signals[7])
-	_, ok := signals[8]
-	require.False(t, ok)
-	require.NoError(t, mock.ExpectationsWereMet())
-}
-
-func TestScheduleDoesNotAdvanceSuccessfulCheckWatermark(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	require.NoError(t, err)
-	defer db.Close()
-	next := time.Date(2026, 9, 13, 7, 0, 0, 0, time.UTC)
-	mock.ExpectExec("INSERT INTO sub2api_enhance.quota_follow_runtime\\(singleton,next_check_at,last_error,paused_revision\\)").WithArgs(next, "检测失败", nil).WillReturnResult(sqlmock.NewResult(0, 1))
-	require.NoError(t, NewRepository(db).Schedule(context.Background(), next, "检测失败", nil))
-	require.NoError(t, mock.ExpectationsWereMet())
-}
-
-func TestRecordFilterPreservesAllCallerConditions(t *testing.T) {
-	now := time.Now()
-	where, args := recordFilter(Filter{From: &now, Source: "enhance", Window: "weekly", Status: "uncertain", Keyword: "user"})
-	require.Contains(t, where, `"window" =`)
-	require.Contains(t, where, "merged_into IS NULL")
-	require.Len(t, args, 5)
-	require.Equal(t, "weekly", args[2])
-	require.Equal(t, "%user%", args[4])
-}
-
 func TestStaleDetectorCannotOverwriteNewlyCommittedEvidence(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
 	cfg := DefaultConfig()
 	raw, _ := json.Marshal(cfg)
-	now := time.Now()
+	actual, _ := json.Marshal(Runtime{LastCheckedAt: timePointer(time.Now())})
 	mock.ExpectBegin()
-	mock.ExpectQuery("SELECT value .* FOR SHARE").WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(string(raw)))
-	mock.ExpectQuery("SELECT last_checked_at .* FOR UPDATE").WillReturnRows(sqlmock.NewRows([]string{"last_checked_at"}).AddRow(now))
+	mock.ExpectQuery("SELECT value").WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(raw))
+	mock.ExpectExec("INSERT INTO .*quota_follow_group_runtime").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT snapshot").WillReturnRows(sqlmock.NewRows([]string{"snapshot"}).AddRow(actual))
 	mock.ExpectRollback()
-	err = NewRepository(db).SaveObservation(context.Background(), cfg, sub2api.QuotaDiscovery{}, "hash", nil, nil, now, "", now, nil)
-	require.ErrorContains(t, err, "已有更新的检测结果")
+	err = NewRepository(db).SaveObservation(context.Background(), cfg, GroupRule{GroupID: 1}, sub2api.SubscriptionDiscovery{}, Runtime{}, Runtime{}, nil)
+	require.ErrorContains(t, err, "旧检测")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
-func TestOriginalAuditEnrichesEnhancementRecordWithoutDuplicateOrigin(t *testing.T) {
+func TestMoreThanHundredSubscriptionsCreateIndependentBatches(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
-	now := time.Now()
 	mock.ExpectBegin()
-	mock.ExpectQuery("SELECT id,event_id FROM sub2api_enhance.quota_follow_reset_deliveries").WithArgs("correlation", int64(7), "weekly").WillReturnRows(sqlmock.NewRows([]string{"id", "event_id"}).AddRow(11, 13))
-	mock.ExpectExec("UPDATE sub2api_enhance.quota_follow_reset_deliveries SET audit_log_id").WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("UPDATE sub2api_enhance.quota_reset_records").WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("UPDATE sub2api_enhance.quota_follow_reset_events").WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("UPDATE sub2api_enhance.quota_follow_collector_state").WillReturnResult(sqlmock.NewResult(0, 1))
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	mock.ExpectQuery("INSERT INTO .*quota_follow_reset_events").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(7))
+	targets := []sub2api.SubscriptionSnapshot{}
+	for i := 0; i < 101; i++ {
+		targets = append(targets, sub2api.SubscriptionSnapshot{ID: int64(i + 1), UserID: int64(i + 1000)})
+	}
+	mock.ExpectExec("UPDATE .*quota_follow_subscription_batches").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("UPDATE .*quota_follow_subscription_items").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("UPDATE .*quota_reset_records").WillReturnResult(sqlmock.NewResult(0, 0))
+	for batch, start := range []int{0, 100} {
+		mock.ExpectQuery("INSERT INTO .*quota_follow_subscription_batches").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(batch + 1))
+		for i := start; i < min(start+100, 101); i++ {
+			mock.ExpectQuery("INSERT INTO .*quota_follow_subscription_items").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(i + 1))
+			mock.ExpectExec("INSERT INTO .*quota_reset_records").WillReturnResult(sqlmock.NewResult(0, 1))
+		}
+	}
+	_, err = NewRepository(db).createEvent(context.Background(), tx, "key", "automatic", GroupRule{GroupID: 1, ResetWeekly: true}, "hash", sub2api.SubscriptionDiscovery{Subscriptions: targets}, []byte(`[]`), time.Now(), 1)
+	require.NoError(t, err)
+	mock.ExpectRollback()
+	require.NoError(t, tx.Rollback())
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+func TestRecordFilterIncludesGroupAndSubscriptionSearch(t *testing.T) {
+	id := int64(7)
+	where, args := recordFilter(Filter{GroupID: &id, Keyword: "99", Window: "weekly"})
+	require.Contains(t, where, "group_id =")
+	require.Contains(t, where, "subscription_id::text")
+	require.Len(t, args, 3)
+}
+func TestAuditDoesNotTurnBatchHTTP200IntoPerSubscriptionSuccess(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	mock.ExpectBegin()
+	mock.ExpectExec("UPDATE .*quota_reset_records").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO .*quota_reset_records").WithArgs(sqlmock.AnyArg(), int64(2), "user", "weekly", sqlmock.AnyArg(), "uncertain", "request", sqlmock.AnyArg(), int64(5), int64(3), int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
-	err = NewRepository(db).importAudit(context.Background(), sourceAudit{ID: 19, CreatedAt: now, RequestID: "correlation", HTTPStatus: 200}, 7, "User", "weekly")
+	err = NewRepository(db).importAudit(context.Background(), sourceAudit{ID: 5, CreatedAt: time.Now(), RequestID: "request", Body: `{"subscription_ids":[1],"action":"reset_quota","weekly":true}`, Path: "/api/v1/admin/subscriptions/bulk-action", HTTPStatus: 200}, map[int64]sub2api.SubscriptionSnapshot{1: {ID: 1, UserID: 2, GroupID: 3, Username: "user"}})
 	require.NoError(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestResetCardAuditNeedsActualWeeklyDropAndCannotReplayConsumedSamples(t *testing.T) {
+	for _, test := range []struct {
+		name                 string
+		drop, consumed, want bool
+	}{{"audit alone", false, false, false}, {"fresh weekly drop", true, false, true}, {"already consumed", true, true, false}} {
+		t.Run(test.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			defer db.Close()
+			now := time.Now().UTC()
+			before := now.Add(-time.Minute)
+			at := now.Add(-10 * time.Second)
+			next := now.Add(time.Hour)
+			state := AccountState{Account: sub2api.SubscriptionAccount{ID: 1, Type: "oauth"}, FetchedAt: &now, NextResetAt: &next, SuspectedDrop: test.drop}
+			if test.consumed {
+				state.ConsumedObservedAt = &now
+			}
+			states := []AccountState{state}
+			mock.ExpectQuery("SELECT DISTINCT ON").WillReturnRows(sqlmock.NewRows([]string{"id", "account_id", "created_at", "latency_ms"}).AddRow(10, 1, at, 1000))
+			err = NewRepository(db).ApplyAccountResetSignals(context.Background(), states, map[int64]AccountState{1: {FetchedAt: &before}}, before.Add(-time.Hour))
+			require.NoError(t, err)
+			require.Equal(t, test.want, states[0].CandidateResetAt != nil)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
 }

@@ -1,49 +1,24 @@
 import {mount,flushPromises} from '@vue/test-utils'
 import {beforeEach,describe,expect,it,vi} from 'vitest'
 import QuotaFollowView from '../QuotaFollowView.vue'
-const mocks=vi.hoisted(()=>({config:vi.fn(),save:vi.fn(),runtime:vi.fn(),discovery:vi.fn(),records:vi.fn(),detail:vi.fn(),reconcile:vi.fn(),repairCache:vi.fn(),resetNow:vi.fn(),events:vi.fn(),event:vi.fn(),groups:vi.fn(),showError:vi.fn(),showSuccess:vi.fn()}))
+const mocks=vi.hoisted(()=>({config:vi.fn(),save:vi.fn(),runtime:vi.fn(),discovery:vi.fn(),records:vi.fn(),detail:vi.fn(),reconcile:vi.fn(),retry:vi.fn(),acknowledge:vi.fn(),resetNow:vi.fn(),events:vi.fn(),event:vi.fn(),groups:vi.fn(),showError:vi.fn(),showSuccess:vi.fn()}))
 vi.mock('@/api/quota-follow',()=>({quotaFollowAPI:mocks}))
 vi.mock('@/api/admin/groups',()=>({getAll:mocks.groups}))
 vi.mock('@/stores/app',()=>({useAppStore:()=>mocks}))
 vi.mock('vue-i18n',()=>({useI18n:()=>({t:(key:string)=>key.split('.').at(-1),te:()=>true})}))
 vi.mock('@/features/system-update/SystemUpdatePanel.vue',()=>({default:{template:'<button>versions</button>'}}))
+const rule={group_id:7,enabled:true,observe_only:true,reset_weekly_enabled:true,reset_daily_enabled:false}
+const saved={enabled:true,groups:[rule],min_interval_minutes:10,max_interval_minutes:15,revision:3}
+const dialogs={BaseDialog:{props:['show'],template:'<div v-if="show"><slot/><slot name="footer"/></div>'}}
 beforeEach(()=>{
- vi.resetAllMocks()
- mocks.config.mockResolvedValue({enabled:false,group_id:7,reset_weekly_enabled:true,reset_daily_enabled:false,min_interval_minutes:10,max_interval_minutes:15,observe_only:true,revision:3,epoch:'epoch',enabled_at:null})
- mocks.groups.mockResolvedValue([{id:7,name:'OpenAI',platform:'openai'}]);mocks.runtime.mockResolvedValue({accounts:[],account_states:[],last_error:'',collector_error:'',redis_status:'not_configured'})
- mocks.discovery.mockResolvedValue({accounts:[],users:[]});mocks.records.mockResolvedValue({items:[],total:0});mocks.events.mockResolvedValue({items:[],total:0});mocks.save.mockResolvedValue({revision:4});mocks.resetNow.mockResolvedValue({group_id:7,windows:['weekly'],total:1,succeeded:1,non_success:0,items:[{user_id:8,username:'User',window:'weekly',request_id:'req',status:'succeeded',http_status:200,error:''}]})
+ vi.resetAllMocks();sessionStorage.clear()
+ mocks.config.mockResolvedValue(structuredClone(saved));mocks.save.mockResolvedValue({...structuredClone(saved),revision:4})
+ mocks.groups.mockResolvedValue([{id:7,name:'OpenAI A',platform:'openai',subscription_type:'subscription'},{id:8,name:'OpenAI B',platform:'openai',subscription_type:'subscription'},{id:9,name:'Standard',platform:'openai',subscription_type:'standard'}]);mocks.runtime.mockResolvedValue([])
+ mocks.discovery.mockResolvedValue({group_id:7,group_name:'OpenAI A',accounts:[],subscriptions:[{subscription_id:99,user_id:8,username:'User'}]});mocks.records.mockResolvedValue({items:[],total:0});mocks.events.mockResolvedValue({items:[],total:0});mocks.resetNow.mockResolvedValue({group_id:7,event_id:101,status:'pending'})
 })
-describe('quota follow page',()=>{
- it('shows boundaries and keeps configuration drafts when refreshing',async()=>{
-  const wrapper=mount(QuotaFollowView);await flushPromises();expect(wrapper.get('[data-test="boundary"]').text()).toBe('boundary')
-  expect(wrapper.classes()).toContain('enhance-page')
-  const enabled=wrapper.get('[data-test="enabled"]');await enabled.setValue(true)
-  await wrapper.findAll('button').find(b=>b.text()==='refresh')!.trigger('click');await flushPromises()
-  expect((enabled.element as HTMLInputElement).checked).toBe(true);expect(mocks.config).toHaveBeenCalledTimes(1);wrapper.unmount()
- })
- it('sends only editable configuration with the expected revision',async()=>{
-  const wrapper=mount(QuotaFollowView);await flushPromises();await wrapper.get('[data-test="enabled"]').setValue(true);await wrapper.get('form').trigger('submit');await flushPromises()
-  expect(mocks.save).toHaveBeenCalledWith({enabled:true,group_id:7,reset_weekly_enabled:true,reset_daily_enabled:false,min_interval_minutes:10,max_interval_minutes:15,observe_only:true},3)
-  expect(mocks.reconcile).not.toHaveBeenCalled();wrapper.unmount()
- })
- it('keeps origin and inference evidence distinct in reset records',async()=>{
-  mocks.records.mockResolvedValue({items:[{id:1,user_id:7,username:'User',source:'sub2api',source_detail:'natural_weekly',action_type:'reset',evidence_type:'inferred',window:'weekly',status:'succeeded',occurred_at:'2026-09-07T00:00:00Z',before_usage_usd:'1.1234567890',after_usage_usd:'0.0000000001',accounts:[]}],total:1})
-  const wrapper=mount(QuotaFollowView);await flushPromises();const text=wrapper.get('[data-test="records"]').text();expect(text).toContain('sub2api');expect(text).toContain('inferred');expect(text).toContain('1.1234567890 → 0.0000000001');wrapper.unmount()
- })
- it('shows carryover separately and schedules only cache cleanup from its detail',async()=>{
-  const record={id:9,user_id:7,username:'User',source:'enhance',source_detail:'weekly_carryover',action_type:'carryover',evidence_type:'confirmed',window:'weekly',status:'succeeded',occurred_at:'2026-09-07T00:00:01Z',before_usage_usd:'0.0000000001',after_usage_usd:'10.0000000002',accounts:[]}
-  mocks.records.mockResolvedValue({items:[record],total:1});mocks.detail.mockResolvedValue({record,carryover:{id:3,status:'succeeded',cache_status:'retry_pending',error_message:'缓存清理失败'}});mocks.repairCache.mockResolvedValue({scheduled:true})
-  const wrapper=mount(QuotaFollowView,{global:{stubs:{BaseDialog:{props:['show'],template:'<div v-if="show"><slot/></div>'}}}});await flushPromises()
-  expect(wrapper.get('[data-test="records"]').text()).toContain('weekly_carryover');expect(wrapper.get('[data-test="records"]').text()).toContain('0.0000000001 → 10.0000000002')
-  await wrapper.findAll('button').find(b=>b.text()==='details')!.trigger('click');await flushPromises()
-  await wrapper.findAll('button').find(b=>b.text()==='repairCache')!.trigger('click');await flushPromises()
-  expect(mocks.repairCache).toHaveBeenCalledWith(9);expect(mocks.reconcile).not.toHaveBeenCalled();expect(mocks.save).not.toHaveBeenCalled();wrapper.unmount()
- })
- it('confirms before calling the original reset API',async()=>{
-  mocks.discovery.mockResolvedValue({accounts:[],users:[{id:8,username:'User',email:'user@example.com'}]})
-  const wrapper=mount(QuotaFollowView,{global:{stubs:{BaseDialog:{props:['show'],template:'<div v-if="show"><slot/><slot name="footer"/></div>'}}}});await flushPromises()
-  await wrapper.get('[data-test="immediate-reset"]').trigger('click');expect(mocks.resetNow).not.toHaveBeenCalled();expect(wrapper.get('[data-test="confirm-immediate-reset"]')).toBeTruthy()
-  await wrapper.get('[data-test="confirm-immediate-reset"]').trigger('click');await flushPromises();expect(mocks.resetNow).toHaveBeenCalledWith({group_id:7,windows:['weekly']});wrapper.unmount()
- })
-
+describe('subscription quota follow',()=>{
+ it('keeps drafts when refreshing status and disables reset until saved',async()=>{const w=mount(QuotaFollowView);await flushPromises();await w.get('[data-test="enabled"]').setValue(false);await w.findAll('button').find(b=>b.text()==='refresh')!.trigger('click');await flushPromises();expect((w.get('[data-test="enabled"]').element as HTMLInputElement).checked).toBe(false);expect(mocks.config).toHaveBeenCalledTimes(1);expect(w.get('[data-test="immediate-reset"]').attributes('disabled')).toBeDefined();w.unmount()})
+ it('adds independent subscription groups and prevents duplicate group choices',async()=>{const w=mount(QuotaFollowView);await flushPromises();expect(w.get('[data-test="group"]').text()).toContain('OpenAI B');expect(w.get('[data-test="group"]').text()).not.toContain('Standard');expect(w.get('[data-test="group"]').text()).not.toContain('OpenAI A');await w.get('[data-test="group"]').setValue(8);await w.get('[data-test="add-group"]').trigger('click');expect(w.findAll('[data-test="group-rule"]')).toHaveLength(2);await w.get('form').trigger('submit');await flushPromises();expect(mocks.save).toHaveBeenCalledWith({enabled:true,min_interval_minutes:10,max_interval_minutes:15,groups:[rule,{...rule,group_id:8,enabled:false}]},3);w.unmount()})
+ it('confirms the subscription group and reuses the request key after a lost response',async()=>{mocks.resetNow.mockRejectedValueOnce(new Error('timeout'));const w=mount(QuotaFollowView,{global:{stubs:dialogs}});await flushPromises();await w.get('[data-test="immediate-reset"]').trigger('click');await flushPromises();expect(mocks.resetNow).not.toHaveBeenCalled();expect(mocks.discovery).toHaveBeenCalledWith(7);await w.get('[data-test="confirm-immediate-reset"]').trigger('click');await flushPromises();const first=mocks.resetNow.mock.calls[0][0];expect(first).toEqual({group_id:7,expected_revision:3,request_id:expect.any(String)});await w.get('[data-test="confirm-immediate-reset"]').trigger('click');await flushPromises();expect(mocks.resetNow.mock.calls[1][0]).toEqual(first);expect(w.text()).toContain('101');w.unmount()})
+ it('shows legacy records without a cache repair action',async()=>{const record={id:9,user_id:7,username:'User',source:'enhance',source_detail:'weekly_carryover',action_type:'carryover',evidence_type:'confirmed',window:'weekly',status:'succeeded',occurred_at:'2026-09-07T00:00:01Z',before_usage_usd:'0.0000000001',after_usage_usd:'10.0000000002',subscription_id:null};mocks.records.mockResolvedValue({items:[record],total:1});mocks.detail.mockResolvedValue({record,carryover:{status:'succeeded'}});const w=mount(QuotaFollowView,{global:{stubs:dialogs}});await flushPromises();expect(w.get('[data-test="records"]').text()).toContain('legacy');expect(w.text()).toContain('0.0000000001 → 10.0000000002');await w.findAll('button').find(b=>b.text()==='details')!.trigger('click');await flushPromises();expect(w.text()).not.toContain('repairCache');w.unmount()})
 })
