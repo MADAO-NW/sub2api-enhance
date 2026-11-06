@@ -66,13 +66,13 @@ UPDATE sub2api_enhance.quota_follow_reset_events SET status='uncertain',complete
 
 -- 原配置保留分组及勾选项，但新语义必须重新确认后启用；已有配置修订递增。
 UPDATE sub2api_enhance.settings SET value=jsonb_build_object(
-    'enabled',false,'revision',COALESCE((value->>'revision')::bigint,1)+1,
-    'min_interval_minutes',COALESCE((value->>'min_interval_minutes')::integer,10),
-    'max_interval_minutes',COALESCE((value->>'max_interval_minutes')::integer,15),
-    'updated_by',COALESCE((value->>'updated_by')::bigint,0),'updated_at',clock_timestamp(),
-    'groups',CASE WHEN value->>'group_id' IS NULL THEN '[]'::jsonb ELSE jsonb_build_array(jsonb_build_object(
-        'group_id',(value->>'group_id')::bigint,'enabled',false,'observe_only',true,
-        'reset_daily_enabled',COALESCE((value->>'reset_daily_enabled')::boolean,false),
-        'reset_weekly_enabled',COALESCE((value->>'reset_weekly_enabled')::boolean,true),
-        'epoch','','enabled_at',NULL)) END),updated_at=clock_timestamp()
-WHERE key='quota_follow_config' AND NOT (value ? 'groups');
+    'enabled',false,'revision',COALESCE((value::jsonb->>'revision')::bigint,1)+1,
+    'min_interval_minutes',COALESCE((value::jsonb->>'min_interval_minutes')::integer,10),
+    'max_interval_minutes',COALESCE((value::jsonb->>'max_interval_minutes')::integer,15),
+    'updated_by',COALESCE((value::jsonb->>'updated_by')::bigint,0),'updated_at',clock_timestamp(),
+    'groups',CASE WHEN value::jsonb->>'group_id' IS NULL THEN '[]'::jsonb ELSE jsonb_build_array(jsonb_build_object(
+        'group_id',(value::jsonb->>'group_id')::bigint,'enabled',false,'observe_only',true,
+        'reset_daily_enabled',COALESCE((value::jsonb->>'reset_daily_enabled')::boolean,false),
+        'reset_weekly_enabled',COALESCE((value::jsonb->>'reset_weekly_enabled')::boolean,true),
+        'epoch','','enabled_at',NULL)) END)::text,updated_at=clock_timestamp()
+WHERE key='quota_follow_config' AND NOT (value::jsonb ? 'groups');
