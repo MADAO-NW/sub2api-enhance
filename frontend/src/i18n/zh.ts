@@ -1,5 +1,6 @@
 export default {
   "thirdPartyPromptAudit": {
+    "trustTab": "信任与熔断",
     "retentionDays": "记录保留天数",
     "retentionHint": "1–365 天，默认 30 天；每小时清理一次。",
     "targets": "审核目标",

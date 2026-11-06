@@ -1,5 +1,6 @@
 export default {
   "thirdPartyPromptAudit": {
+    "trustTab": "Trust & breakers",
     "retentionDays": "Retention days",
     "retentionHint": "1–365 days, default 30; cleaned up hourly.",
     "targets": "Targets",
