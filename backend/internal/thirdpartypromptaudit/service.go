@@ -225,6 +225,8 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 	}
 	completion, failure := s.processJob(ctx, job, true)
 	if failure != nil {
+		// 失败回合也要更新回合键，避免后续请求按"仍在审核"白等到超时。
+		s.rememberTurn(ctx, turnKey, job.ID, "failed", "")
 		if failure.Code == "user_excluded" {
 			result.Kind, result.ErrorCode = IngressDecisionAllow, "user_excluded"
 			return result
