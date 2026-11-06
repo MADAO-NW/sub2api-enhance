@@ -1,10 +1,11 @@
 import type { AuditConfig, ConfigUpdate, KeyUpdate, SavedConfig } from '@/api/admin/third-party-prompt-audit'
 
 export function editableConfig(value: SavedConfig): AuditConfig {
-  const { mode, capture_when_audit_off, platforms, all_groups, group_ids, excluded_user_ids, audit_prompt, models, review_threshold, block_threshold,
-	aggregation, worker_count, warning, disable, user_rules, admin_email } = value
-  return JSON.parse(JSON.stringify({ mode, capture_when_audit_off, audit_scope: 'current_user', platforms: platforms ?? [], all_groups, group_ids: group_ids ?? [], excluded_user_ids: excluded_user_ids ?? [], audit_prompt,
-	models: models ?? [], review_threshold, block_threshold, aggregation, worker_count, warning, disable, user_rules: user_rules ?? [], admin_email })) as AuditConfig
+  const { mode, platforms, all_groups, group_ids, excluded_user_ids, audit_prompt, models, review_threshold, block_threshold,
+	aggregation, worker_count, warning, disable, user_rules, admin_email, retention_days } = value
+  return JSON.parse(JSON.stringify({ mode, platforms: platforms ?? [], all_groups, group_ids: group_ids ?? [], excluded_user_ids: excluded_user_ids ?? [], audit_prompt,
+	models: models ?? [], review_threshold, block_threshold, aggregation, worker_count, warning, disable, user_rules: user_rules ?? [], admin_email,
+	retention_days: retention_days ?? 30 })) as AuditConfig
 }
 
 export function configUpdate(config: AuditConfig, revision: number, keys: Record<string, KeyUpdate>): ConfigUpdate {
@@ -32,11 +33,3 @@ export function formatMS(value: number | null | undefined): string {
   return value == null ? '—' : `${Math.round(value).toLocaleString()} ms`
 }
 
-export function sumCounts(value: Record<string, number>): number { return Object.values(value).reduce((sum, count) => sum + count, 0) }
-
-export function decodeCaptureBody(value: string | undefined): string {
-  if (!value) return ''
-  const bytes = Uint8Array.from(atob(value), character => character.charCodeAt(0))
-  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes) }
-  catch { return value }
-}

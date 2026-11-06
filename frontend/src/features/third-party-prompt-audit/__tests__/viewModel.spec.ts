@@ -3,10 +3,10 @@ import { configUpdate, editableConfig, timeRange } from '../viewModel'
 import type { SavedConfig } from '@/api/admin/third-party-prompt-audit'
 
 export const savedConfig = (): SavedConfig => ({
-  mode: 'off', capture_when_audit_off: false, audit_scope: 'current_user', platforms: [], all_groups: true, group_ids: [], excluded_user_ids: [], audit_prompt: 'editable policy',
+  mode: 'off', platforms: [], all_groups: true, group_ids: [], excluded_user_ids: [], audit_prompt: 'editable policy',
   models: [{ id: 'node-a', name: 'Node A', base_url: 'https://example.invalid', model: 'model', enabled: true, timeout_ms: 5000, max_concurrency: 4 }],
   review_threshold: null, block_threshold: null, aggregation: 'any_block', worker_count: 4,
-  warning: { enabled: false, window: 0, limit: 0 }, disable: { enabled: false, limit: 0 }, user_rules: [], admin_email: '',
+  warning: { enabled: false, window: 0, limit: 0 }, disable: { enabled: false, limit: 0 }, user_rules: [], admin_email: '', retention_days: 30,
   revision: 4, warning_rule_revision: 1, has_api_keys: { 'node-a': true }, updated_by: 1, updated_at: '2026-09-06T01:00:00Z', application_error: '', applied_revision: 1, instance_id: 'test-instance', model_defaults: { timeout_ms: 300000, max_concurrency: 4 },
   rule_defaults: { review_threshold: 0.5, block_threshold: 0.8, warning_window: 10, warning_limit: 3, disable_limit: 5 }
 })
@@ -21,6 +21,10 @@ describe('third-party audit configuration contract', () => {
     expect(request.expected_revision).toBe(4)
     expect(request.config.audit_prompt).toBe('new policy')
     for (const key of ['revision', 'has_api_keys', 'fixed_contract', 'fixed_roles', 'default_policy', 'model_defaults']) expect(request.config).not.toHaveProperty(key)
+    // 采集相关配置已下线，保留天数必须随可编辑配置一起保存。
+    expect(request.config).not.toHaveProperty('capture_when_audit_off')
+    expect(request.config).not.toHaveProperty('audit_scope')
+    expect(request.config.retention_days).toBe(30)
   })
   it('does not send stale key text when keeping or clearing a key', () => {
     const draft = editableConfig(savedConfig())

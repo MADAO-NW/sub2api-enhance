@@ -1,0 +1,141 @@
+<script setup lang="ts">
+import { onMounted, ref, watch } from 'vue'
+import Pagination from '@/components/common/Pagination.vue'
+import {
+  thirdPartyPromptAuditAPI as api, type BreakerEntry, type TrustEntry,
+} from '@/api/admin/third-party-prompt-audit'
+import { useAppStore } from '@/stores/app'
+import { extractApiErrorMessage } from '@/utils/apiError'
+import { formatTime } from './viewModel'
+import { useAuditLabels } from './labels'
+
+const props = withDefaults(defineProps<{ refreshKey?: number }>(), { refreshKey: 0 })
+const emit = defineEmits<{ (event: 'changed'): void }>()
+const label = useAuditLabels(), app = useAppStore()
+const status = ref<'tripped' | 'trusted' | 'confirmed' | ''>('tripped')
+const breakers = ref<BreakerEntry[]>([])
+const breakerPage = ref(1), breakerTotal = ref(0)
+const trusted = ref<TrustEntry[]>([])
+const trustPage = ref(1), trustTotal = ref(0)
+const loading = ref(false), pending = ref(''), error = ref('')
+
+async function loadBreakers() {
+  loading.value = true
+  error.value = ''
+  try {
+    const result = await api.breakerList(status.value, breakerPage.value, 20)
+    breakers.value = result.items
+    breakerTotal.value = result.total
+  } catch (err) { error.value = extractApiErrorMessage(err, label('error')) }
+  finally { loading.value = false }
+}
+async function loadTrust() {
+  try {
+    const result = await api.trustList(trustPage.value, 20)
+    trusted.value = result.items
+    trustTotal.value = result.total
+  } catch (err) { error.value = extractApiErrorMessage(err, label('error')) }
+}
+async function act(kind: 'trust' | 'confirm' | 'untrust', hash: string) {
+  pending.value = hash + kind
+  try {
+    if (kind === 'trust') await api.trust(hash, '熔断列表手工信任')
+    else if (kind === 'confirm') await api.confirmBreaker(hash)
+    else await api.untrust(hash)
+    app.showSuccess(label('saved'))
+    emit('changed')
+    await Promise.all([loadBreakers(), loadTrust()])
+  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { pending.value = '' }
+}
+function changeBreakerPage(value: number) { breakerPage.value = value; void loadBreakers() }
+function changeTrustPage(value: number) { trustPage.value = value; void loadTrust() }
+watch(status, () => { breakerPage.value = 1; void loadBreakers() })
+watch(() => props.refreshKey, () => { void loadBreakers(); void loadTrust() })
+onMounted(() => { void loadBreakers(); void loadTrust() })
+</script>
+
+<template>
+  <div class="space-y-5">
+    <p v-if="error" role="alert" class="text-red-600 dark:text-red-400">{{ error }}</p>
+    <section class="card space-y-4 p-5">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 class="text-lg font-semibold">{{ label('breakerList') }}</h2>
+          <p class="mt-1 text-sm text-gray-500 dark:text-dark-400">{{ label('breakerHint') }}</p>
+        </div>
+        <label class="flex items-center gap-2 text-sm"><span>{{ label('status') }}</span>
+          <select v-model="status" class="input w-auto">
+            <option value="tripped">{{ label('breakerTripped') }}</option>
+            <option value="trusted">{{ label('breakerTrusted') }}</option>
+            <option value="confirmed">{{ label('breakerConfirmed') }}</option>
+            <option value="">{{ label('all') }}</option>
+          </select>
+        </label>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-sm">
+          <thead class="text-gray-500 dark:text-dark-400"><tr>
+            <th class="p-2">{{ label('instructionBlock') }}</th>
+            <th class="p-2">{{ label('status') }}</th>
+            <th class="p-2">{{ label('distinctUsers') }}</th>
+            <th class="p-2">{{ label('trippedAt') }}</th>
+            <th class="p-2">{{ label('actions') }}</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="item in breakers" :key="item.hash" class="border-t border-gray-100 align-top dark:border-dark-700">
+              <td class="max-w-xl p-2">
+                <p class="break-all font-mono text-xs text-gray-500">{{ item.hash }}</p>
+                <pre class="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words text-xs">{{ item.preview }}</pre>
+              </td>
+              <td class="p-2">{{ label('breaker' + item.status.charAt(0).toUpperCase() + item.status.slice(1)) }}</td>
+              <td class="p-2">{{ item.distinct_users }}</td>
+              <td class="whitespace-nowrap p-2">{{ formatTime(item.tripped_at) }}</td>
+              <td class="space-y-2 p-2">
+                <template v-if="item.status === 'tripped'">
+                  <button class="btn btn-secondary btn-sm" :disabled="pending === item.hash + 'trust'" @click="act('trust', item.hash)">{{ label('trust') }}</button>
+                  <button class="btn btn-secondary btn-sm" :disabled="pending === item.hash + 'confirm'" @click="act('confirm', item.hash)">{{ label('confirmViolation') }}</button>
+                </template>
+                <button v-else-if="item.status === 'trusted'" class="btn btn-secondary btn-sm" :disabled="pending === item.hash + 'untrust'" @click="act('untrust', item.hash)">{{ label('untrust') }}</button>
+                <span v-else class="text-xs text-gray-500">{{ label('breakerConfirmedHint') }}</span>
+              </td>
+            </tr>
+            <tr v-if="!loading && !breakers.length"><td colspan="5" class="p-8 text-center text-gray-500">{{ label('empty') }}</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <Pagination :page="breakerPage" :page-size="20" :page-size-options="[20, 50]" :total="breakerTotal" @update:page="changeBreakerPage" />
+    </section>
+    <section class="card space-y-4 p-5">
+      <div>
+        <h2 class="text-lg font-semibold">{{ label('trustList') }}</h2>
+        <p class="mt-1 text-sm text-gray-500 dark:text-dark-400">{{ label('trustHint') }}</p>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-sm">
+          <thead class="text-gray-500 dark:text-dark-400"><tr>
+            <th class="p-2">{{ label('instructionBlock') }}</th>
+            <th class="p-2">{{ label('trustedBy') }}</th>
+            <th class="p-2">{{ label('reason') }}</th>
+            <th class="p-2">{{ label('created') }}</th>
+            <th class="p-2">{{ label('actions') }}</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="item in trusted" :key="item.hash" class="border-t border-gray-100 align-top dark:border-dark-700">
+              <td class="max-w-xl p-2">
+                <p class="break-all font-mono text-xs text-gray-500">{{ item.hash }}</p>
+                <pre class="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words text-xs">{{ item.preview }}</pre>
+              </td>
+              <td class="p-2">{{ item.trusted_by }}</td>
+              <td class="p-2">{{ item.reason }}</td>
+              <td class="whitespace-nowrap p-2">{{ formatTime(item.created_at) }}</td>
+              <td class="p-2"><button class="btn btn-secondary btn-sm" :disabled="pending === item.hash + 'untrust'" @click="act('untrust', item.hash)">{{ label('untrust') }}</button></td>
+            </tr>
+            <tr v-if="!trusted.length"><td colspan="5" class="p-8 text-center text-gray-500">{{ label('empty') }}</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <Pagination :page="trustPage" :page-size="20" :page-size-options="[20, 50]" :total="trustTotal" @update:page="changeTrustPage" />
+    </section>
+  </div>
+</template>

@@ -1,34 +1,22 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import type { DecisionConfig, ModelResult } from '@/api/admin/third-party-prompt-audit'
+import type { NodeResult } from '@/api/admin/third-party-prompt-audit'
 import { useAuditLabels } from './labels'
 
-const props = defineProps<{ model: ModelResult; config?: DecisionConfig }>()
+defineProps<{ node: NodeResult }>()
 const label = useAuditLabels()
-// 尚未提交的检查点保留原始片段，列表与正式结果直接使用后端派生字段。
-const maxSegment = computed(() => props.model.max_segment_confidence !== undefined
-  ? props.model.max_segment_confidence
-  : props.model.segments?.reduce<number | null>((max, item) => max === null ? item.result.confidence : Math.max(max, item.result.confidence), null))
 </script>
 
 <template>
   <div class="space-y-1 text-sm" data-test="node-decision">
-    <p v-if="model.skipped" class="text-gray-500">{{ label(model.skip_reason || 'aggregation_decided') }}</p>
-    <p v-else-if="model.error" class="text-red-600 dark:text-red-400">{{ label('unclassified') }} · {{ model.error.message }} · {{ model.error.code }}</p>
-    <template v-else-if="model.basis === 'segments_all_pass'">
-      <p>{{ label('segments_all_pass') }}</p>
-      <p>{{ label('maxSegmentScore') }}: {{ maxSegment ?? label('noValidScore') }} · {{ label('triggerThreshold') }}: {{ config?.review_threshold ?? '—' }}</p>
-      <p>{{ label('jointNotRun') }}</p>
-    </template>
-    <template v-else-if="model.confidence != null">
-      <p v-if="model.basis === 'joint'">{{ label(model.reused ? 'reusedJoint' : 'jointScore') }}: {{ model.confidence }} · {{ model.decision ? label(model.decision) : '—' }}</p>
-      <p v-else>{{ label(model.basis || 'current_user') }} · {{ label(model.reused ? 'reusedResult' : 'targetScore') }}: {{ model.confidence }} · {{ model.decision ? label(model.decision) : '—' }}</p>
-      <p>{{ label('rawThresholds') }}: {{ config?.review_threshold ?? '—' }} / {{ config?.block_threshold ?? '—' }}</p>
-      <p v-if="model.joint_attempt_id && !model.reused">{{ label('sourceReference') }} · Attempt #{{ model.joint_attempt_id }}</p>
-      <p v-if="model.binding_triggered">{{ label('bindingTriggered') }}</p>
-      <p v-if="model.dispatch" class="text-xs text-gray-500">{{ label('dispatch') }} #{{ model.dispatch.order }} · {{ label(model.dispatch.health) }} · {{ model.dispatch.active }} / {{ model.dispatch.max_concurrency }} · {{ label(model.dispatch.reason) }}</p>
+    <p class="font-medium">{{ node.model_name || node.model_id }}</p>
+    <p v-if="node.skipped" class="text-gray-500">{{ label(node.skip_reason || 'aggregation_decided') }}</p>
+    <p v-else-if="node.error" class="text-red-600 dark:text-red-400">{{ label('unclassified') }} · {{ node.error.message }} · {{ node.error.code }}</p>
+    <template v-else-if="node.confidence != null">
+      <p>{{ label('targetScore') }}: {{ node.confidence }}</p>
+      <p class="whitespace-pre-wrap break-words">{{ node.reason }}</p>
+      <p v-if="node.attempt_id" class="text-xs text-gray-500">{{ label('sourceReference') }} · Attempt #{{ node.attempt_id }}</p>
+      <p v-if="node.dispatch" class="text-xs text-gray-500">{{ label('dispatch') }} #{{ node.dispatch.order }} · {{ label(node.dispatch.health) }} · {{ node.dispatch.active }} / {{ node.dispatch.max_concurrency }} · {{ label(node.dispatch.reason) }}</p>
     </template>
     <p v-else>{{ label('noValidScore') }}</p>
-    <p v-if="config">{{ label('decisionRevision') }}: {{ config.revision }}</p>
   </div>
 </template>

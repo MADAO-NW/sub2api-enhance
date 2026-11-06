@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"slices"
 	"strings"
 
@@ -14,10 +13,11 @@ import (
 
 // JobDetail 是任务详情：任务本身、当前轮目标、历史轮次与相关处置动作。
 type JobDetail struct {
-	Job     *AuditJob   `json:"job"`
-	Targets []JobTarget `json:"targets"`
-	Rounds  []JobRound  `json:"rounds"`
-	Actions []Action    `json:"actions"`
+	Job      *AuditJob      `json:"job"`
+	Targets  []JobTarget    `json:"targets"`
+	Rounds   []JobRound     `json:"rounds"`
+	Attempts []ModelAttempt `json:"attempts"`
+	Actions  []Action       `json:"actions"`
 }
 
 func validateFilter(filter Filter) error {
@@ -161,11 +161,15 @@ func (r *Repository) JobDetail(ctx context.Context, id int64) (*JobDetail, error
 	if err != nil {
 		return nil, err
 	}
-	actions, err := r.ListActions(ctx, job.UserID, id)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	attempts, err := r.ListModelAttempts(ctx, "job_id=$1", id)
+	if err != nil {
 		return nil, err
 	}
-	return &JobDetail{Job: job, Targets: targets, Rounds: rounds, Actions: actions}, nil
+	actions, err := r.ListActions(ctx, job.UserID, id)
+	if err != nil {
+		return nil, err
+	}
+	return &JobDetail{Job: job, Targets: targets, Rounds: rounds, Attempts: attempts, Actions: actions}, nil
 }
 
 type reauditCandidate struct {
@@ -292,5 +296,3 @@ func (r *Repository) appendRound(ctx context.Context, jobID, actorID int64, reus
 
 // jobFilterWhere 供统计与列表共用同一套过滤语义。
 func jobFilterWhere(filter Filter) (string, []any) { return filterSQL(filter, true) }
-
-var _ = fmt.Sprintf
