@@ -69,7 +69,7 @@ onUnmounted(() => { disposed = true })
       <nav class="flex flex-wrap gap-2" :aria-label="label('title')">
         <button v-for="tab in tabs" :key="tab" class="rounded-xl px-5 py-3 text-sm font-medium transition"
           :class="active === tab ? 'bg-primary-600 text-white' : 'bg-white text-gray-600 hover:bg-primary-50 dark:bg-dark-800 dark:text-dark-300'"
-          :aria-current="active === tab ? 'page' : undefined" @click="select(tab)">{{ label(tab) }}</button>
+          :aria-current="active === tab ? 'page' : undefined" @click="select(tab)">{{ label(tab === 'trust' ? 'trustTab' : tab) }}</button>
       </nav>
       <AuditOverview v-show="active === 'overview'" :refresh-key="tabRefresh.overview + refreshKey" @inspect-jobs="inspectJobs" />
       <AuditRecords v-if="visited.includes('jobs')" v-show="active === 'jobs'" :initial-filter="jobFilter" :refresh-key="tabRefresh.jobs + refreshKey" @reaudit-created="trackReaudits" />
