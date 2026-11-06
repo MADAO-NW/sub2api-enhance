@@ -131,3 +131,21 @@ func (r *Repository) ListActions(ctx context.Context, userID, rootID int64) ([]A
 	}
 	return out, rows.Err()
 }
+
+// insertAction 在提交事务内写入一条处置动作；动作本身由收件箱异步执行。
+func insertAction(ctx context.Context, tx *sql.Tx, action *Action) error {
+	rule, err := json.Marshal(action.RuleSnapshot)
+	if err != nil {
+		return err
+	}
+	business, err := json.Marshal(action.BusinessSnapshot)
+	if err != nil {
+		return err
+	}
+	deliveries, err := json.Marshal(action.Deliveries)
+	if err != nil {
+		return err
+	}
+	return tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_enforcement_actions(user_id,job_id,actor_user_id,action_type,rule_snapshot,business_snapshot,notification_status,deliveries,auth_cache_status,execution_status,applied_at,completed_at)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id,applied_at`, action.UserID, action.JobID, action.ActorUserID, action.ActionType, string(rule), string(business), action.NotificationStatus, string(deliveries), action.AuthCacheStatus, action.ExecutionStatus, action.AppliedAt, action.CompletedAt).Scan(&action.ID, &action.AppliedAt)
+}

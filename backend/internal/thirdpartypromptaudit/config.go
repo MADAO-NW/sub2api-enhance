@@ -48,6 +48,7 @@ const defaultDisableLimit = 1
 
 // legacyDefaultPolicySHA256 仅识别已发布的旧内置默认值，不能覆盖管理员自定义政策。
 var legacyDefaultPolicySHA256 = map[string]struct{}{
+	"1f4c395da0da7213d3c3453791447532fc66e42ab0e29e09791ccd12de823144": {},
 	"9071cf397aa94bca6982620a56c908a5977fdfc94206c7e198f160c5f65b2e0d": {},
 	"4ebb50f2c9183ab5c20214d094f291ae1571cbbd931a16f6bcca9915043a011c": {},
 	"88606d5072b66a33a6a91f720e9989a99304c68210589be24131feb605a76734": {},
@@ -86,24 +87,22 @@ type UserRuleConfig struct {
 }
 
 type Config struct {
-	Mode                string           `json:"mode"`
-	CaptureWhenAuditOff bool             `json:"capture_when_audit_off"`
-	AuditScope          string           `json:"audit_scope"`
-	Platforms           []string         `json:"platforms"`
-	AllGroups           bool             `json:"all_groups"`
-	GroupIDs            []int64          `json:"group_ids"`
-	ExcludedUserIDs     []int64          `json:"excluded_user_ids"`
-	AuditPrompt         string           `json:"audit_prompt"`
-	Models              []ModelConfig    `json:"models"`
-	ReviewThreshold     *float64         `json:"review_threshold"`
-	BlockThreshold      *float64         `json:"block_threshold"`
-	Aggregation         string           `json:"aggregation"`
-	WorkerCount         int              `json:"worker_count"`
-	Warning             WarningConfig    `json:"warning"`
-	Disable             DisableConfig    `json:"disable"`
-	UserRules           []UserRuleConfig `json:"user_rules"`
-	AdminEmail          string           `json:"admin_email"`
-	RetentionDays       int              `json:"retention_days"`
+	Mode            string           `json:"mode"`
+	Platforms       []string         `json:"platforms"`
+	AllGroups       bool             `json:"all_groups"`
+	GroupIDs        []int64          `json:"group_ids"`
+	ExcludedUserIDs []int64          `json:"excluded_user_ids"`
+	AuditPrompt     string           `json:"audit_prompt"`
+	Models          []ModelConfig    `json:"models"`
+	ReviewThreshold *float64         `json:"review_threshold"`
+	BlockThreshold  *float64         `json:"block_threshold"`
+	Aggregation     string           `json:"aggregation"`
+	WorkerCount     int              `json:"worker_count"`
+	Warning         WarningConfig    `json:"warning"`
+	Disable         DisableConfig    `json:"disable"`
+	UserRules       []UserRuleConfig `json:"user_rules"`
+	AdminEmail      string           `json:"admin_email"`
+	RetentionDays   int              `json:"retention_days"`
 }
 
 type ConfigSnapshot struct {
@@ -135,9 +134,6 @@ func (snapshot *ConfigSnapshot) UnmarshalJSON(raw []byte) error {
 	}
 	*snapshot = ConfigSnapshot(value)
 	normalizeModelConcurrency(&snapshot.Config)
-	if snapshot.AuditScope == "" {
-		snapshot.AuditScope = "current_user"
-	}
 	legacy := len(historical.FixedRoles) > 0
 	for _, model := range historical.Models {
 		legacy = legacy || len(model.Temperature) > 0 || len(model.MaxTokens) > 0
@@ -230,13 +226,12 @@ func NewConfigManager(db *sql.DB, encryptor appconfig.SecretEncryptor, cfg *appc
 
 func DefaultConfig() Config {
 	reviewThreshold, blockThreshold := defaultReviewThreshold, defaultBlockThreshold
-	return Config{Mode: "off", AuditScope: "current_user", Platforms: []string{}, AllGroups: true,
+	return Config{Mode: "off", Platforms: []string{}, AllGroups: true,
 		GroupIDs: []int64{}, ExcludedUserIDs: []int64{}, AuditPrompt: DefaultPolicy, Models: []ModelConfig{},
 		ReviewThreshold: &reviewThreshold, BlockThreshold: &blockThreshold,
 		Aggregation: "any_block", WorkerCount: 4,
-		CaptureWhenAuditOff: true,
-		Warning:             WarningConfig{Window: defaultWarningWindow, Limit: defaultWarningLimit},
-		Disable:             DisableConfig{Limit: defaultDisableLimit}, UserRules: []UserRuleConfig{},
+		Warning: WarningConfig{Window: defaultWarningWindow, Limit: defaultWarningLimit},
+		Disable: DisableConfig{Limit: defaultDisableLimit}, UserRules: []UserRuleConfig{},
 		RetentionDays: RetentionDefaultDays}
 }
 
@@ -256,13 +251,6 @@ func normalizeModelConcurrency(config *Config) {
 		if config.Models[i].MaxConcurrency == 0 {
 			config.Models[i].MaxConcurrency = DefaultNodeMaxConcurrency
 		}
-	}
-}
-
-// normalizeAuditScope 将已发布的范围选项收敛为当前任务 user 固定策略。
-func normalizeAuditScope(config *Config) {
-	if config != nil {
-		config.AuditScope = "current_user"
 	}
 }
 
@@ -323,9 +311,6 @@ func warningRuleHash(config Config, revision, userID int64) (string, error) {
 func validateConfig(config Config, activating bool) error {
 	if !slices.Contains([]string{"off", "async", "blocking"}, config.Mode) {
 		return errors.New("审核模式无效")
-	}
-	if config.AuditScope != "current_user" {
-		return errors.New("审核范围无效")
 	}
 	if !slices.Contains([]string{"any_block", "majority_block", "all_block"}, config.Aggregation) {
 		return errors.New("聚合规则无效")
@@ -497,13 +482,11 @@ func (m *ConfigManager) Reload(ctx context.Context) (loadErr error) {
 	}
 	stored := storedConfig{Config: DefaultConfig(), Revision: 1, EncryptedKeys: map[string]string{}}
 	if values[SettingKey] != "" {
-		stored.AuditScope = "current_user"
 		err = json.Unmarshal([]byte(values[SettingKey]), &stored)
 	}
 	// 节点名称是模型选择的派生展示值，旧配置加载后也立即使用统一规则。
 	normalizeModelNames(&stored.Config)
 	normalizeModelConcurrency(&stored.Config)
-	normalizeAuditScope(&stored.Config)
 	normalizeUserRuleModes(&stored.Config)
 	normalizeRetention(&stored.Config)
 	m.mu.Lock()
@@ -557,7 +540,6 @@ func (m *ConfigManager) upgradeLegacyDefaultPolicy(ctx context.Context) error {
 		return err
 	}
 	current := storedConfig{Config: DefaultConfig(), Revision: 1, EncryptedKeys: map[string]string{}}
-	current.AuditScope = "current_user"
 	if err := json.Unmarshal([]byte(raw), &current); err != nil {
 		return err
 	}
@@ -640,13 +622,6 @@ func (m *ConfigManager) IsExcluded(userID int64) bool {
 	return m.active != nil && m.loadError == nil && slices.Contains(m.active.Stored.ExcludedUserIDs, userID)
 }
 
-// CaptureWhenAuditOff 返回全局关闭时是否仍启用独立原文采集。
-func (m *ConfigManager) CaptureWhenAuditOff() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.active != nil && m.loadError == nil && m.active.Stored.CaptureWhenAuditOff
-}
-
 // EvaluationBinding 在同一配置读锁内冻结当前用户规则、审核节点及节点凭据。
 func (m *ConfigManager) EvaluationBinding(userID int64) (ConfigSnapshot, map[string]string, error) {
 	return m.evaluationBinding(userID, false)
@@ -725,7 +700,6 @@ func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID in
 	normalizeModelNames(&input.Config)
 	normalizeRetention(&input.Config)
 	normalizeUserRuleModes(&input.Config)
-	normalizeAuditScope(&input.Config)
 	if err := validateConfig(input.Config, input.Config.Mode != "off"); err != nil {
 		return PublicConfig{}, infraerrors.BadRequest("third_party_audit_invalid_config", err.Error())
 	}
@@ -749,7 +723,6 @@ func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID in
 		return PublicConfig{}, err
 	}
 	if err == nil {
-		current.AuditScope = "current_user"
 		if err := json.Unmarshal([]byte(raw), &current); err != nil {
 			return PublicConfig{}, err
 		}
@@ -856,12 +829,10 @@ func (m *ConfigManager) ReadSaved(ctx context.Context) (PublicConfig, error) {
 		return PublicConfig{}, err
 	}
 	if err == nil {
-		stored.AuditScope = "current_user"
 		if err = json.Unmarshal([]byte(raw), &stored); err != nil {
 			return PublicConfig{}, err
 		}
 	}
-	normalizeAuditScope(&stored.Config)
 	result := publicConfig(stored)
 	if err = m.Reload(ctx); err != nil {
 		result.ApplicationError = err.Error()

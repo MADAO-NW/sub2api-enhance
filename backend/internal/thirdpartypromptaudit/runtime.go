@@ -64,11 +64,13 @@ func (m *RuntimeMetrics) ObserveEvaluation(started, finished time.Time) {
 }
 
 func (m *RuntimeMetrics) Success(at time.Time) { m.mu.Lock(); defer m.mu.Unlock(); m.lastSuccess = &at }
+
 func (m *RuntimeMetrics) Error(code, message string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lastError = &RuntimeProblem{Code: code, Message: message, At: time.Now().UTC()}
 }
+
 func (m *RuntimeMetrics) Probe(result ProbeResult) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -76,35 +78,33 @@ func (m *RuntimeMetrics) Probe(result ProbeResult) {
 }
 
 type RuntimeSnapshot struct {
-	CapturePersistFailures uint64                   `json:"capture_persist_failures"`
-	IngressPool            sql.DBStats              `json:"ingress_pool"`
-	WorkerPool             sql.DBStats              `json:"worker_pool"`
-	WarningEnabled         bool                     `json:"warning_enabled"`
-	DisableEnabled         bool                     `json:"disable_enabled"`
-	InstanceID             string                   `json:"instance_id"`
-	StartedAt              time.Time                `json:"started_at"`
-	AsOf                   time.Time                `json:"as_of"`
-	Running                bool                     `json:"running"`
-	Mode                   string                   `json:"mode"`
-	Revision               int64                    `json:"revision"`
-	ExpectedRevision       int64                    `json:"expected_revision"`
-	WorkerCapacity         int                      `json:"worker_capacity"`
-	ActiveWorkers          int64                    `json:"active_workers"`
-	DatabaseOK             bool                     `json:"database_ok"`
-	DatabaseError          string                   `json:"database_error"`
-	ConfigError            string                   `json:"config_error"`
-	InputPersistFailures   uint64                   `json:"input_persist_failures"`
-	LastSuccess            *time.Time               `json:"last_success"`
-	LastError              *RuntimeProblem          `json:"last_error"`
-	EvaluationLatency      LatencySummary           `json:"evaluation_latency"`
-	Probes                 []ProbeResult            `json:"probes"`
-	Scheduler              schedulerRuntimeSnapshot `json:"scheduler"`
-	Redis                  RedisRuntime              `json:"redis"`
+	WorkerPool        sql.DBStats              `json:"worker_pool"`
+	WarningEnabled    bool                     `json:"warning_enabled"`
+	DisableEnabled    bool                     `json:"disable_enabled"`
+	InstanceID        string                   `json:"instance_id"`
+	StartedAt         time.Time                `json:"started_at"`
+	AsOf              time.Time                `json:"as_of"`
+	Running           bool                     `json:"running"`
+	Mode              string                   `json:"mode"`
+	Revision          int64                    `json:"revision"`
+	ExpectedRevision  int64                    `json:"expected_revision"`
+	WorkerCapacity    int                      `json:"worker_capacity"`
+	ActiveWorkers     int64                    `json:"active_workers"`
+	DatabaseOK        bool                     `json:"database_ok"`
+	DatabaseError     string                   `json:"database_error"`
+	ConfigError       string                   `json:"config_error"`
+	IntakeFailures    uint64                   `json:"intake_failures"`
+	LastSuccess       *time.Time               `json:"last_success"`
+	LastError         *RuntimeProblem          `json:"last_error"`
+	EvaluationLatency LatencySummary           `json:"evaluation_latency"`
+	Probes            []ProbeResult            `json:"probes"`
+	Scheduler         schedulerRuntimeSnapshot `json:"scheduler"`
+	Redis             RedisRuntime             `json:"redis"`
 }
 
 func (s *Service) Runtime(ctx context.Context) RuntimeSnapshot {
-	result := RuntimeSnapshot{InstanceID: s.metrics.InstanceID, StartedAt: s.metrics.StartedAt, AsOf: time.Now().UTC(), Running: s.running.Load(), Mode: s.config.EffectiveMode(),
-		ActiveWorkers: s.active.Load(), InputPersistFailures: s.metrics.IntakeFailures.Load(), Probes: []ProbeResult{}}
+	result := RuntimeSnapshot{InstanceID: s.metrics.InstanceID, StartedAt: s.metrics.StartedAt, AsOf: time.Now().UTC(), Running: s.running.Load(),
+		Mode: s.config.EffectiveMode(), ActiveWorkers: s.active.Load(), IntakeFailures: s.metrics.IntakeFailures.Load(), Probes: []ProbeResult{}}
 	result.WorkerCapacity = s.config.WorkerCapacity()
 	if s.redis != nil {
 		result.Redis = s.redis.Runtime()
@@ -130,7 +130,6 @@ func (s *Service) Runtime(ctx context.Context) RuntimeSnapshot {
 	} else {
 		result.Scheduler = schedulerRuntimeSnapshot{Nodes: []nodeRuntimeSnapshot{}}
 	}
-
 	dbCtx, cancel := context.WithTimeout(ctx, persistenceTimeout)
 	err := s.repo.db.PingContext(dbCtx)
 	cancel()

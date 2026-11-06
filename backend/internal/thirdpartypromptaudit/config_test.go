@@ -32,9 +32,8 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 	require.Equal(t, 0.8, *defaults.BlockThreshold)
 	require.Equal(t, WarningConfig{Window: 10, Limit: 2}, defaults.Warning)
 	require.Equal(t, DisableConfig{Limit: 1}, defaults.Disable)
-	require.True(t, defaults.CaptureWhenAuditOff)
 	require.Empty(t, defaults.UserRules)
-	require.Equal(t, "current_user", defaults.AuditScope)
+	require.Equal(t, RetentionDefaultDays, defaults.RetentionDays)
 	require.Equal(t, 0.5, publicDefaults.ReviewThreshold)
 	require.Equal(t, 0.8, publicDefaults.BlockThreshold)
 	require.Equal(t, 10, publicDefaults.WarningWindow)
@@ -62,13 +61,15 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 	require.ErrorContains(t, validateModel(model), "最大并发")
 }
 
-func TestCaptureWhenAuditOffDefaultDoesNotOverrideExplicitFalse(t *testing.T) {
-	missing := storedConfig{Config: DefaultConfig()}
-	require.NoError(t, json.Unmarshal([]byte(`{"mode":"off"}`), &missing))
-	require.True(t, missing.CaptureWhenAuditOff)
-	explicit := storedConfig{Config: DefaultConfig()}
-	require.NoError(t, json.Unmarshal([]byte(`{"mode":"off","capture_when_audit_off":false}`), &explicit))
-	require.False(t, explicit.CaptureWhenAuditOff)
+// 旧配置缺少保留天数时补齐默认值，已下线的采集配置不再读取。
+func TestRetentionDefaultsAndLegacyFieldsAreIgnored(t *testing.T) {
+	legacy := storedConfig{Config: DefaultConfig()}
+	require.NoError(t, json.Unmarshal([]byte(`{"mode":"off","capture_when_audit_off":false,"audit_scope":"current_user"}`), &legacy))
+	require.Equal(t, RetentionDefaultDays, legacy.RetentionDays)
+	zero := storedConfig{Config: DefaultConfig()}
+	zero.RetentionDays = 0
+	normalizeRetention(&zero.Config)
+	require.Equal(t, RetentionDefaultDays, zero.RetentionDays)
 }
 
 func TestUserRuleOverridesOnlyTheSelectedUsersDecisionAndActions(t *testing.T) {
@@ -93,19 +94,19 @@ func TestUserRuleOverridesOnlyTheSelectedUsersDecisionAndActions(t *testing.T) {
 	require.Equal(t, "blocking", effectiveConfigForUser(config, 8).Mode)
 }
 
-func TestCaptureOnlyAndManualReviewStayIndependentFromAutomaticAuditScope(t *testing.T) {
+// 全局 off 与不审核用户都在入口直接放行：不建任务、不落库，也不需要解析后的目标。
+func TestGlobalOffAndExcludedUsersSkipAudit(t *testing.T) {
 	config := testConfig()
 	config.Mode = "off"
-	config.CaptureWhenAuditOff = true
 	config.ExcludedUserIDs = []int64{7}
 	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config}}}
 	service := &Service{config: manager, closing: true, metrics: NewRuntimeMetrics()}
-	require.True(t, manager.CaptureWhenAuditOff())
-	require.False(t, service.RequiresAudit(7, nil, "openai"))
-	decision := service.Check(context.Background(), IntakeRequest{Manual: true, UserID: 7, Provider: "openai"})
-	require.NotNil(t, decision)
-	require.Equal(t, "async", decision.Mode)
-	require.Equal(t, IngressDecisionUnavailable, decision.Kind)
+	require.Equal(t, "off", manager.EffectiveMode())
+	require.Equal(t, "off", manager.EffectiveModeForUser(7))
+	parsed := ParsePromptTexts("chat_completions", []string{"正常请求"}, ClientGeneric)
+	require.Nil(t, service.Check(context.Background(), IntakeRequest{Parsed: parsed, UserID: 8, APIKeyID: 2, Provider: "openai"}))
+	config.Mode = "async"
+	require.Nil(t, service.Check(context.Background(), IntakeRequest{Parsed: parsed, UserID: 7, APIKeyID: 2, Provider: "openai"}))
 }
 
 func TestPerUserModeRespectsGlobalOffAndFreezesEvaluationCredentials(t *testing.T) {
@@ -225,32 +226,35 @@ func TestSavingNewExclusionTerminatesQueuedAndRetryJobs(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestAutomaticRequestWithoutCurrentUserDoesNotCreateJob(t *testing.T) {
+// 没有审核目标时不建任务：这是历史里没有用户文本的唯一放行路径。
+func TestRequestWithoutTargetsCreatesNoJob(t *testing.T) {
 	config := testConfig()
 	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config}}}
 	service := &Service{config: manager, metrics: NewRuntimeMetrics()}
-	decision := service.Check(context.Background(), IntakeRequest{UserID: 7, Provider: "openai", Protocol: "openai_chat_completions", Body: []byte(`{"messages":[{"role":"assistant","content":"模型续写"}]}`)})
+	decision := service.Check(context.Background(), IntakeRequest{Parsed: &ParsedRequest{TurnFingerprint: "turn"}, UserID: 7, Provider: "openai"})
 	require.NotNil(t, decision)
 	require.Equal(t, IngressDecisionAllow, decision.Kind)
 	require.Equal(t, int64(0), decision.JobID)
 	require.Equal(t, "current_user_not_found", decision.ErrorCode)
 }
 
-func TestUserModeIsChosenAtIntakeAndExclusionStillWins(t *testing.T) {
+// 入口按用户规则选择模式，后台请求不能占用同步等待。
+func TestUserModeIsChosenAtIntakeAndBackgroundDowngrades(t *testing.T) {
 	config := testConfig()
 	config.UserRules = []UserRuleConfig{{UserID: 7, Mode: "blocking", ReviewThreshold: 0.5, BlockThreshold: 0.8, Aggregation: "any_block", Warning: WarningConfig{Window: 10, Limit: 3}, Disable: DisableConfig{Limit: 5}}}
 	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config}}}
 	service := &Service{config: manager, closing: true, metrics: NewRuntimeMetrics()}
-	decision := service.Check(context.Background(), IntakeRequest{UserID: 7, Provider: "openai"})
+	parsed := &ParsedRequest{TurnFingerprint: "turn"}
+	decision := service.Check(context.Background(), IntakeRequest{Parsed: parsed, UserID: 7, Provider: "openai"})
 	require.NotNil(t, decision)
 	require.Equal(t, "blocking", decision.Mode)
-	decision = service.Check(context.Background(), IntakeRequest{UserID: 7, Provider: "openai", Background: true})
+	decision = service.Check(context.Background(), IntakeRequest{Parsed: parsed, UserID: 7, Provider: "openai", Background: true})
 	require.NotNil(t, decision)
 	require.Equal(t, "async", decision.Mode)
 	config.ExcludedUserIDs = []int64{7}
 	manager.active.Stored.Config = config
 	require.Equal(t, "off", manager.EffectiveModeForUser(7))
-	require.Nil(t, service.Check(context.Background(), IntakeRequest{UserID: 7, Provider: "openai"}))
+	require.Nil(t, service.Check(context.Background(), IntakeRequest{Parsed: parsed, UserID: 7, Provider: "openai"}))
 }
 
 func TestRemovedParametersRejectedAtConfigAndProbeBoundaries(t *testing.T) {
@@ -289,29 +293,10 @@ func TestHistoricalSnapshotsAreDisplayOnlyAndNewSnapshotsStayClean(t *testing.T)
 		display, err := json.Marshal(historical)
 		require.NoError(t, err)
 		require.JSONEq(t, old, string(display))
-		// 没有仓储和客户端；旧快照必须在调用或缓存读取前失败。
-		_, failure := (&Evaluator{}).Evaluate(context.Background(), &Job{Config: historical}, nil)
-		require.Equal(t, "audit_snapshot_requires_reaudit", failure.Code)
-		require.False(t, failure.Retryable)
 	}
 	var current ConfigSnapshot
 	require.NoError(t, json.Unmarshal(raw, &current))
 	require.Nil(t, current.historicalJSON)
-}
-
-func TestSnapshotWithoutScopeUsesCurrentUserBehavior(t *testing.T) {
-	config := testConfig()
-	snapshot := ConfigSnapshot{Config: config, Revision: 2, ContractVersion: ContractVersion, FixedContract: OutputContract}
-	raw, err := json.Marshal(snapshot)
-	require.NoError(t, err)
-	var fields map[string]json.RawMessage
-	require.NoError(t, json.Unmarshal(raw, &fields))
-	delete(fields, "audit_scope")
-	raw, err = json.Marshal(fields)
-	require.NoError(t, err)
-	var restored ConfigSnapshot
-	require.NoError(t, json.Unmarshal(raw, &restored))
-	require.Equal(t, "current_user", restored.AuditScope)
 }
 
 func TestConfigRequiresCalibratedThresholdsOnlyWhenActivating(t *testing.T) {

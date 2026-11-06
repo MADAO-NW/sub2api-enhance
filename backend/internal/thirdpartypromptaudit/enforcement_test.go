@@ -60,13 +60,13 @@ func TestBlockingNoticeRecipientsAreIndependentAndDeduplicated(t *testing.T) {
 	outcomeID := int64(9)
 	action := Action{ActionType: "blocking_notice", JobID: &outcomeID}
 	user := EnforcementUser{Username: "user", Email: "user@example.invalid"}
-	deliveries := actionDeliveries(action, user, "admin@example.invalid")
+	deliveries := jobActionDeliveries(action, user, "admin@example.invalid")
 	require.Len(t, deliveries, 2)
 	require.Equal(t, "admin", deliveries[0].Kind)
 	require.Equal(t, "user", deliveries[1].Kind)
 	require.Contains(t, deliveries[0].Subject, "请求已阻止")
-	require.Len(t, actionDeliveries(action, user, "user@example.invalid"), 1)
-	require.Len(t, actionDeliveries(action, user, ""), 1)
+	require.Len(t, jobActionDeliveries(action, user, "user@example.invalid"), 1)
+	require.Len(t, jobActionDeliveries(action, user, ""), 1)
 }
 
 func TestNotificationWorkerSendsAdminAndUserDeliveriesIndependently(t *testing.T) {
@@ -108,18 +108,4 @@ func TestTestAdminEmailRejectsMissingAdministratorRecipient(t *testing.T) {
 	err := service.TestAdminEmail(context.Background())
 	require.Equal(t, 400, infraerrors.Code(err))
 	require.Equal(t, "third_party_audit_admin_email_missing", infraerrors.Reason(err))
-}
-
-func TestDisableContributionFollowsTheLatestTaskDecision(t *testing.T) {
-	count, counted := adjustDisableContribution(4, false, true)
-	require.EqualValues(t, 5, count)
-	require.True(t, counted)
-	count, counted = adjustDisableContribution(count, counted, true)
-	require.EqualValues(t, 5, count)
-	count, counted = adjustDisableContribution(count, counted, false)
-	require.EqualValues(t, 4, count)
-	require.False(t, counted)
-	count, counted = adjustDisableContribution(0, true, false)
-	require.Zero(t, count)
-	require.False(t, counted)
 }

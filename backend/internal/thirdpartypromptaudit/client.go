@@ -7,13 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/lib/pq"
 	"io"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 type probeContextKey int
@@ -24,32 +25,34 @@ const probeActorContext probeContextKey = 0
 // healthProbeContext 标识服务自动发起的低频节点恢复探测。
 const healthProbeContext probeContextKey = 1
 
+// attemptStore 抽象真实模型调用流水的持久化，测试实现与 Repository 共用同一流程。
+type attemptStore interface {
+	PrepareModelAttempt(ctx context.Context, job *AuditJob, attempt *ModelAttempt) error
+	StartModelAttempt(ctx context.Context, job *AuditJob, attempt *ModelAttempt) error
+	FinishModelAttempt(ctx context.Context, job *AuditJob, attempt *ModelAttempt) error
+}
+
 type ModelClient struct {
 	publicOrigin string
-	attempts     AttemptStore
+	attempts     attemptStore
 	allowAudit   func() bool
-	allowJob     func(*Job) error
+	allowJob     func(*AuditJob) error
 }
 
 func NewModelClient(repository *Repository, config *ConfigManager) *ModelClient {
-	return &ModelClient{publicOrigin: config.publicOrigin, attempts: repository, allowAudit: func() bool { return config.EffectiveMode() != "off" }, allowJob: func(job *Job) error {
-		if job != nil && !job.Dispatched && job.IngressStage != "manual_capture_reprocess" && job.CurrentRequestedBy == nil && config.IsExcluded(job.UserID) {
-			return ErrUserExcluded
-		}
-		return nil
-	}}
+	return &ModelClient{publicOrigin: config.publicOrigin, attempts: repository,
+		allowAudit: func() bool { return config.EffectiveMode() != "off" },
+		allowJob: func(job *AuditJob) error {
+			if job != nil && !job.Dispatched && job.CurrentRequestedBy == nil && config.IsExcluded(job.UserID) {
+				return ErrUserExcluded
+			}
+			return nil
+		}}
 }
 
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
-}
-
-// chatRequest 保留审核节点固定字段的测试契约；运行时会在同名字段外合并高级参数。
-type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
-	Stream   bool          `json:"stream"`
 }
 
 func nodeHTTPClient(model ModelConfig) (*http.Client, string, error) {
@@ -68,20 +71,20 @@ func nodeHTTPClient(model ModelConfig) (*http.Client, string, error) {
 }
 
 // EvaluateTarget 在同一个节点总预算内至多修正一次格式，逐次记录真实 HTTP 调用。
-func (c *ModelClient) EvaluateTarget(ctx context.Context, job *Job, model ModelConfig, key string, snapshot ConfigSnapshot,
-	client *http.Client, url, stage string, target any, order *int) (*Score, int64, *AuditError) {
+func (c *ModelClient) EvaluateTarget(ctx context.Context, job *AuditJob, model ModelConfig, key string, snapshot ConfigSnapshot,
+	client *http.Client, url, kind, text, targetHash string, order *int) (*Score, int64, *AuditError) {
 	var repairOf *int64
 	correction := ""
 	for number := 0; number < 2; number++ {
-		callStage := stage
+		callStage := kind
 		if number > 0 {
 			callStage = "format_repair"
 		}
-		result, id, failure := c.call(ctx, job, model, key, snapshot, client, url, stage, callStage, target, order, repairOf, correction)
+		result, id, failure := c.call(ctx, job, model, key, snapshot, client, url, kind, callStage, text, targetHash, order, repairOf, correction)
 		if failure == nil {
 			return result, id, nil
 		}
-		if stage == "health_probe" || (failure.Code != "invalid_response" && failure.Code != "upstream_protocol_error") || number > 0 || ctx.Err() != nil {
+		if kind == "health_probe" || (failure.Code != "invalid_response" && failure.Code != "upstream_protocol_error") || number > 0 || ctx.Err() != nil {
 			return nil, id, failure
 		}
 		repairOf = &id
@@ -90,8 +93,8 @@ func (c *ModelClient) EvaluateTarget(ctx context.Context, job *Job, model ModelC
 	return nil, 0, &AuditError{Code: "invalid_response", Stage: "response_parse", Message: "节点返回格式无效"}
 }
 
-func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key string, snapshot ConfigSnapshot,
-	client *http.Client, url, ruleStage, callStage string, target any, order *int, repairOf *int64, correction string) (*Score, int64, *AuditError) {
+func (c *ModelClient) call(ctx context.Context, job *AuditJob, model ModelConfig, key string, snapshot ConfigSnapshot,
+	client *http.Client, url, kind, callStage, text, targetHash string, order *int, repairOf *int64, correction string) (*Score, int64, *AuditError) {
 	if c.publicOrigin != "" && strings.HasPrefix(url, c.publicOrigin+"/") {
 		return nil, 0, &AuditError{Code: "audit_node_recursion", Stage: "model_request", Message: "审核节点不能指向增强公共入口"}
 	}
@@ -107,11 +110,7 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 			return nil, 0, persistenceFailure(err, "user_excluded")
 		}
 	}
-	auditStage := ruleStage
-	if auditStage == "probe" || auditStage == "health_probe" {
-		auditStage = TargetKindCurrentUser
-	}
-	targetJSON, err := json.Marshal(auditEnvelope{Stage: auditStage, Target: target})
+	envelope, err := json.Marshal(auditEnvelope{TargetKind: kind, Target: text})
 	if err != nil {
 		return nil, 0, &AuditError{Code: "input_encode_failed", Stage: "input_parse", Message: err.Error()}
 	}
@@ -121,33 +120,30 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 	}
 	request["model"] = model.Model
 	request["stream"] = false
-	request["messages"] = []chatMessage{{Role: "system", Content: systemPromptSnapshot(snapshot, correction)}, {Role: "user", Content: string(targetJSON)}}
+	request["messages"] = []chatMessage{{Role: "system", Content: systemPromptSnapshot(snapshot, kind, correction)}, {Role: "user", Content: string(envelope)}}
 	body, err := json.Marshal(request)
 	if err != nil {
 		return nil, 0, &AuditError{Code: "request_encode_failed", Stage: "model_request", Message: err.Error()}
 	}
-	metadata := map[string]any{"stage": ruleStage, "segment_order": order, "repair_of_attempt_id": repairOf, "model": model, "contract_version": snapshot.ContractVersion, "request_body": request}
-	metadata["audit_stage"] = auditStage
-	attempt := &ModelAttempt{ModelID: model.ID, ModelSnapshot: model, Stage: callStage, SegmentOrder: order, RepairOfAttemptID: repairOf, Status: "prepared"}
+	metadata := map[string]any{"target_kind": kind, "target_order": order, "target_hash": targetHash, "repair_of_attempt_id": repairOf,
+		"model": model, "contract_version": snapshot.ContractVersion, "request_body": request}
+	attempt := &ModelAttempt{ModelID: model.ID, ModelSnapshot: model, Stage: callStage, RepairOfAttemptID: repairOf, Status: "prepared", TargetHash: targetHash}
 	if job == nil {
 		attempt.CallKind = "probe"
-		if automatic, _ := ctx.Value(healthProbeContext).(bool); automatic {
+		if automaticHealthProbe {
 			attempt.CallKind = "health_probe"
 		}
 		metadata["actor_user_id"] = ctx.Value(probeActorContext)
 	} else {
-		attempt.JobID = &job.ID
-		attempt.EvaluationRound = &job.Attempts
-		attempt.AuditRound = job.AuditRound
-		attempt.CallKind = "audit"
+		jobID, round, evaluation := job.ID, job.CurrentRound, max(job.Attempts, 1)
+		attempt.JobID, attempt.AuditRound, attempt.EvaluationRound, attempt.CallKind = &jobID, round, &evaluation, "audit"
 		metadata["job_id"] = job.ID
-		metadata["target_hash"] = job.TargetHash
 	}
 	attempt.RequestMetadata, err = json.Marshal(metadata)
 	if err != nil {
 		return nil, 0, &AuditError{Code: "request_encode_failed", Stage: "model_request", Message: err.Error()}
 	}
-	if err := c.attempts.PrepareAttempt(ctx, job, attempt); err != nil {
+	if err := c.attempts.PrepareModelAttempt(ctx, job, attempt); err != nil {
 		return nil, 0, persistenceFailure(err, "attempt_prepare_failed")
 	}
 	if job != nil && c.allowJob != nil {
@@ -164,7 +160,7 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 	if key != "" {
 		httpRequest.Header.Set("Authorization", "Bearer "+key)
 	}
-	if err := c.attempts.StartAttempt(ctx, job, attempt); err != nil {
+	if err := c.attempts.StartModelAttempt(ctx, job, attempt); err != nil {
 		return nil, attempt.ID, persistenceFailure(err, "attempt_start_failed")
 	}
 	if job != nil {
@@ -180,8 +176,8 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 		attempt.HTTPStatus = &response.StatusCode
 		raw, readErr := io.ReadAll(response.Body)
 		closeErr := response.Body.Close()
-		text := string(raw)
-		attempt.RawResponse = &text
+		value := string(raw)
+		attempt.RawResponse = &value
 		if readErr != nil {
 			failure = requestFailure(readErr)
 		} else if closeErr != nil {
@@ -216,9 +212,9 @@ func (c *ModelClient) call(ctx context.Context, job *Job, model ModelConfig, key
 		attempt.ErrorMessage = failure.Message
 	}
 	// 仅持久化收尾脱离请求取消，不能借此再次调用第三方。
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
 	defer cancel()
-	if err := c.attempts.FinishAttempt(persistCtx, job, attempt); err != nil {
+	if err := c.attempts.FinishModelAttempt(persistCtx, job, attempt); err != nil {
 		return nil, attempt.ID, persistenceFailure(err, "attempt_result_persist_failed")
 	}
 	return result, attempt.ID, failure

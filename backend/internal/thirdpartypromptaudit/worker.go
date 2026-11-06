@@ -16,9 +16,8 @@ func (s *Service) run() {
 	defer s.wg.Done()
 	defer s.running.Store(false)
 	var tasks sync.WaitGroup
-	tasks.Add(2)
+	tasks.Add(1)
 	go func() { defer tasks.Done(); s.actionLoop(s.ctx) }()
-	go func() { defer tasks.Done(); s.captureLoop(s.ctx) }()
 	defer tasks.Wait()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -37,7 +36,7 @@ func (s *Service) run() {
 				s.refreshNodeLimits()
 			}
 			recoverCtx, recoverCancel := context.WithTimeout(s.ctx, persistenceTimeout)
-			if err := s.repo.RecoverExpired(recoverCtx); err != nil && s.ctx.Err() == nil {
+			if err := s.repo.RecoverExpiredAuditJobs(recoverCtx); err != nil && s.ctx.Err() == nil {
 				s.noteError("lease_recovery_failed", err)
 			}
 			recoverCancel()
@@ -46,7 +45,7 @@ func (s *Service) run() {
 		// Worker 数是评估并发槽位；缩容不取消正在处理的任务。
 		for s.ctx.Err() == nil && s.tryAcquireSlot() {
 			claimCtx, cancel := context.WithTimeout(s.ctx, persistenceTimeout)
-			job, err := s.repo.Claim(claimCtx, s.config.EffectiveMode() != "off")
+			job, err := s.repo.ClaimAuditJob(claimCtx, s.config.EffectiveMode() != "off")
 			cancel()
 			if err != nil {
 				s.active.Add(-1)
@@ -59,9 +58,9 @@ func (s *Service) run() {
 				s.active.Add(-1)
 				break
 			}
-			logger.LegacyPrintf("third_party_prompt_audit", "开始处理审核任务 job_id=%d evaluation_round=%d claim_generation=%d", job.ID, job.Attempts, job.ClaimGeneration)
+			logger.LegacyPrintf("third_party_prompt_audit", "开始处理审核任务 job_id=%d round=%d attempts=%d claim_generation=%d", job.ID, job.CurrentRound, job.Attempts, job.ClaimGeneration)
 			tasks.Add(1)
-			go func(job *Job) {
+			go func(job *AuditJob) {
 				defer tasks.Done()
 				defer s.releaseSlot()
 				_, _ = s.processJob(s.ctx, job, false)

@@ -19,14 +19,13 @@ import (
 )
 
 type AdminHandler struct {
-	captures *CaptureStore
-	service  *Service
-	config   *ConfigManager
-	repo     *Repository
+	service *Service
+	config  *ConfigManager
+	repo    *Repository
 }
 
-func NewAdminHandler(service *Service, config *ConfigManager, repo *Repository, captures *CaptureStore) *AdminHandler {
-	return &AdminHandler{service: service, config: config, repo: repo, captures: captures}
+func NewAdminHandler(service *Service, config *ConfigManager, repo *Repository) *AdminHandler {
+	return &AdminHandler{service: service, config: config, repo: repo}
 }
 
 // bindStrict 在配置和管理写入的接入边界拒绝重复字段、固定协议字段和未知属性。
@@ -114,7 +113,7 @@ func (h *AdminHandler) TestAdminEmail(c *gin.Context) {
 }
 
 func (h *AdminHandler) GetContract(c *gin.Context) {
-	response.Success(c, gin.H{"version": ContractVersion, "default_policy": DefaultPolicy, "output_contract": OutputContract})
+	response.Success(c, gin.H{"version": ContractVersion, "default_policy": DefaultPolicy, "output_contract": OutputContract, "template_rules": TemplateRules()})
 }
 
 func (h *AdminHandler) ListModels(c *gin.Context) {
@@ -146,12 +145,7 @@ func (h *AdminHandler) ProbeModel(c *gin.Context) {
 }
 
 func (h *AdminHandler) GetRuntime(c *gin.Context) {
-	result := h.service.Runtime(c.Request.Context())
-	if h.captures != nil {
-		result.CapturePersistFailures = h.captures.failures.Load()
-		result.IngressPool = h.captures.db.Stats()
-	}
-	response.Success(c, result)
+	response.Success(c, h.service.Runtime(c.Request.Context()))
 }
 
 func (h *AdminHandler) GetStats(c *gin.Context) {
@@ -174,13 +168,9 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 		response.BadRequest(c, "统计时区无效")
 		return
 	}
-	query := StatsQuery{From: from, To: to, Timezone: timezone, Mode: c.Query("mode"), ModelID: c.Query("model_id"), Stage: c.Query("stage")}
+	query := StatsQuery{From: from, To: to, Timezone: timezone, Mode: c.Query("mode")}
 	if query.Mode != "" && query.Mode != "async" && query.Mode != "blocking" {
 		response.BadRequest(c, "运行模式筛选无效")
-		return
-	}
-	if query.Stage != "" && !slices.Contains([]string{"segment", "joint", "format_repair", "probe", "current_user", "instruction_context", "intent_binding", "effective_behavior", "health_probe"}, query.Stage) {
-		response.BadRequest(c, "调用阶段筛选无效")
 		return
 	}
 	result, err := h.repo.Stats(c.Request.Context(), query)
@@ -192,7 +182,8 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 }
 
 func filterFromQuery(c *gin.Context) (Filter, error) {
-	filter := Filter{Status: c.Query("status"), Decision: Decision(c.Query("decision")), RunKind: c.Query("run_kind"), Mode: c.Query("mode"), Platform: c.Query("platform"), RequestID: c.Query("request_id"), Keyword: c.Query("keyword"), ModelID: c.Query("model_id"), ModelName: c.Query("model_name")}
+	filter := Filter{Status: c.Query("status"), Decision: Decision(c.Query("decision")), RunKind: c.Query("run_kind"),
+		Mode: c.Query("mode"), Platform: c.Query("platform"), RequestID: c.Query("request_id"), Model: c.Query("model")}
 	for _, field := range []struct {
 		name   string
 		target **int64
@@ -218,8 +209,8 @@ func filterFromQuery(c *gin.Context) (Filter, error) {
 		}
 	}
 	if value := c.Query("ids"); value != "" {
-		for _, value := range strings.Split(value, ",") {
-			id, err := strconv.ParseInt(value, 10, 64)
+		for _, part := range strings.Split(value, ",") {
+			id, err := strconv.ParseInt(part, 10, 64)
 			if err != nil {
 				return filter, errors.New("ID 列表无效")
 			}
@@ -289,33 +280,6 @@ func (h *AdminHandler) GetJob(c *gin.Context) {
 	response.Success(c, result)
 }
 
-func (h *AdminHandler) GetJobLatestUserContent(c *gin.Context) {
-	id, ok := recordID(c)
-	if !ok {
-		return
-	}
-	result, err := h.repo.JobLatestUserContent(c.Request.Context(), id)
-	if err != nil {
-		respondError(c, err)
-		return
-	}
-	response.Success(c, result)
-}
-
-func (h *AdminHandler) ResumeResult(c *gin.Context) {
-	id, ok := recordID(c)
-	if !ok {
-		return
-	}
-	if err := h.repo.ResumeResult(c.Request.Context(), id); err != nil {
-		respondError(c, err)
-		return
-	}
-	middleware.SetAuditExtra(c, map[string]any{"result": "success", "job_id": id})
-	h.service.notify()
-	response.Success(c, gin.H{"id": id, "status": "retry"})
-}
-
 func (h *AdminHandler) RetryAction(c *gin.Context) {
 	id, ok := recordID(c)
 	if !ok {
@@ -336,10 +300,6 @@ func (h *AdminHandler) PreviewReaudits(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	if err := validateFilter(input.Filter); err != nil {
-		response.BadRequest(c, err.Error())
-		return
-	}
 	result, err := h.repo.PreviewReaudits(c.Request.Context(), input)
 	if err != nil {
 		respondError(c, err)
@@ -351,10 +311,6 @@ func (h *AdminHandler) PreviewReaudits(c *gin.Context) {
 func (h *AdminHandler) CreateReaudits(c *gin.Context) {
 	var input ReauditRequest
 	if err := bindStrict(c, &input); err != nil {
-		response.BadRequest(c, err.Error())
-		return
-	}
-	if err := validateFilter(input.Filter); err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
@@ -373,84 +329,110 @@ func (h *AdminHandler) CreateReaudits(c *gin.Context) {
 	response.Accepted(c, result)
 }
 
-func (h *AdminHandler) CreateBatch(c *gin.Context) {
-	var input BatchRequest
-	if err := bindStrict(c, &input); err != nil {
+type TrustRequest struct {
+	Hash   string `json:"hash" binding:"required,len=64"`
+	Reason string `json:"reason" binding:"max=200"`
+}
+
+func (h *AdminHandler) ListTrust(c *gin.Context) {
+	page, size, err := paginationQuery(c)
+	if err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	if input.Type != BatchPendingReview && input.Type != BatchFailedRecovery && input.Type != BatchReauditSelected && input.Type != BatchReauditFilter {
-		response.BadRequest(c, "批次类型无效")
-		return
-	}
-	b, err := h.repo.CreateBatch(c.Request.Context(), input, adminActor(c))
+	result, err := h.repo.ListTrust(c.Request.Context(), page, size)
 	if err != nil {
 		respondError(c, err)
 		return
 	}
-	h.service.notify()
-	response.Accepted(c, gin.H{"batch_id": b.ID, "status": b.Status, "matched": b.Matched, "ready": b.Ready})
-}
-func (h *AdminHandler) GetBatch(c *gin.Context) {
-	id, ok := recordID(c)
-	if !ok {
-		return
-	}
-	b, err := h.repo.GetBatch(c.Request.Context(), id)
-	if err != nil {
-		respondError(c, err)
-		return
-	}
-	response.Success(c, b)
+	response.Success(c, result)
 }
 
-func (h *AdminHandler) GetBatchItems(c *gin.Context) {
-	id, ok := recordID(c)
-	if !ok {
-		return
-	}
-	limit, afterID := 50, int64(0)
-	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 {
-		limit = v
-	}
-	if value := c.Query("after_id"); value != "" {
-		parsed, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || parsed < 0 {
-			response.BadRequest(c, "after_id 无效")
-			return
-		}
-		afterID = parsed
-	}
-	items, err := h.repo.GetBatchItems(c.Request.Context(), id, limit, afterID)
-	if err != nil {
-		respondError(c, err)
-		return
-	}
-	response.Success(c, items)
-}
-
-func (h *AdminHandler) PreviewBatch(c *gin.Context) {
-	var input BatchRequest
+func (h *AdminHandler) TrustInstruction(c *gin.Context) {
+	var input TrustRequest
 	if err := bindStrict(c, &input); err != nil {
+		response.BadRequest(c, "信任请求无效："+err.Error())
+		return
+	}
+	if err := h.repo.TrustInstruction(c.Request.Context(), input.Hash, adminActor(c), input.Reason); err != nil {
+		respondError(c, err)
+		return
+	}
+	middleware.SetAuditExtra(c, map[string]any{"result": "success", "hash": input.Hash})
+	response.Success(c, gin.H{"hash": input.Hash})
+}
+
+func (h *AdminHandler) UntrustInstruction(c *gin.Context) {
+	hash := c.Param("hash")
+	if len(hash) != 64 {
+		response.BadRequest(c, "指令块哈希无效")
+		return
+	}
+	if err := h.repo.UntrustInstruction(c.Request.Context(), hash, adminActor(c)); err != nil {
+		respondError(c, err)
+		return
+	}
+	middleware.SetAuditExtra(c, map[string]any{"result": "success", "hash": hash})
+	response.Success(c, gin.H{"hash": hash})
+}
+
+func (h *AdminHandler) ListBreakers(c *gin.Context) {
+	page, size, err := paginationQuery(c)
+	if err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	p, err := h.repo.PreviewBatch(c.Request.Context(), input)
+	status := c.Query("status")
+	if status != "" && !slices.Contains([]string{BreakerTripped, BreakerTrusted, BreakerConfirmed}, status) {
+		response.BadRequest(c, "熔断状态筛选无效")
+		return
+	}
+	result, err := h.repo.ListBreakers(c.Request.Context(), status, page, size)
 	if err != nil {
 		respondError(c, err)
 		return
 	}
-	response.Success(c, p)
+	response.Success(c, result)
 }
-func (h *AdminHandler) ListBatches(c *gin.Context) {
-	limit := 20
-	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 {
-		limit = v
+
+func (h *AdminHandler) ConfirmBreaker(c *gin.Context) {
+	hash := c.Param("hash")
+	if len(hash) != 64 {
+		response.BadRequest(c, "指令块哈希无效")
+		return
 	}
-	items, err := h.repo.ListBatches(c.Request.Context(), adminActor(c), limit)
+	if err := h.repo.ConfirmBreaker(c.Request.Context(), hash, adminActor(c)); err != nil {
+		respondError(c, err)
+		return
+	}
+	middleware.SetAuditExtra(c, map[string]any{"result": "success", "hash": hash})
+	response.Success(c, gin.H{"hash": hash})
+}
+
+// EnableAndReset 通过处置动作发件箱恢复用户并重置累计；已计指令块记录保留（决策 21）。
+func (h *AdminHandler) EnableAndReset(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		response.BadRequest(c, "用户 ID 无效")
+		return
+	}
+	if h.service.accounts == nil {
+		response.BadRequest(c, "账号 API 未配置")
+		return
+	}
+	user, err := h.service.accounts.GetUser(c.Request.Context(), id)
 	if err != nil {
 		respondError(c, err)
 		return
 	}
-	response.Success(c, items)
+	if user.Role != "user" {
+		response.BadRequest(c, "只允许处理普通用户")
+		return
+	}
+	actionID, err := h.repo.CreateCounterReset(c.Request.Context(), id, adminActor(c))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Accepted(c, gin.H{"action_id": actionID, "execution_status": "pending"})
 }
