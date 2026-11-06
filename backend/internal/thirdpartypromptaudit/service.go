@@ -2,10 +2,10 @@ package thirdpartypromptaudit
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,7 +13,6 @@ import (
 	infraerrors "sub2api-enhance/internal/pkg/errors"
 	"sub2api-enhance/internal/pkg/logger"
 
-	"github.com/google/uuid"
 	"sub2api-enhance/internal/notify"
 	"sub2api-enhance/internal/sub2api"
 )
@@ -21,43 +20,48 @@ import (
 // persistenceTimeout 限定请求退出后的数据库收尾时间，不用于追加模型调用。
 const persistenceTimeout = 5 * time.Second
 
+// blockingTurnWait 是 blocking 模式等待同一回合已有任务结论的上限（既定 5 秒边界）。
+const blockingTurnWait = 5 * time.Second
+
 type Service struct {
-	accounts      *sub2api.Client
-	repo          *Repository
-	config        *ConfigManager
-	evaluator     *Evaluator
-	client        *ModelClient
-	email         notify.Sender
-	mu            sync.Mutex
-	ctx           context.Context
-	cancel        context.CancelFunc
-	closing       bool
-	wg            sync.WaitGroup
-	foreground    sync.WaitGroup
-	wake          chan struct{}
-	active        atomic.Int64
-	running       atomic.Bool
-	metrics       *RuntimeMetrics
-	redis         *RedisStore
-	flightMu      sync.Mutex
-	flights       map[string]*evaluationFlight
-	flightLeaders map[int64]string
+	accounts   *sub2api.Client
+	repo       *Repository
+	config     *ConfigManager
+	evaluator  *Evaluator
+	client     *ModelClient
+	email      notify.Sender
+	mu         sync.Mutex
+	ctx        context.Context
+	cancel     context.CancelFunc
+	closing    bool
+	wg         sync.WaitGroup
+	foreground sync.WaitGroup
+	wake       chan struct{}
+	active     atomic.Int64
+	running    atomic.Bool
+	metrics    *RuntimeMetrics
+	redis      *RedisStore
+	flightMu   sync.Mutex
+	flights    map[string]*reviewFlight
+	leaders    map[int64][]string
 }
 
-// SetRedisStore 在服务对外启动前装配可重建的统计投影与审核热缓存。
+// reviewFlight 合并同一 (内容哈希, 评估语义) 的并发审核：后到的任务等待并共享结论。
+type reviewFlight struct {
+	done    chan struct{}
+	outcome *reviewOutcome
+	failure *AuditError
+}
+
+// SetRedisStore 在服务对外启动前装配回合键与响应映射。
 func (s *Service) SetRedisStore(store *RedisStore) {
 	s.redis = store
 	s.repo.SetRedisStore(store)
 }
 
-type evaluationFlight struct {
-	done       chan struct{}
-	evaluation *Evaluation
-	failure    *AuditError
-}
-
 func NewService(repo *Repository, config *ConfigManager, evaluator *Evaluator, client *ModelClient, email notify.Sender) *Service {
-	return &Service{repo: repo, config: config, evaluator: evaluator, client: client, email: email, wake: make(chan struct{}, 1), metrics: NewRuntimeMetrics(), flights: make(map[string]*evaluationFlight), flightLeaders: make(map[int64]string)}
+	return &Service{repo: repo, config: config, evaluator: evaluator, client: client, email: email, wake: make(chan struct{}, 1),
+		metrics: NewRuntimeMetrics(), flights: make(map[string]*reviewFlight), leaders: make(map[int64][]string)}
 }
 
 func (s *Service) TestAdminEmail(ctx context.Context) error {
@@ -87,25 +91,17 @@ func (s *Service) Start(parent context.Context) error {
 		return nil
 	}
 	s.ctx, s.cancel = context.WithCancel(parent)
-	s.repo.SetProjectionContext(s.ctx)
-	if err := s.repo.RecoverBatches(s.ctx); err != nil {
-		s.noteError("batch_recovery_failed", err)
-	}
-	s.repo.WarmStatsProjections(s.ctx)
 	s.closing = false
-	err := s.config.upgradeLegacyDefaultPolicy(s.ctx)
-	if err == nil {
-		err = s.config.Reload(s.ctx)
-	}
+	err := s.config.Reload(s.ctx)
 	s.refreshNodeLimits()
 	if err != nil {
 		s.noteError("config_load_failed", err)
 	}
-	s.wg.Add(2)
+	s.wg.Add(3)
 	s.running.Store(true)
 	go s.run()
 	go s.runHealthProbes()
-	s.StartBatchWorker()
+	go s.runRetention()
 	return err
 }
 
@@ -117,7 +113,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 	done := make(chan struct{})
-	go func() { s.foreground.Wait(); s.wg.Wait(); s.repo.statsWG.Wait(); close(done) }()
+	go func() { s.foreground.Wait(); s.wg.Wait(); close(done) }()
 	select {
 	case <-done:
 		return nil
@@ -126,40 +122,32 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	}
 }
 
+// Check 判定一次入口请求：续跑只绑定已审回合，首次请求与孤儿续跑才建任务。
 func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDecision {
-	mode := s.config.EffectiveMode()
-	if mode == "off" && !request.Manual {
+	parsed := request.Parsed
+	if parsed == nil {
 		return nil
 	}
-	snapshot, configErr := s.config.Active()
-	if configErr == nil && !request.Manual && (slices.Contains(snapshot.ExcludedUserIDs, request.UserID) ||
-		(!snapshot.AllGroups && (request.GroupID == nil || !slices.Contains(snapshot.GroupIDs, *request.GroupID))) ||
-		(len(snapshot.Platforms) > 0 && !slices.Contains(snapshot.Platforms, request.Provider))) {
+	mode, snapshot, modeErr := s.config.EffectiveMode(), ConfigSnapshot{}, error(nil)
+	if s.config.EffectiveMode() == "off" {
 		return nil
 	}
-	if configErr == nil {
+	snapshot, modeErr = s.config.Active()
+	if modeErr == nil {
+		if excludedByScope(snapshot, request) {
+			return nil
+		}
 		snapshot.Config = effectiveConfigForUser(snapshot.Config, request.UserID)
 		mode = snapshot.Mode
 	}
-	if request.Manual {
-		mode = "async"
-		snapshot.Mode = mode
-	}
 	if request.Background && mode == "blocking" {
 		mode = "async"
-		if configErr == nil {
-			snapshot.Mode = mode
-		}
+		snapshot.Mode = mode
 	}
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
-		kind := IngressDecisionUnavailable
-		if mode == "async" {
-			kind = IngressDecisionUnavailable
-		}
-		s.metrics.IntakeFailures.Add(1)
-		return &IntakeDecision{Mode: mode, Kind: kind, ErrorCode: "third_party_audit_unavailable"}
+		return &IntakeDecision{Mode: mode, Kind: IngressDecisionUnavailable, ErrorCode: "third_party_audit_unavailable"}
 	}
 	s.foreground.Add(1)
 	base := s.ctx
@@ -171,109 +159,74 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		stop := context.AfterFunc(base, cancel)
 		defer stop()
 	}
-	if configErr != nil {
-		snapshot = ConfigSnapshot{Config: Config{Mode: mode, AuditScope: "current_user", AllGroups: true}}
+	if modeErr != nil {
+		if mode == "blocking" {
+			return &IntakeDecision{Mode: mode, Kind: IngressDecisionUnavailable, ErrorCode: "third_party_audit_unavailable"}
+		}
+		return nil
 	}
-	if request.Manual {
-		request.Stage = "manual_capture_reprocess"
+	if len(parsed.Targets()) == 0 {
+		return &IntakeDecision{Mode: mode, Kind: IngressDecisionAllow, ErrorCode: "current_user_not_found"}
 	}
-	input, inputErr := CaptureInput(request.Protocol, request.Body)
-	capturedCompletely := inputErr == nil
-	key := request.CaptureKey
-	if key == "" {
-		key = uuid.NewString()
+	turnKey := turnKeyFor(request.APIKeyID, parsed.TurnFingerprint)
+	// 续跑请求不建任务，只查询已审回合；绑不上的孤儿续跑按首次请求处理。
+	if parsed.Continuation {
+		bound := turnKey
+		if parsed.PreviousResponseID != "" {
+			resolved, err := s.resolveResponseTurn(ctx, parsed.PreviousResponseID)
+			if err != nil {
+				return s.redisFailure(mode, "response_mapping_unavailable")
+			}
+			if resolved != "" {
+				bound = resolved
+			}
+		}
+		state, err := s.getTurn(ctx, bound)
+		if err != nil {
+			return s.redisFailure(mode, "turn_key_unavailable")
+		}
+		if state != nil {
+			return s.boundDecision(state, mode, turnKey)
+		}
 	}
-	apiKeyID := request.APIKeyID
-	job := &Job{CapturedAt: request.CapturedAt, CaptureID: request.CaptureID, CaptureKey: key, ReuseMode: ReuseModeAllow, UserID: request.UserID, APIKeyID: &apiKeyID, GroupID: request.GroupID, RequestID: request.RequestID,
-		ConversationKey: request.ConversationKey, CurrentRunKind: "request", AuditRound: 1,
-		Identity: Identity{Username: request.Username, UserEmail: request.UserEmail, APIKeyName: request.APIKeyName, GroupName: request.GroupName, Endpoint: request.Endpoint},
-		Platform: request.Provider, Protocol: request.Protocol, IngressStage: request.Stage, RequestedModel: request.Model, ExecutionMode: mode,
-		Config: snapshot, FullInput: input, SnapshotStatus: "complete", Status: "queued"}
-	if request.Manual && request.ActorUserID > 0 {
+	state, err := s.getTurn(ctx, turnKey)
+	if err != nil {
+		return s.redisFailure(mode, "turn_key_unavailable")
+	}
+	if state != nil {
+		return s.boundDecision(state, mode, turnKey)
+	}
+	job := &AuditJob{UserID: request.UserID, APIKeyID: request.APIKeyID, GroupID: request.GroupID, Identity: request.Identity,
+		Platform: request.Provider, RequestID: request.RequestID, Model: request.Model, Protocol: parsed.Protocol,
+		ClientFingerprint: parsed.ClientRules, Mode: mode, TurnFingerprint: parsed.TurnFingerprint,
+		OrphanContinuation: parsed.Continuation, Status: "queued", CurrentRound: 1, CurrentRunKind: RunKindRequest,
+		ReuseMode: ReuseModeAllow, Config: snapshot, MaxAttempts: MaxEvaluationAttempts}
+	if request.ActorUserID > 0 {
 		job.CurrentRequestedBy = &request.ActorUserID
 	}
 	if mode == "blocking" {
 		job.Status = "processing"
 	}
-	var target auditTarget
-	if inputErr == nil {
-		target, inputErr = prepareTarget(job)
-	}
-	if !request.Manual && errors.Is(inputErr, ErrNoText) {
-		return &IntakeDecision{Mode: mode, Kind: IngressDecisionAllow, ErrorCode: "current_user_not_found"}
-	}
-	if inputErr != nil {
-		if !capturedCompletely {
-			job.SnapshotStatus = "incomplete"
-		}
-		job.Status = "failed"
-		job.FailureStage = "input_parse"
-		job.LastErrorCode = "input_parse_failed"
-		job.LastErrorMessage = inputErr.Error()
-		if errors.Is(inputErr, ErrNoText) {
-			job.Status = "skipped"
-			job.SnapshotStatus = "complete"
-			job.LastErrorCode = "current_user_not_found"
-			job.FailureStage = ""
-		}
-	}
-	if configErr != nil {
-		job.Status = "failed"
-		job.FailureStage = "config"
-		job.LastErrorCode = "config_unavailable"
-		job.LastErrorMessage = configErr.Error()
-	}
-	// 异步模式只保存并排队；有效行为也不能把异步请求升级成前台审核。
-	behaviorGuard := mode == "blocking" && inputErr == nil && len(target.EffectiveBehavior) > 0 && configErr == nil
-	logger.LegacyPrintf("third_party_prompt_audit", "开始保存审核输入 request_id=%s user_id=%d mode=%s", request.RequestID, request.UserID, mode)
-	captureCtx, captureCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
-	stored, created, err := s.repo.CreateJob(captureCtx, job)
-	captureCancel()
+	persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
+	err = s.repo.CreateAuditJob(persistCtx, job, parsed.Targets())
+	persistCancel()
 	if err != nil {
 		s.metrics.IntakeFailures.Add(1)
 		s.noteError("input_persist_failed", err)
-		kind := IngressDecisionUnavailable
-		if mode == "blocking" {
-			kind = IngressDecisionUnavailable
-		}
-		return &IntakeDecision{Mode: mode, Kind: kind, ErrorCode: "third_party_audit_unavailable"}
+		return &IntakeDecision{Mode: mode, Kind: IngressDecisionUnavailable, ErrorCode: "third_party_audit_unavailable"}
 	}
-	job = stored
-	if created && inputErr == nil {
-		targetCtx, targetCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
-		err := s.repo.SaveCanonicalTargets(targetCtx, job, target)
-		targetCancel()
-		if err != nil {
-			_ = s.repo.Fail(ctx, job, &AuditError{Code: "target_persist_failed", Stage: "result_persist", Message: err.Error()}, false)
-			return &IntakeDecision{JobID: job.ID, Mode: mode, Kind: IngressDecisionUnavailable, ErrorCode: "third_party_audit_unavailable"}
-		}
-	}
-	result := &IntakeDecision{JobID: job.ID, Mode: mode, Kind: IngressDecisionAllow}
-	logger.LegacyPrintf("third_party_prompt_audit", "审核输入已保存 job_id=%d request_id=%s status=%s", job.ID, job.RequestID, job.Status)
-	if mode == "async" && !behaviorGuard {
+	logger.LegacyPrintf("third_party_prompt_audit", "审核任务已创建 job_id=%d request_id=%s user_id=%d mode=%s protocol=%s targets=%d orphan_continuation=%t",
+		job.ID, job.RequestID, job.UserID, mode, job.Protocol, len(parsed.Targets()), parsed.Continuation)
+	s.rememberTurn(ctx, turnKey, job.ID, job.Status, "")
+	result := &IntakeDecision{JobID: job.ID, Mode: mode, Kind: IngressDecisionAllow, TurnKey: turnKey}
+	if mode == "async" {
 		s.notify()
 		return result
 	}
-	if job.Status == "skipped" {
-		return result
-	}
-	if !created {
-		if job.Status == "done" {
-			outcome, err := s.repo.GetOutcome(ctx, job.ID)
-			if err == nil && outcome != nil {
-				result.Kind = gatewayKind(outcome.Decision)
-				return result
-			}
-		}
-		result.Kind, result.ErrorCode = IngressDecisionUnavailable, "third_party_audit_unavailable"
-		return result
-	}
-	if job.Status != "processing" {
-		result.Kind, result.ErrorCode = IngressDecisionUnavailable, "third_party_audit_unavailable"
-		return result
-	}
-	outcome, failure := s.processJob(ctx, job, mode == "blocking" || behaviorGuard)
+	completion, failure := s.processJob(ctx, job, true)
 	if failure != nil {
+		// 失败回合也要更新回合键，避免后续请求按"仍在审核"白等到超时。
+		s.rememberTurn(ctx, turnKey, job.ID, "failed", "")
 		if failure.Code == "user_excluded" {
 			result.Kind, result.ErrorCode = IngressDecisionAllow, "user_excluded"
 			return result
@@ -281,19 +234,137 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		result.Kind, result.ErrorCode = IngressDecisionUnavailable, "third_party_audit_unavailable"
 		return result
 	}
-	if outcome.BehaviorDecision == DecisionBlock {
-		result.Kind, result.ErrorCode = IngressDecisionBlock, "effective_behavior_blocked"
-		return result
-	}
-	if outcome.BehaviorUnavailable {
-		result.Kind, result.ErrorCode = IngressDecisionUnavailable, "effective_behavior_unavailable"
-		return result
-	}
-	result.Kind = gatewayKind(outcome.Decision)
+	s.rememberTurn(ctx, turnKey, job.ID, "done", string(completion.Decision))
+	result.Kind = gatewayKind(completion.Decision)
 	if result.Kind == IngressDecisionBlock {
 		result.ErrorCode = "third_party_audit_blocked"
 	}
 	return result
+}
+
+// excludedByScope 判断请求是否不属于自动审核范围：不审核用户、分组和平台筛选都跳过。
+func excludedByScope(snapshot ConfigSnapshot, request IntakeRequest) bool {
+	if slices.Contains(snapshot.ExcludedUserIDs, request.UserID) {
+		return true
+	}
+	if len(snapshot.Platforms) > 0 && !slices.Contains(snapshot.Platforms, request.Provider) {
+		return true
+	}
+	if snapshot.AllGroups {
+		return false
+	}
+	if request.GroupID == nil {
+		return true
+	}
+	for _, groupID := range snapshot.GroupIDs {
+		if groupID == *request.GroupID {
+			return false
+		}
+	}
+	return true
+}
+
+// redisFailure 处理回合键读写失败：async 放行并记运行日志，blocking 沿用不可用语义（决策 11）。
+func (s *Service) redisFailure(mode, code string) *IntakeDecision {
+	s.noteError(code, errors.New("回合键读写失败"))
+	if mode == "async" {
+		return &IntakeDecision{Mode: mode, Kind: IngressDecisionAllow, ErrorCode: code}
+	}
+	return &IntakeDecision{Mode: mode, Kind: IngressDecisionUnavailable, ErrorCode: "third_party_audit_unavailable"}
+}
+
+// boundDecision 按已绑定回合的状态与裁决返回结果：阻断继续拒绝，其余直接转发且不落库。
+func (s *Service) boundDecision(state *turnState, mode, turnKey string) *IntakeDecision {
+	switch {
+	case state.Status == "done" && state.Decision == string(DecisionBlock):
+		return &IntakeDecision{JobID: state.JobID, Mode: mode, Kind: IngressDecisionBlock, ErrorCode: "third_party_audit_blocked", TurnKey: turnKey}
+	case state.Status == "done" && state.Decision == string(DecisionReview):
+		return &IntakeDecision{JobID: state.JobID, Mode: mode, Kind: IngressDecisionFlag, TurnKey: turnKey}
+	case state.Status == "done":
+		return &IntakeDecision{JobID: state.JobID, Mode: mode, Kind: IngressDecisionAllow, TurnKey: turnKey}
+	case mode == "async":
+		// 首轮审核仍在进行或已失败：异步模式不阻断原请求。
+		return &IntakeDecision{JobID: state.JobID, Mode: mode, Kind: IngressDecisionAllow, TurnKey: turnKey}
+	default:
+		return s.waitForTurn(state.JobID, mode, turnKey)
+	}
+}
+
+// waitForTurn 在 blocking 模式下等待同一回合已有任务的结论，超时按不可用处理。
+func (s *Service) waitForTurn(jobID int64, mode, turnKey string) *IntakeDecision {
+	deadline := time.Now().Add(blockingTurnWait)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), persistenceTimeout)
+		job, err := s.repo.GetAuditJob(ctx, jobID)
+		cancel()
+		if err == nil {
+			switch job.Status {
+			case "done":
+				result := &IntakeDecision{JobID: jobID, Mode: mode, Kind: gatewayKind(job.Decision), TurnKey: turnKey}
+				if job.Decision == DecisionBlock {
+					result.ErrorCode = "third_party_audit_blocked"
+				}
+				return result
+			case "failed", "skipped":
+				return &IntakeDecision{JobID: jobID, Mode: mode, Kind: IngressDecisionUnavailable, ErrorCode: "third_party_audit_unavailable"}
+			}
+		}
+		if time.Now().After(deadline) {
+			return &IntakeDecision{JobID: jobID, Mode: mode, Kind: IngressDecisionUnavailable, ErrorCode: "third_party_audit_unavailable"}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// turnKeyFor 由 API key 与回合指纹组成回合键，用于去重和续跑绑定。
+func turnKeyFor(apiKeyID int64, turnFingerprint string) string {
+	return strconv.FormatInt(apiKeyID, 10) + ":" + turnFingerprint
+}
+
+func (s *Service) getTurn(ctx context.Context, key string) (*turnState, error) {
+	if s.redis == nil {
+		return nil, errors.New("增强 Redis 未装配")
+	}
+	return s.redis.GetTurn(ctx, key)
+}
+
+func (s *Service) resolveResponseTurn(ctx context.Context, responseID string) (string, error) {
+	if s.redis == nil {
+		return "", errors.New("增强 Redis 未装配")
+	}
+	return s.redis.GetResponseTurn(ctx, responseID)
+}
+
+// rememberTurn 写入回合键状态；Redis 故障只记运行日志，不影响已确定的业务结论。
+func (s *Service) rememberTurn(ctx context.Context, key string, jobID int64, status, decision string) {
+	if s.redis == nil {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
+	defer cancel()
+	if err := s.redis.SaveTurn(writeCtx, key, turnState{JobID: jobID, Status: status, Decision: decision}); err != nil {
+		s.noteError("turn_key_persist_failed", err)
+	}
+}
+
+// RegisterResponseID 登记上游响应 ID 到回合键的映射；续跑请求按 previous_response_id 查回该回合。
+func (s *Service) RegisterResponseID(ctx context.Context, responseID, turnKey string) {
+	if responseID == "" || turnKey == "" || s.redis == nil {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
+	defer cancel()
+	if err := s.redis.SaveResponseTurn(writeCtx, responseID, turnKey); err != nil {
+		s.noteError("response_mapping_persist_failed", err)
+	}
+}
+
+// RejectContinuation 记录被拒绝的续跑：只打一行运行日志，不落库、不展示（决策 15）。
+func (s *Service) RejectContinuation(decision *IntakeDecision, apiKeyID int64, reason string) {
+	if decision == nil {
+		return
+	}
+	logger.LegacyPrintf("third_party_prompt_audit", "续跑请求被拒绝 api_key_id=%d job_id=%d reason=%s", apiKeyID, decision.JobID, reason)
 }
 
 func gatewayKind(decision Decision) IngressDecisionKind {
@@ -307,34 +378,12 @@ func gatewayKind(decision Decision) IngressDecisionKind {
 	}
 }
 
-func (s *Service) ObserveGateway(ctx context.Context, own *IntakeDecision, final IngressDecision, duration time.Duration) {
-	if own == nil || own.JobID == 0 {
-		return
-	}
-	result := "continued"
-	if !final.AllowNextStage {
-		switch {
-		case final.Kind == IngressDecisionBlock && final.ErrorCode == "third_party_audit_blocked":
-			result = "blocked_here"
-		case final.Kind == IngressDecisionBlock:
-			result = "blocked_here"
-		default:
-			result = "unavailable"
-		}
-	}
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
-	defer cancel()
-	if err := s.repo.RecordGateway(persistCtx, own.JobID, result, duration); err != nil {
-		s.noteError("gateway_result_persist_failed", err)
-	}
-}
-
-func (s *Service) processJob(parent context.Context, job *Job, foreground bool) (*Outcome, *AuditError) {
-	defer s.finishEvaluationFlight(job.ID)
+// processJob 执行一轮审核：逐目标取得结论后统一提交轮次与处置。
+func (s *Service) processJob(parent context.Context, job *AuditJob, foreground bool) (*CompletionResult, *AuditError) {
+	defer s.finishFlights(job.ID)
 	ctx, cancel := context.WithCancelCause(parent)
-	done := s.heartbeat(ctx, cancel, func(ctx context.Context) error { return s.repo.Renew(ctx, job) })
+	done := s.heartbeat(ctx, cancel, func(ctx context.Context) error { return s.repo.RenewAuditJob(ctx, job) })
 	defer func() { cancel(nil); <-done }()
-	// 同步请求先持久化并续租，再等待与后台共享的执行槽位。
 	if foreground {
 		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
@@ -349,79 +398,94 @@ func (s *Service) processJob(parent context.Context, job *Job, foreground bool) 
 			}
 		}
 		defer s.releaseSlot()
-		if err := s.repo.BeginForegroundEvaluation(ctx, job); err != nil {
+		if err := s.repo.BeginForegroundAuditJob(ctx, job); err != nil {
 			return nil, s.finishFailure(ctx, job, persistenceFailure(err, "evaluation_start_failed"))
 		}
+		wait := time.Since(job.CreatedAt).Milliseconds()
+		job.BlockingWaitMS = &wait
 	}
-	evaluation := job.Checkpoint
-	if evaluation == nil {
-		if job.ExecutionMode == "blocking" && job.auditRunKind() != "reaudit" && !foreground {
-			return nil, &AuditError{Code: "blocking_request_ended", Stage: "worker", Message: "同步请求已经结束，不能在后台重新调用模型"}
+	started := time.Now()
+	var binding ConfigSnapshot
+	var keys map[string]string
+	var err error
+	if job.CurrentRequestedBy != nil {
+		binding, keys, err = s.config.EvaluationBindingAllowExcluded(job.UserID)
+	} else {
+		binding, keys, err = s.config.EvaluationBinding(job.UserID)
+	}
+	var failure *AuditError
+	switch {
+	case errors.Is(err, ErrAuditPaused):
+		failure = persistenceFailure(err, "audit_paused")
+	case errors.Is(err, ErrUserExcluded):
+		failure = persistenceFailure(err, "user_excluded")
+	case err != nil:
+		failure = &AuditError{Code: "evaluation_binding_unavailable", Stage: "config", Message: err.Error(), Retryable: true}
+	}
+	if failure != nil {
+		return nil, s.finishFailure(ctx, job, failure)
+	}
+	s.evaluator.updateNodeLimits(binding.Models)
+	// 请求的同步/异步语义在入口确定；重新绑定只更新本轮审核配置。
+	binding.Mode = job.Mode
+	if err := s.repo.BindAuditJobConfig(ctx, job, binding); err != nil {
+		return nil, s.finishFailure(ctx, job, persistenceFailure(err, "evaluation_binding_persist_failed"))
+	}
+	targets, err := s.repo.LoadRoundTargets(ctx, job.ID, job.CurrentRound)
+	if err != nil {
+		return nil, s.finishFailure(ctx, job, persistenceFailure(err, "target_load_failed"))
+	}
+	hashes := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if target.Kind == PromptKindInstruction {
+			hashes = append(hashes, target.Hash)
 		}
-		started := time.Now()
-		var failure *AuditError
-		var binding ConfigSnapshot
-		var keys map[string]string
-		var err error
-		if job.IngressStage == "manual_capture_reprocess" || job.CurrentRequestedBy != nil {
-			binding, keys, err = s.config.EvaluationBindingAllowExcluded(job.UserID)
-		} else {
-			binding, keys, err = s.config.EvaluationBinding(job.UserID)
+	}
+	trusted, err := s.repo.TrustedHashes(ctx, hashes)
+	if err != nil {
+		return nil, s.finishFailure(ctx, job, persistenceFailure(err, "trust_load_failed"))
+	}
+	for index := range targets {
+		target := &targets[index]
+		if target.Resolution != "" {
+			// 已成功的目标保留结论，重试只补未完成的目标。
+			continue
 		}
-		if errors.Is(err, ErrAuditPaused) {
-			failure = persistenceFailure(err, "audit_paused")
-		} else if errors.Is(err, ErrUserExcluded) {
-			failure = persistenceFailure(err, "user_excluded")
-		} else if err != nil {
-			failure = &AuditError{Code: "evaluation_binding_unavailable", Stage: "config", Message: err.Error(), Retryable: true}
-		} else {
-			s.evaluator.updateNodeLimits(binding.Models)
-			// 请求的同步/异步语义在入口确定；重新绑定只更新本轮审核配置。
-			binding.Mode = job.ExecutionMode
-			if err = s.repo.BindEvaluationConfig(ctx, job, binding); err != nil {
-				failure = persistenceFailure(err, "evaluation_binding_persist_failed")
+		if trusted[target.Hash] {
+			// 信任优先：已信任的指令块不调用模型（决策 23）。
+			target.Resolution, target.Decision = ResolutionTrust, DecisionPass
+			if err := s.repo.ResolveTarget(ctx, job, target); err != nil {
+				return nil, s.finishFailure(ctx, job, persistenceFailure(err, "target_resolve_failed"))
 			}
+			continue
 		}
-		if failure == nil {
-			_, err = prepareTarget(job)
-			if err != nil {
-				failure = &AuditError{Code: "input_parse_failed", Stage: "input_parse", Message: err.Error()}
-			}
-		}
-		if failure == nil {
-			if err = s.repo.SaveTarget(ctx, job); err != nil {
-				failure = persistenceFailure(err, "target_persist_failed")
-			}
-		}
-		if failure == nil {
-			evaluation, failure = s.evaluateWithInflightReuse(ctx, job, keys)
-		}
-		s.metrics.ObserveEvaluation(started, time.Now())
-		if failure != nil {
-			return nil, s.finishFailure(ctx, job, failure)
-		}
-		persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
-		err = s.repo.SaveCheckpoint(persistCtx, job, evaluation)
-		persistCancel()
-		if err != nil {
-			failure := persistenceFailure(err, "result_checkpoint_failed")
-			s.noteError(failure.Code, failure)
+		outcome, reviewFailure := s.reviewWithInflightReuse(ctx, job, target, keys)
+		if reviewFailure != nil {
 			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
-			if err := s.repo.Fail(persistCtx, job, failure, failure.Retryable && (job.ExecutionMode == "async" || job.auditRunKind() == "reaudit") && job.Attempts < job.MaxAttempts); err != nil {
-				s.noteError("job_failure_persist_failed", err)
-			}
+			_ = s.repo.FailTarget(persistCtx, job, target, reviewFailure)
 			persistCancel()
-			return nil, failure
+			return nil, s.finishFailure(ctx, job, reviewFailure)
+		}
+		target.Resolution, target.Decision = outcome.resolution, outcome.review.Decision
+		reviewID := outcome.review.ID
+		target.ReviewID = &reviewID
+		if err := s.repo.ResolveTarget(ctx, job, target); err != nil {
+			return nil, s.finishFailure(ctx, job, persistenceFailure(err, "target_resolve_failed"))
+		}
+		if target.Decision == DecisionBlock {
+			// 已有 block 即可确定任务裁决，剩余目标不再消耗模型调用。
+			break
 		}
 	}
 	persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
-	outcome, err := s.repo.Complete(persistCtx, job, evaluation, foreground && ctx.Err() == nil)
+	completion, err := s.repo.CompleteAuditJob(persistCtx, job, foreground && ctx.Err() == nil)
 	persistCancel()
+	s.metrics.ObserveEvaluation(started, time.Now())
 	if err != nil {
 		failure := persistenceFailure(err, "result_persist_failed")
 		s.noteError(failure.Code, failure)
 		persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
-		if err := s.repo.Fail(persistCtx, job, failure, failure.Retryable); err != nil {
+		if err := s.repo.FailAuditJob(persistCtx, job, failure, failure.Retryable); err != nil {
 			s.noteError("job_failure_persist_failed", err)
 		}
 		persistCancel()
@@ -429,86 +493,55 @@ func (s *Service) processJob(parent context.Context, job *Job, foreground bool) 
 	}
 	s.metrics.Success(time.Now())
 	s.notify()
-	return outcome, nil
+	logger.LegacyPrintf("third_party_prompt_audit", "审核任务完成 job_id=%d round=%d decision=%s trigger_kind=%s violation_counted=%t tripped_breakers=%v",
+		job.ID, completion.Round, completion.Decision, completion.TriggerKind, completion.ViolationCounted, completion.TrippedBreakers)
+	return completion, nil
 }
 
-// evaluateWithInflightReuse 在相同裁决配置下合并全库完全一致的完整目标。
-func (s *Service) evaluateWithInflightReuse(ctx context.Context, job *Job, boundKeys ...map[string]string) (*Evaluation, *AuditError) {
-	keys := map[string]string{}
-	if len(boundKeys) > 0 {
-		keys = boundKeys[0]
-	}
+// reviewWithInflightReuse 合并同一 (内容哈希, 评估语义) 的并发审核；等待方不占节点并发位。
+func (s *Service) reviewWithInflightReuse(ctx context.Context, job *AuditJob, target *JobTarget, keys map[string]string) (*reviewOutcome, *AuditError) {
 	if job.ReuseMode == ReuseModeForce {
-		return s.evaluator.Evaluate(ctx, job, keys)
+		return s.evaluator.Review(ctx, job, target, keys)
 	}
-	key, err := fingerprint(struct {
-		TargetHash, EvaluationHash, Aggregation string
-		ReviewThreshold, BlockThreshold         *float64
-	}{job.TargetHash, job.EvaluationHash, job.Config.Aggregation, job.Config.ReviewThreshold, job.Config.BlockThreshold})
+	evalHash, err := evaluationHash(job.Config, target.Kind)
 	if err != nil {
-		return nil, &AuditError{Code: "inflight_key_failed", Stage: "worker", Message: err.Error()}
+		return nil, &AuditError{Code: "evaluation_hash_failed", Stage: "config", Message: err.Error()}
 	}
+	key := target.Hash + "\x00" + evalHash
 	s.flightMu.Lock()
-	if s.flights == nil {
-		s.flights = make(map[string]*evaluationFlight)
-	}
-	if current := s.flights[key]; current != nil {
+	if flight := s.flights[key]; flight != nil {
 		s.flightMu.Unlock()
 		select {
-		case <-current.done:
-			if current.failure != nil {
-				failure := *current.failure
-				return nil, &failure
+		case <-flight.done:
+			if flight.failure != nil {
+				copied := *flight.failure
+				return nil, &copied
 			}
-			cloned, err := cloneEvaluation(current.evaluation)
-			if err != nil {
-				return nil, &AuditError{Code: "inflight_result_clone_failed", Stage: "worker", Message: err.Error()}
-			}
-			job.Reuse.InflightHits++
-			for i := range cloned.Models {
-				if cloned.Models[i].Skipped {
-					continue
-				}
-				cloned.Models[i].Reused = true
-				cloned.Models[i].JointAttemptID = nil
-				cloned.Models[i].Dispatch = nil
-				for j := range cloned.Models[i].Segments {
-					cloned.Models[i].Segments[j].ReuseKind = "inflight"
-				}
-				for j := range cloned.Models[i].TargetUses {
-					cloned.Models[i].TargetUses[j].ReuseKind = "inflight"
-				}
-				for j := range cloned.Models[i].BehaviorUses {
-					cloned.Models[i].BehaviorUses[j].ReuseKind = "inflight"
-				}
-			}
-			return cloned, nil
+			return &reviewOutcome{review: flight.outcome.review, resolution: ResolutionInflight}, nil
 		case <-ctx.Done():
 			return nil, requestFailure(ctx.Err())
 		}
 	}
-	flight := &evaluationFlight{done: make(chan struct{})}
+	flight := &reviewFlight{done: make(chan struct{})}
 	s.flights[key] = flight
-	if s.flightLeaders == nil {
-		s.flightLeaders = make(map[int64]string)
-	}
-	s.flightLeaders[job.ID] = key
+	s.leaders[job.ID] = append(s.leaders[job.ID], key)
 	s.flightMu.Unlock()
-	evaluation, failure := s.evaluator.Evaluate(ctx, job, keys)
+	outcome, failure := s.evaluator.Review(ctx, job, target, keys)
 	s.flightMu.Lock()
-	flight.evaluation, flight.failure = evaluation, failure
+	flight.outcome, flight.failure = outcome, failure
 	close(flight.done)
 	s.flightMu.Unlock()
-	return evaluation, failure
+	return outcome, failure
 }
 
-func (s *Service) finishEvaluationFlight(jobID int64) {
+// finishFlights 移除本任务发起的并发审核合并键，避免结果长期驻留内存。
+func (s *Service) finishFlights(jobID int64) {
 	s.flightMu.Lock()
 	defer s.flightMu.Unlock()
-	if key := s.flightLeaders[jobID]; key != "" {
-		delete(s.flightLeaders, jobID)
+	for _, key := range s.leaders[jobID] {
 		delete(s.flights, key)
 	}
+	delete(s.leaders, jobID)
 }
 
 func (s *Service) tryAcquireSlot() bool {
@@ -563,7 +596,7 @@ func (s *Service) runHealthProbes() {
 	}
 }
 
-// runHealthProbe 验证节点连通性和固定 JSON 返回协议，不创建业务任务或缓存。
+// runHealthProbe 验证节点连通性和固定 JSON 返回协议，不创建业务任务、审核轮次或缓存。
 func (s *Service) runHealthProbe(snapshot ConfigSnapshot, model ModelConfig) {
 	started := time.Now()
 	key, err := s.config.ResolveKeyByModelID(model.ID)
@@ -579,13 +612,12 @@ func (s *Service) runHealthProbe(snapshot ConfigSnapshot, model ModelConfig) {
 	defer client.CloseIdleConnections()
 	ctx, cancel := context.WithTimeout(context.WithValue(s.ctx, healthProbeContext, true), time.Duration(model.TimeoutMS)*time.Millisecond)
 	defer cancel()
-	target := map[string]any{"protocol": "health_probe", "messages": []map[string]any{{"source_role": "user", "content": "节点健康检查，请按固定协议返回评分。"}}}
-	_, _, failure := s.client.EvaluateTarget(ctx, nil, model, key, snapshot, client, url, "health_probe", target, nil)
+	_, _, failure := s.client.EvaluateTarget(ctx, nil, model, key, snapshot, client, url, "health_probe", "节点健康检查，请按固定协议返回评分。", "", nil)
 	s.evaluator.nodeScheduler().observe(model.ID, failure, time.Since(started))
 }
 
 // finishFailure 区分服务暂停、请求结束和业务重试，防止停机耗尽异步任务的评估预算。
-func (s *Service) finishFailure(ctx context.Context, job *Job, failure *AuditError) *AuditError {
+func (s *Service) finishFailure(ctx context.Context, job *AuditJob, failure *AuditError) *AuditError {
 	if cause := context.Cause(ctx); cause != nil && ctx.Err() == context.Canceled && !errors.Is(cause, context.Canceled) {
 		failure = persistenceFailure(cause, "lease_renew_failed")
 	}
@@ -595,16 +627,16 @@ func (s *Service) finishFailure(ctx context.Context, job *Job, failure *AuditErr
 	if !job.Dispatched && failure.Code == "user_excluded" {
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
 		defer cancel()
-		if err := s.repo.SkipExcluded(persistCtx, job); err != nil {
+		if err := s.repo.SkipExcludedAuditJob(persistCtx, job); err != nil {
 			s.noteError("excluded_skip_failed", err)
 		}
 		s.notify()
 		return failure
 	}
-	if !job.Dispatched && job.ExecutionMode == "async" && (failure.Code == "capacity_saturated" || failure.Code == "temporarily_unhealthy" || failure.Code == "audit_paused") {
+	if !job.Dispatched && job.Mode == "async" && (failure.Code == "capacity_saturated" || failure.Code == "temporarily_unhealthy" || failure.Code == "audit_paused") {
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
 		defer cancel()
-		if err := s.repo.DeferCapacity(persistCtx, job, failure); err != nil {
+		if err := s.repo.DeferAuditJob(persistCtx, job, failure); err != nil {
 			s.noteError("capacity_defer_failed", err)
 		}
 		s.notify()
@@ -613,15 +645,15 @@ func (s *Service) finishFailure(ctx context.Context, job *Job, failure *AuditErr
 	s.mu.Lock()
 	closing := s.closing
 	s.mu.Unlock()
-	if closing && (job.ExecutionMode == "async" || job.auditRunKind() == "reaudit") {
+	if closing && (job.Mode == "async" || job.runKind() == RunKindReaudit) {
 		failure = &AuditError{Code: "worker_paused", Stage: "worker", Message: "服务正在停止，任务将在恢复后继续", Retryable: true}
 	}
-	retry := (job.ExecutionMode == "async" || job.auditRunKind() == "reaudit") && failure.Retryable &&
+	retry := (job.Mode == "async" || job.runKind() == RunKindReaudit) && failure.Retryable &&
 		(job.Attempts < job.MaxAttempts || failure.Code == "audit_paused" || failure.Code == "worker_paused")
 	s.noteError(failure.Code, failure)
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
 	defer cancel()
-	if err := s.repo.Fail(persistCtx, job, failure, retry); err != nil {
+	if err := s.repo.FailAuditJob(persistCtx, job, failure, retry); err != nil {
 		s.noteError("job_failure_persist_failed", err)
 	}
 	return failure
@@ -667,12 +699,11 @@ func (s *Service) noteError(code string, err error) {
 }
 
 type ProbeRequest struct {
-	ActorUserID int64       `json:"-"`
+	ActorUserID int64       `json:"-" binding:"-"`
 	Model       ModelConfig `json:"model"`
 	KeyAction   string      `json:"key_action" binding:"required,oneof=keep replace clear"`
 	APIKey      string      `json:"api_key"`
 	AuditPrompt string      `json:"audit_prompt" binding:"required"`
-	Protocol    string      `json:"protocol"`
 	Input       string      `json:"input"`
 	InputKind   string      `json:"input_kind" binding:"required,oneof=text json"`
 }
@@ -687,6 +718,7 @@ type ProbeResult struct {
 	LatencyMS int64       `json:"latency_ms"`
 }
 
+// Probe 只测试单个节点：使用管理员提供的政策与一段待审目标，不创建任务或复用结果。
 func (s *Service) Probe(ctx context.Context, input ProbeRequest) (result ProbeResult) {
 	ctx = context.WithValue(ctx, probeActorContext, input.ActorUserID)
 	started := time.Now()
@@ -719,50 +751,34 @@ func (s *Service) Probe(ctx context.Context, input ProbeRequest) (result ProbeRe
 		result.Error = &AuditError{Code: "credential_binding_unavailable", Stage: "config", Message: err.Error()}
 		return result
 	}
-	value := any("这是一段正常的项目开发说明，请按审核政策评估。")
+	kind, text := PromptKindUser, "这是一段正常的项目开发说明，请按审核政策评估。"
 	if input.Input != "" {
-		value = input.Input
 		if input.InputKind == "json" {
-			value, err = decodeUniqueJSON([]byte(input.Input))
-			if err != nil {
-				result.Error = &AuditError{Code: "invalid_probe_input", Stage: "input_parse", Message: err.Error()}
+			value, decodeErr := decodeUniqueJSON([]byte(input.Input))
+			if decodeErr != nil {
+				result.Error = &AuditError{Code: "invalid_probe_input", Stage: "input_parse", Message: decodeErr.Error()}
 				return result
 			}
-			if _, ok := value.(map[string]any); !ok {
-				result.Error = &AuditError{Code: "invalid_probe_input", Stage: "input_parse", Message: "结构化测试输入必须是完整协议请求对象"}
+			object, ok := value.(map[string]any)
+			if !ok {
+				result.Error = &AuditError{Code: "invalid_probe_input", Stage: "input_parse", Message: "结构化测试输入必须是待审对象"}
 				return result
 			}
+			if value, ok := object["target_kind"].(string); ok && (value == PromptKindInstruction || value == PromptKindUser) {
+				kind = value
+			}
+			body, ok := object["target"].(string)
+			if !ok || body == "" {
+				result.Error = &AuditError{Code: "invalid_probe_input", Stage: "input_parse", Message: "结构化测试输入必须包含字符串 target"}
+				return result
+			}
+			text = body
+		} else {
+			text = input.Input
 		}
-	}
-
-	protocol := input.Protocol
-	if protocol == "" {
-		protocol = "openai_responses"
-	}
-	var body []byte
-	if text, ok := value.(string); ok {
-		protocol = "openai_responses"
-		body, err = json.Marshal(map[string]any{"input": text})
-	} else {
-		body, err = json.Marshal(value)
-	}
-	if err != nil {
-		result.Error = &AuditError{Code: "invalid_probe_input", Stage: "input_parse", Message: err.Error()}
-		return result
-	}
-	snapshot, err := CaptureInput(protocol, body)
-	if err != nil {
-		result.Error = &AuditError{Code: "invalid_probe_input", Stage: "input_parse", Message: err.Error()}
-		return result
 	}
 	config := ConfigSnapshot{Config: DefaultConfig(), ContractVersion: ContractVersion, FixedContract: OutputContract}
 	config.AuditPrompt = input.AuditPrompt
-	job := &Job{Config: config, Protocol: protocol, FullInput: snapshot}
-	target, err := prepareTarget(job)
-	if err != nil {
-		result.Error = &AuditError{Code: "invalid_probe_input", Stage: "input_parse", Message: err.Error()}
-		return result
-	}
 	client, url, err := nodeHTTPClient(input.Model)
 	if err != nil {
 		result.Error = &AuditError{Code: "invalid_model", Stage: "config", Message: err.Error()}
@@ -771,13 +787,14 @@ func (s *Service) Probe(ctx context.Context, input ProbeRequest) (result ProbeRe
 	defer client.CloseIdleConnections()
 	probeCtx, cancel := context.WithTimeout(ctx, time.Duration(input.Model.TimeoutMS)*time.Millisecond)
 	defer cancel()
-	result.Result, result.AttemptID, result.Error = s.client.EvaluateTarget(probeCtx, nil, input.Model, key, config, client, url, "probe", target, nil)
+	result.Result, result.AttemptID, result.Error = s.client.EvaluateTarget(probeCtx, nil, input.Model, key, config, client, url, kind, text, "", nil)
 	result.OK = result.Error == nil
 	result.LatencyMS = time.Since(started).Milliseconds()
 	s.metrics.Probe(result)
 	return result
 }
 
+// CreateReaudits 在同一任务上追加一轮审核；重新审核本身不触发新处置。
 func (s *Service) CreateReaudits(ctx context.Context, request ReauditRequest, actorID int64) (*ReauditResult, error) {
 	if request.ReuseMode == "" {
 		request.ReuseMode = ReuseModeAllow

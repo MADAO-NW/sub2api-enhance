@@ -10,7 +10,7 @@ import (
 )
 
 // actionColumns 完整保留远端执行和邮件投递的独立状态。
-const actionColumns = `id,user_id,outcome_id,actor_user_id,action_type,rule_snapshot,business_snapshot,applied_at,notification_status,deliveries,auth_cache_status,auth_cache_error,next_attempt_at,claim_generation,lease_until,updated_at,execution_status,attempt_history,requested_at,completed_at`
+const actionColumns = `id,user_id,job_id,actor_user_id,action_type,rule_snapshot,business_snapshot,applied_at,notification_status,deliveries,auth_cache_status,auth_cache_error,next_attempt_at,claim_generation,lease_until,updated_at,execution_status,attempt_history,requested_at,completed_at`
 
 type rowScanner interface{ Scan(...any) error }
 
@@ -18,7 +18,7 @@ func scanAction(row rowScanner) (*Action, error) {
 	var a Action
 	var rule, business, deliveries, attempts string
 	var cacheError *string
-	err := row.Scan(&a.ID, &a.UserID, &a.OutcomeID, &a.ActorUserID, &a.ActionType, &rule, &business, &a.AppliedAt, &a.NotificationStatus, &deliveries, &a.AuthCacheStatus, &cacheError, &a.NextAttemptAt, &a.ClaimGeneration, &a.LeaseUntil, &a.UpdatedAt, &a.ExecutionStatus, &attempts, &a.RequestedAt, &a.CompletedAt)
+	err := row.Scan(&a.ID, &a.UserID, &a.JobID, &a.ActorUserID, &a.ActionType, &rule, &business, &a.AppliedAt, &a.NotificationStatus, &deliveries, &a.AuthCacheStatus, &cacheError, &a.NextAttemptAt, &a.ClaimGeneration, &a.LeaseUntil, &a.UpdatedAt, &a.ExecutionStatus, &attempts, &a.RequestedAt, &a.CompletedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +116,7 @@ func (r *Repository) RetryAction(ctx context.Context, id int64) error {
 }
 func (r *Repository) ListActions(ctx context.Context, userID, rootID int64) ([]Action, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT `+actionColumns+` FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions WHERE user_id=$1 AND
-	 (outcome_id IN(SELECT id FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$2) OR action_type='counter_reset') ORDER BY id`, userID, rootID)
+	 (job_id=$2 OR action_type='counter_reset') ORDER BY id`, userID, rootID)
 	if err != nil {
 		return nil, err
 	}
@@ -130,4 +130,22 @@ func (r *Repository) ListActions(ctx context.Context, userID, rootID int64) ([]A
 		out = append(out, *a)
 	}
 	return out, rows.Err()
+}
+
+// insertAction 在提交事务内写入一条处置动作；动作本身由收件箱异步执行。
+func insertAction(ctx context.Context, tx *sql.Tx, action *Action) error {
+	rule, err := json.Marshal(action.RuleSnapshot)
+	if err != nil {
+		return err
+	}
+	business, err := json.Marshal(action.BusinessSnapshot)
+	if err != nil {
+		return err
+	}
+	deliveries, err := json.Marshal(action.Deliveries)
+	if err != nil {
+		return err
+	}
+	return tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_enforcement_actions(user_id,job_id,actor_user_id,action_type,rule_snapshot,business_snapshot,notification_status,deliveries,auth_cache_status,execution_status,applied_at,completed_at)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id,applied_at`, action.UserID, action.JobID, action.ActorUserID, action.ActionType, string(rule), string(business), action.NotificationStatus, string(deliveries), action.AuthCacheStatus, action.ExecutionStatus, action.AppliedAt, action.CompletedAt).Scan(&action.ID, &action.AppliedAt)
 }

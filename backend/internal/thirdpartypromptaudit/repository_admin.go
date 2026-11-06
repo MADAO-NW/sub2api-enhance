@@ -5,247 +5,109 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"log"
 	"slices"
 	"strings"
 
-	"github.com/google/uuid"
 	"github.com/lib/pq"
 )
 
-type DecisionConfig struct {
-	Revision        int64    `json:"revision"`
-	ReviewThreshold *float64 `json:"review_threshold"`
-	BlockThreshold  *float64 `json:"block_threshold"`
+// JobDetail 是任务详情：任务本身、当前轮目标、历史轮次与相关处置动作。
+type JobDetail struct {
+	Job      *AuditJob      `json:"job"`
+	Targets  []JobTarget    `json:"targets"`
+	Rounds   []JobRound     `json:"rounds"`
+	Attempts []ModelAttempt `json:"attempts"`
+	Actions  []Action       `json:"actions"`
 }
-
-type ModelResultView struct {
-	ModelResult
-	MaxSegmentConfidence *float64 `json:"max_segment_confidence"`
-}
-
-type OutcomeView struct {
-	*Outcome
-	Models         []ModelResultView `json:"models"`
-	DecisionConfig *DecisionConfig   `json:"decision_config,omitempty"`
-	SegmentReuse   SegmentReuseView  `json:"segment_reuse"`
-	TargetReuse    TargetReuseView   `json:"target_reuse"`
-	AuditTargets   AuditStageTargets `json:"audit_targets,omitempty"`
-}
-
-type SegmentReuseView struct {
-	Reused int      `json:"reused"`
-	Total  int      `json:"total"`
-	Rate   *float64 `json:"rate"`
-}
-
-type TargetReuseView struct {
-	SegmentReuseView
-	ByKind map[string]SegmentReuseView `json:"by_kind"`
-}
-
-// outcomeView 派生解释字段，不向持久化结果复制片段最大值或当前配置。
-func outcomeView(outcome *Outcome, config *DecisionConfig) *OutcomeView {
-	if outcome == nil {
-		return nil
-	}
-	if config == nil && outcome.Config.Revision > 0 {
-		config = &DecisionConfig{Revision: outcome.Config.Revision, ReviewThreshold: outcome.Config.ReviewThreshold, BlockThreshold: outcome.Config.BlockThreshold}
-	}
-	view := &OutcomeView{Outcome: outcome, DecisionConfig: config, Models: make([]ModelResultView, 0, len(outcome.Models)), TargetReuse: TargetReuseView{ByKind: map[string]SegmentReuseView{}}}
-	for _, model := range outcome.Models {
-		item := ModelResultView{ModelResult: model}
-		uses := model.TargetUses
-		if len(uses) == 0 {
-			uses = model.Segments
-		}
-		if len(model.BehaviorUses) > 0 {
-			uses = append(append([]SegmentUse(nil), uses...), model.BehaviorUses...)
-		}
-		for _, segment := range uses {
-			view.SegmentReuse.Total++
-			view.TargetReuse.Total++
-			kind := segment.TargetKind
-			if kind == "" {
-				kind = TargetKindLegacySegment
-			}
-			byKind := view.TargetReuse.ByKind[kind]
-			byKind.Total++
-			if slices.Contains([]string{"history", "within_job", "inflight", "full_evaluation", "force_batch"}, segment.ReuseKind) {
-				view.SegmentReuse.Reused++
-				view.TargetReuse.Reused++
-				byKind.Reused++
-			}
-			view.TargetReuse.ByKind[kind] = byKind
-			if item.MaxSegmentConfidence == nil || segment.Result.Confidence > *item.MaxSegmentConfidence {
-				score := segment.Result.Confidence
-				item.MaxSegmentConfidence = &score
-			}
-		}
-		view.Models = append(view.Models, item)
-	}
-	if view.SegmentReuse.Total > 0 {
-		rate := float64(view.SegmentReuse.Reused) / float64(view.SegmentReuse.Total)
-		view.SegmentReuse.Rate = &rate
-	}
-	if view.TargetReuse.Total > 0 {
-		rate := float64(view.TargetReuse.Reused) / float64(view.TargetReuse.Total)
-		view.TargetReuse.Rate = &rate
-	}
-	for kind, item := range view.TargetReuse.ByKind {
-		if item.Total > 0 {
-			rate := float64(item.Reused) / float64(item.Total)
-			item.Rate = &rate
-			view.TargetReuse.ByKind[kind] = item
-		}
-	}
-	return view
-}
-
-// latestOutcomeJoin 为任务筛选和列表提供当前有效审核结论。
-const latestOutcomeJoin = ` LEFT JOIN LATERAL (
- SELECT current.* FROM sub2api_enhance.third_party_prompt_audit_outcomes current
- WHERE current.job_id=j.id ORDER BY current.audit_round DESC,current.id DESC LIMIT 1
-) o ON true `
-
-// jobOutcomeSummary 将当前结论及节点解释并入任务列表。
-const jobOutcomeSummary = `CASE WHEN o.id IS NULL THEN NULL ELSE json_build_object(
- 'id',o.id,'job_id',o.job_id,'user_id',o.user_id,'decision',o.decision,'partial_failure',o.partial_failure,
- 'enforcement_eligible',o.enforcement_eligible,'source_outcome_id',o.source_outcome_id,'audit_round',o.audit_round,
- 'run_kind',o.run_kind,'requested_by',o.requested_by,'reuse_mode',o.reuse_mode,'created_at',o.created_at,
- 'started_at',o.started_at,'finished_at',o.finished_at,
- 'duration_ms',CASE WHEN o.started_at IS NULL OR o.finished_at IS NULL THEN NULL ELSE GREATEST(0,extract(epoch FROM (o.finished_at-o.started_at))*1000)::bigint END,
- 'models',(SELECT COALESCE(json_agg(json_build_object('model_id',m->>'model_id','model_name',m->>'model_name','decision',m->>'decision','basis',m->>'basis','confidence',m->'confidence',
-   'reused',m->'reused','joint_attempt_id',CASE WHEN COALESCE((m->>'reused')::boolean,false) THEN NULL ELSE m->'joint_attempt_id' END,'error',m->'error','skipped',m->'skipped','skip_reason',m->'skip_reason',
-   'target_uses',COALESCE(m->'target_uses','[]'::json),'binding_triggered',m->'binding_triggered','dispatch',m->'dispatch',
-   'behavior_decision',m->'behavior_decision','behavior_confidence',m->'behavior_confidence','behavior_reason',m->'behavior_reason','behavior_uses',COALESCE(m->'behavior_uses','[]'::json),'behavior_error',m->'behavior_error',
-   'max_segment_confidence',(SELECT MAX((s->'result'->>'confidence')::double precision) FROM jsonb_array_elements((COALESCE(m->'target_uses',m->'segments','[]'::json)::jsonb || COALESCE(m->'behavior_uses','[]'::json)::jsonb)) s))),'[]') FROM json_array_elements(o.model_results::json) m),
- 'decision_config',json_build_object('revision',(o.config_snapshot::json->>'revision')::bigint,'review_threshold',o.config_snapshot::json->'review_threshold','block_threshold',o.config_snapshot::json->'block_threshold'),
- 'segment_reuse',(SELECT json_build_object('reused',count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation','force_batch')),'total',count(*),
-   'rate',CASE WHEN count(*)=0 THEN NULL ELSE (count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation','force_batch')))::double precision/count(*) END)
-   FROM json_array_elements(o.model_results::json) m CROSS JOIN LATERAL jsonb_array_elements((COALESCE(m->'target_uses',m->'segments','[]'::json)::jsonb || COALESCE(m->'behavior_uses','[]'::json)::jsonb)) s),
- 'target_reuse',(SELECT json_build_object('reused',count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation','force_batch')),'total',count(*),
-   'rate',CASE WHEN count(*)=0 THEN NULL ELSE (count(*) FILTER(WHERE s->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation','force_batch')))::double precision/count(*) END,
-   'by_kind',COALESCE((SELECT json_object_agg(grouped.target_kind,json_build_object('reused',grouped.reused,'total',grouped.total,
-     'rate',CASE WHEN grouped.total=0 THEN NULL ELSE grouped.reused::double precision/grouped.total END)) FROM (
-       SELECT COALESCE(target->>'target_kind','legacy_segment') target_kind,
-         count(*) FILTER(WHERE target->>'reuse_kind' IN ('history','within_job','inflight','full_evaluation','force_batch')) reused,count(*) total
-       FROM json_array_elements(o.model_results::json) model CROSS JOIN LATERAL jsonb_array_elements((COALESCE(model->'target_uses',model->'segments','[]'::json)::jsonb || COALESCE(model->'behavior_uses','[]'::json)::jsonb)) target
-       GROUP BY COALESCE(target->>'target_kind','legacy_segment')) grouped),'{}'::json))
-   FROM json_array_elements(o.model_results::json) m CROSS JOIN LATERAL jsonb_array_elements((COALESCE(m->'target_uses',m->'segments','[]'::json)::jsonb || COALESCE(m->'behavior_uses','[]'::json)::jsonb)) s)
-) END`
 
 func validateFilter(filter Filter) error {
-	if filter.From != nil && filter.To != nil && !filter.From.Before(*filter.To) {
-		return errors.New("开始时间必须早于结束时间")
-	}
-	for _, id := range filter.IDs {
-		if id <= 0 {
-			return errors.New("筛选 ID 必须大于 0")
-		}
-	}
-	for _, id := range []*int64{filter.UserID, filter.APIKeyID, filter.GroupID} {
-		if id != nil && *id <= 0 {
-			return errors.New("身份筛选 ID 必须大于 0")
-		}
+	if filter.Decision != "" && filter.Decision != DecisionPass && filter.Decision != DecisionReview && filter.Decision != DecisionBlock {
+		return errors.New("裁决筛选无效")
 	}
 	if filter.Status != "" && !slices.Contains([]string{"queued", "processing", "retry", "done", "failed", "skipped"}, filter.Status) {
-		return errors.New("任务状态无效")
-	}
-	if filter.Decision != "" && filter.Decision != DecisionPass && filter.Decision != DecisionReview && filter.Decision != DecisionBlock {
-		return errors.New("分类筛选无效")
-	}
-	if filter.RunKind != "" && filter.RunKind != "request" && filter.RunKind != "reaudit" {
-		return errors.New("任务来源无效")
+		return errors.New("状态筛选无效")
 	}
 	if filter.Mode != "" && filter.Mode != "async" && filter.Mode != "blocking" {
 		return errors.New("运行模式筛选无效")
 	}
+	if filter.RunKind != "" && filter.RunKind != RunKindRequest && filter.RunKind != RunKindReaudit {
+		return errors.New("轮次类型筛选无效")
+	}
+	if filter.From != nil && filter.To != nil && !filter.From.Before(*filter.To) {
+		return errors.New("开始时间必须早于结束时间")
+	}
 	return nil
 }
 
-// filterSQL 在列表、预览和提交中保持同一筛选语义，所有外部值只作为 SQL 参数。
+// filterSQL 只用本包常量拼接列名，值全部走参数。
 func filterSQL(filter Filter, includeTime bool) (string, []any) {
-	clauses := make([]string, 0)
-	args := make([]any, 0)
-	add := func(expression string, value any) {
+	clauses := []string{"1=1"}
+	args := []any{}
+	appendValue := func(column string, value any) {
 		args = append(args, value)
-		clauses = append(clauses, fmt.Sprintf(expression, len(args)))
+		clauses = append(clauses, column+"=$"+itoa(len(args)))
 	}
 	if len(filter.IDs) > 0 {
-		add("j.id=ANY($%d)", pq.Array(filter.IDs))
+		appendValue("j.id", pq.Array(filter.IDs))
+		clauses[len(clauses)-1] = "j.id=ANY($" + itoa(len(args)) + ")"
+	}
+	if filter.UserID != nil {
+		appendValue("j.user_id", *filter.UserID)
+	}
+	if filter.APIKeyID != nil {
+		appendValue("j.api_key_id", *filter.APIKeyID)
+	}
+	if filter.GroupID != nil {
+		appendValue("j.group_id", *filter.GroupID)
+	}
+	if filter.Status != "" {
+		appendValue("j.status", filter.Status)
+	}
+	if filter.Decision != "" {
+		appendValue("j.decision", string(filter.Decision))
+	}
+	if filter.RunKind != "" {
+		appendValue("j.current_run_kind", filter.RunKind)
+	}
+	if filter.Mode != "" {
+		appendValue("j.mode", filter.Mode)
+	}
+	if filter.Platform != "" {
+		appendValue("j.platform", filter.Platform)
+	}
+	if filter.RequestID != "" {
+		appendValue("j.request_id", filter.RequestID)
+	}
+	if filter.Model != "" {
+		appendValue("j.model", filter.Model)
 	}
 	if includeTime {
 		if filter.From != nil {
-			add("j.created_at>=$%d", *filter.From)
+			appendValue("j.created_at", *filter.From)
+			clauses[len(clauses)-1] = "j.created_at>=$" + itoa(len(args))
 		}
 		if filter.To != nil {
-			add("j.created_at<$%d", *filter.To)
+			appendValue("j.created_at", *filter.To)
+			clauses[len(clauses)-1] = "j.created_at<$" + itoa(len(args))
 		}
-	}
-	if filter.UserID != nil {
-		add("j.user_id=$%d", *filter.UserID)
-	}
-	if filter.APIKeyID != nil {
-		add("j.api_key_id=$%d", *filter.APIKeyID)
-	}
-	if filter.GroupID != nil {
-		add("j.group_id=$%d", *filter.GroupID)
-	}
-	if filter.Status != "" {
-		add("j.status=$%d", filter.Status)
-	}
-	if filter.RunKind != "" {
-		add("j.current_run_kind=$%d", filter.RunKind)
-	}
-	if filter.Mode != "" {
-		add("j.execution_mode=$%d", filter.Mode)
-	}
-	if filter.Platform != "" {
-		add("j.platform=$%d", filter.Platform)
-	}
-	if filter.RequestID != "" {
-		add("j.request_id=$%d", filter.RequestID)
-	}
-	if filter.Keyword != "" {
-		add("(j.identity_snapshot ILIKE '%%'||$%d||'%%')", filter.Keyword)
-	}
-	if filter.Decision != "" {
-		add("o.decision=$%d", filter.Decision)
-	}
-	if filter.ModelID != "" {
-		add("EXISTS(SELECT 1 FROM json_array_elements(o.model_results::json) model WHERE model->>'model_id'=$%d)", filter.ModelID)
-	}
-	if filter.ModelName != "" {
-		add(`((j.status<>'failed' AND EXISTS(SELECT 1 FROM json_array_elements(COALESCE(o.model_results,'[]')::json) model WHERE model->>'model_name' ILIKE '%%'||$%[1]d||'%%'))
-		 OR (j.status='failed' AND EXISTS(SELECT 1 FROM sub2api_enhance.third_party_prompt_audit_model_attempts attempt
-		 WHERE attempt.job_id=j.id AND attempt.audit_round=j.audit_round AND attempt.model_snapshot::json->>'name' ILIKE '%%'||$%[1]d||'%%')))`, filter.ModelName)
-	}
-	if len(clauses) == 0 {
-		return "TRUE", args
 	}
 	return strings.Join(clauses, " AND "), args
 }
 
-func (r *Repository) ListJobs(ctx context.Context, filter Filter, page, pageSize int) (*Page[Job], error) {
+// ListJobs 返回按创建时间倒序的审核任务列表。
+func (r *Repository) ListJobs(ctx context.Context, filter Filter, page, pageSize int) (*Page[AuditJob], error) {
 	if err := validateFilter(filter); err != nil {
 		return nil, err
 	}
+	result := &Page[AuditJob]{Items: []AuditJob{}, Page: page, PageSize: pageSize}
 	where, args := filterSQL(filter, true)
-	from := jobSource + latestOutcomeJoin
-	result := &Page[Job]{Items: []Job{}, Page: page, PageSize: pageSize}
-	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*)`+from+`WHERE `+where, args...).Scan(&result.Total); err != nil {
+	countQuery := `SELECT count(*)` + auditJobSource + `WHERE ` + where
+	if err := r.db.QueryRowContext(ctx, countQuery, args...).Scan(&result.Total); err != nil {
 		return nil, err
 	}
-	query := `SELECT row_to_json(record) FROM(SELECT ` + jobProjection(false) + `,` + jobOutcomeSummary + ` AS outcome,
- (SELECT initial.decision FROM sub2api_enhance.third_party_prompt_audit_outcomes initial WHERE initial.job_id=j.id ORDER BY initial.audit_round,initial.id LIMIT 1) AS original_decision` + from + `WHERE ` + where + ` ORDER BY j.created_at DESC,j.id DESC`
-	if pageSize > 0 {
-		args = append(args, pageSize, (page-1)*pageSize)
-		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)-1, len(args))
-	}
-	query += `) record`
-	rows, err := r.db.QueryContext(ctx, query, args...)
+	pageArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
+	rows, err := r.db.QueryContext(ctx, `SELECT row_to_json(record) FROM (SELECT `+auditJobColumns+auditJobSource+`WHERE `+where+
+		` ORDER BY j.created_at DESC,j.id DESC LIMIT $`+itoa(len(args)+1)+` OFFSET $`+itoa(len(args)+2)+`) record`, pageArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -255,261 +117,66 @@ func (r *Repository) ListJobs(ctx context.Context, filter Filter, page, pageSize
 		if err := rows.Scan(&raw); err != nil {
 			return nil, err
 		}
-		job, err := decodeJobList(raw)
+		job, err := decodeAuditJob(raw)
 		if err != nil {
-			log.Printf("审核任务列表跳过无法解码记录 error=%v", err)
-			continue
+			return nil, err
 		}
 		result.Items = append(result.Items, *job)
 	}
 	return result, rows.Err()
 }
 
-type JobDetail struct {
-	InputJSON    string                  `json:"input_json"`
-	InputParts   []Segment               `json:"input_parts"`
-	AuditTargets AuditStageTargets       `json:"audit_targets,omitempty"`
-	NonText      []NonTextInput          `json:"non_text"`
-	Job          *Job                    `json:"job"`
-	Outcome      *OutcomeView            `json:"outcome"`
-	Rounds       []*OutcomeView          `json:"rounds"`
-	Attempts     []ModelAttempt          `json:"attempts"`
-	Actions      []Action                `json:"actions"`
-	Enforcement  *EnforcementExplanation `json:"enforcement,omitempty"`
-}
-
-type AuditStageTargets map[string]auditEnvelope
-
-type EnforcementExplanation struct {
-	Role                  string `json:"role"`
-	UserStatus            string `json:"user_status"`
-	WarningReason         string `json:"warning_reason"`
-	DisableReason         string `json:"disable_reason"`
-	WindowViolations      int    `json:"window_violations"`
-	WindowSize            int    `json:"window_size"`
-	DisableViolationCount int64  `json:"disable_violation_count"`
-}
-
+// JobDetail 读取任务详情；复用结论只展示结论本身，不暴露来源任务。
 func (r *Repository) JobDetail(ctx context.Context, id int64) (*JobDetail, error) {
-	job, err := r.GetJob(ctx, id, true)
+	job, err := r.GetAuditJob(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	result := &JobDetail{Job: job, Rounds: []*OutcomeView{}, InputParts: []Segment{}, NonText: []NonTextInput{}}
-	if job.FullInput != nil {
-		raw, err := json.MarshalIndent(job.FullInput, "", "  ")
-		if err != nil {
-			return nil, err
-		}
-		result.InputJSON = string(raw)
-		result.NonText = job.FullInput.NonText
-		displayJob := *job
-		target, targetErr := prepareTargetForContract(&displayJob, job.Config.ContractVersion)
-		if targetErr == nil {
-			result.AuditTargets = auditStageTargets(target)
-		}
-		if parts, extractErr := ExtractSegments(job.FullInput, "full_request"); extractErr == nil {
-			for i := range parts {
-				if i < len(displayJob.Manifest) {
-					parts[i].SegmentMeta = displayJob.Manifest[i]
-				}
-			}
-			result.InputParts = parts
-		}
-	}
-	outcome, err := r.GetOutcome(ctx, id)
+	targets, err := r.LoadRoundTargets(ctx, job.ID, job.CurrentRound)
 	if err != nil {
 		return nil, err
 	}
-	result.Outcome = outcomeView(outcome, job.DecisionConfig)
-	if result.Outcome != nil && job.FullInput != nil {
-		outcomeJob := *job
-		outcomeJob.Config = outcome.Config
-		if target, err := prepareTargetForContract(&outcomeJob, outcome.Config.ContractVersion); err == nil {
-			result.Outcome.AuditTargets = auditStageTargets(target)
+	reviewIDs := make([]int64, 0, len(targets))
+	for _, target := range targets {
+		if target.ReviewID != nil {
+			reviewIDs = append(reviewIDs, *target.ReviewID)
 		}
 	}
-	job.Outcome = result.Outcome
-	roundRows, err := r.db.QueryContext(ctx, `SELECT id FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE job_id=$1 ORDER BY audit_round DESC,id DESC`, job.ID)
+	reviews, err := r.GetReviews(ctx, reviewIDs)
 	if err != nil {
 		return nil, err
 	}
-	roundIDs := make([]int64, 0)
-	for roundRows.Next() {
-		var outcomeID int64
-		if err := roundRows.Scan(&outcomeID); err != nil {
-			_ = roundRows.Close()
-			return nil, err
+	for i := range targets {
+		target := &targets[i]
+		if target.ReviewID == nil {
+			continue
 		}
-		roundIDs = append(roundIDs, outcomeID)
-	}
-	if err := roundRows.Err(); err != nil {
-		_ = roundRows.Close()
-		return nil, err
-	}
-	if err := roundRows.Close(); err != nil {
-		return nil, err
-	}
-	for _, outcomeID := range roundIDs {
-		round, err := r.queryOutcome(ctx, `SELECT id,job_id,user_id,decision,partial_failure,enforcement_eligible,model_results,source_outcome_id,created_at,audit_round,run_kind,requested_by,config_snapshot,started_at,finished_at,reuse_mode FROM sub2api_enhance.third_party_prompt_audit_outcomes WHERE id=$1`, outcomeID)
-		if err != nil {
-			return nil, err
+		review := reviews[*target.ReviewID]
+		if review == nil {
+			continue
 		}
-		roundView := outcomeView(round, nil)
-		if job.FullInput != nil {
-			roundJob := *job
-			roundJob.Config = round.Config
-			if target, err := prepareTargetForContract(&roundJob, round.Config.ContractVersion); err == nil {
-				roundView.AuditTargets = auditStageTargets(target)
-			}
-		}
-		result.Rounds = append(result.Rounds, roundView)
-		if round.AuditRound == 1 {
-			decision := round.Decision
-			job.OriginalDecision = &decision
-		}
+		target.Review = &ReviewView{Decision: review.Decision, Score: review.Score, Reason: review.Reason, Nodes: review.Nodes, RunKind: review.RunKind}
 	}
-	result.Attempts, err = r.ListAttempts(ctx, id)
+	rounds, err := r.ListRounds(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	result.Actions, err = r.ListActions(ctx, job.UserID, job.ID)
+	attempts, err := r.ListModelAttempts(ctx, "job_id=$1", id)
 	if err != nil {
 		return nil, err
 	}
-	result.Enforcement, err = r.enforcementExplanation(ctx, result)
+	actions, err := r.ListActions(ctx, job.UserID, id)
 	if err != nil {
 		return nil, err
 	}
-	return result, nil
-}
-
-// auditStageTargets 把冻结的结构化输入展开为模型各阶段的实际 user 消息目标。
-func auditStageTargets(target auditTarget) AuditStageTargets {
-	current := messageBundle{Protocol: target.Protocol, Messages: target.CurrentUser}
-	result := AuditStageTargets{TargetKindCurrentUser: {Stage: TargetKindCurrentUser, Target: current}}
-	if len(target.EffectiveBehavior) > 0 {
-		behavior := messageBundle{Protocol: target.Protocol, Messages: target.EffectiveBehavior}
-		result[TargetKindEffectiveBehavior] = auditEnvelope{Stage: TargetKindEffectiveBehavior, Target: behavior}
-	}
-	if len(target.InstructionContext) == 0 {
-		return result
-	}
-	instructions := messageBundle{Protocol: target.Protocol, Messages: target.InstructionContext}
-	result[TargetKindInstructionContext] = auditEnvelope{Stage: TargetKindInstructionContext, Target: instructions}
-	result[TargetKindIntentBinding] = auditEnvelope{Stage: TargetKindIntentBinding, Target: intentBindingTarget{CurrentUser: current, InstructionContext: instructions}}
-	return result
-}
-
-// enforcementExplanation 使用当前处置规则和已持久化状态解释最新结论为何触发或未触发账号动作。
-func (r *Repository) enforcementExplanation(ctx context.Context, detail *JobDetail) (*EnforcementExplanation, error) {
-	view := &EnforcementExplanation{}
-	if err := r.db.QueryRowContext(ctx, `SELECT role,status FROM public.users WHERE id=$1 AND deleted_at IS NULL`, detail.Job.UserID).Scan(&view.Role, &view.UserStatus); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return view, nil
-		}
-		return nil, err
-	}
-	current := storedConfig{Config: DefaultConfig()}
-	var raw string
-	if err := r.db.QueryRowContext(ctx, `SELECT value FROM sub2api_enhance.settings WHERE key=$1`, SettingKey).Scan(&raw); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	} else if err == nil {
-		current.AuditScope = "current_user"
-		if err := json.Unmarshal([]byte(raw), &current); err != nil {
-			return nil, err
-		}
-	}
-	current.Config = effectiveConfigForUser(current.Config, detail.Job.UserID)
-	var warningArmed bool
-	var windowAfter int64
-	if err := r.db.QueryRowContext(ctx, `SELECT warning_window_after_outcome_id,warning_armed,disable_violation_count FROM sub2api_enhance.third_party_prompt_audit_enforcement_states WHERE user_id=$1`, detail.Job.UserID).Scan(&windowAfter, &warningArmed, &view.DisableViolationCount); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	eligible := false
-	if len(detail.Rounds) > 0 {
-		eligible = detail.Rounds[len(detail.Rounds)-1].AuditRound == 1 && detail.Rounds[len(detail.Rounds)-1].EnforcementEligible
-		for _, round := range detail.Rounds {
-			if round.AuditRound == 1 && round.EnforcementEligible {
-				eligible = true
-				break
-			}
-		}
-	}
-	triggered := func(kind string) bool {
-		if detail.Outcome == nil {
-			return false
-		}
-		for _, action := range detail.Actions {
-			if action.ActionType == kind && action.OutcomeID != nil && *action.OutcomeID == detail.Outcome.ID {
-				return true
-			}
-		}
-		return false
-	}
-	if !eligible {
-		view.WarningReason, view.DisableReason = "not_enforcement_eligible", "not_enforcement_eligible"
-	} else if detail.Outcome == nil || detail.Outcome.Decision != DecisionBlock {
-		view.WarningReason, view.DisableReason = "decision_not_block", "decision_not_block"
-	} else {
-		if !current.Warning.Enabled {
-			view.WarningReason = "rule_disabled"
-		} else if triggered("warning") {
-			view.WarningReason = "triggered"
-		} else {
-			rows, err := r.db.QueryContext(ctx, `SELECT latest.decision FROM sub2api_enhance.third_party_prompt_audit_jobs root JOIN LATERAL (SELECT first.id,first.enforcement_eligible FROM sub2api_enhance.third_party_prompt_audit_outcomes first WHERE first.job_id=root.id ORDER BY first.audit_round,first.id LIMIT 1) original ON original.enforcement_eligible JOIN LATERAL (SELECT current.decision FROM sub2api_enhance.third_party_prompt_audit_outcomes current WHERE current.job_id=root.id ORDER BY current.audit_round DESC,current.id DESC LIMIT 1) latest ON true WHERE root.user_id=$1 AND original.id>$2 ORDER BY root.id DESC LIMIT $3`, detail.Job.UserID, windowAfter, current.Warning.Window)
-			if err != nil {
-				return nil, err
-			}
-			for rows.Next() {
-				var decision Decision
-				if err = rows.Scan(&decision); err != nil {
-					_ = rows.Close()
-					return nil, err
-				}
-				view.WindowSize++
-				if decision == DecisionBlock {
-					view.WindowViolations++
-				}
-			}
-			if err = rows.Err(); err != nil {
-				_ = rows.Close()
-				return nil, err
-			}
-			if err := rows.Close(); err != nil {
-				return nil, err
-			}
-			if view.WindowViolations < current.Warning.Limit {
-				view.WarningReason = "window_insufficient"
-			} else if !warningArmed {
-				view.WarningReason = "already_notified"
-			} else {
-				view.WarningReason = "no_new_block"
-			}
-		}
-		if view.Role != "user" {
-			view.DisableReason = "role_excluded"
-		} else if !current.Disable.Enabled {
-			view.DisableReason = "rule_disabled"
-		} else if triggered("disable") {
-			view.DisableReason = "triggered"
-		} else if view.UserStatus != "active" {
-			view.DisableReason = "already_disabled"
-		} else if view.DisableViolationCount < current.Disable.Limit {
-			view.DisableReason = "cumulative_insufficient"
-		} else {
-			view.DisableReason = "action_already_pending"
-		}
-	}
-	return view, nil
+	return &JobDetail{Job: job, Targets: targets, Rounds: rounds, Attempts: attempts, Actions: actions}, nil
 }
 
 type reauditCandidate struct {
-	ID       int64
-	UserID   int64
-	Ready    bool
-	ActiveID *int64
-	Reason   string
+	ID     int64
+	UserID int64
+	Ready  bool
+	Reason string
 }
 
 func (r *Repository) reauditCandidates(ctx context.Context, request ReauditRequest) ([]reauditCandidate, error) {
@@ -520,9 +187,7 @@ func (r *Repository) reauditCandidates(ctx context.Context, request ReauditReque
 		return nil, err
 	}
 	where, args := filterSQL(request.Filter, true)
-	query := `SELECT j.id,j.user_id,j.snapshot_status='complete' AND j.full_input_snapshot IS NOT NULL AND COALESCE(j.last_error_code,'')<>'no_text',
-	 CASE WHEN j.status IN ('queued','processing','retry') THEN j.id END` + jobSource + latestOutcomeJoin + `WHERE ` + where + ` ORDER BY j.id`
-	rows, err := r.db.QueryContext(ctx, query, args...)
+	rows, err := r.db.QueryContext(ctx, `SELECT j.id,j.user_id,j.status IN ('done','failed','skipped')`+auditJobSource+`WHERE `+where+` ORDER BY j.id`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -530,11 +195,11 @@ func (r *Repository) reauditCandidates(ctx context.Context, request ReauditReque
 	items := make([]reauditCandidate, 0)
 	for rows.Next() {
 		var item reauditCandidate
-		if err := rows.Scan(&item.ID, &item.UserID, &item.Ready, &item.ActiveID); err != nil {
+		if err := rows.Scan(&item.ID, &item.UserID, &item.Ready); err != nil {
 			return nil, err
 		}
 		if !item.Ready {
-			item.Reason = "完整可审文本不可用，跳过重新审核"
+			item.Reason = "该任务仍在处理中"
 		}
 		items = append(items, item)
 	}
@@ -551,8 +216,6 @@ func (r *Repository) PreviewReaudits(ctx context.Context, request ReauditRequest
 		item := ReauditItem{JobID: candidate.ID, Status: "ready", userID: candidate.UserID}
 		if !candidate.Ready {
 			item.Status, item.Reason = "skipped", candidate.Reason
-		} else if candidate.ActiveID != nil {
-			item.Status, item.Reason = "already_running", "该任务已在处理中"
 		} else {
 			result.Ready++
 		}
@@ -561,7 +224,7 @@ func (r *Repository) PreviewReaudits(ctx context.Context, request ReauditRequest
 	return result, nil
 }
 
-// CreateReaudits 逐项锁定原任务并开始新的审核轮次，不再创建复核子任务。
+// CreateReaudits 在同一任务上追加新一轮：复制当前轮目标，重新审核本身不触发新的处置。
 func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest, snapshot ConfigSnapshot, actorID int64) (*ReauditResult, error) {
 	if request.ReuseMode == "" {
 		request.ReuseMode = ReuseModeAllow
@@ -569,10 +232,6 @@ func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest,
 	result, err := r.PreviewReaudits(ctx, request)
 	if err != nil {
 		return nil, err
-	}
-	batchID := request.BatchID
-	if request.ReuseMode == ReuseModeForce && batchID == "" {
-		batchID = uuid.NewString()
 	}
 	for i := range result.Items {
 		item := &result.Items[i]
@@ -586,56 +245,54 @@ func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest,
 			item.Status, item.Reason = "failed", err.Error()
 			continue
 		}
-		var id int64
-		err = r.db.QueryRowContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs root SET
-		 audit_round=audit_round+1,current_run_kind='reaudit',current_requested_by=$1,config_revision=$2,config_snapshot=$3,
-		 reuse_mode=$4,reaudit_batch_id=$5,status='queued',attempts=0,max_attempts=$6,claim_generation=claim_generation+1,lease_until=NULL,next_attempt_at=clock_timestamp(),
-		 result_checkpoint=NULL,reuse_metrics='{"whole_lookups":0,"whole_hits":0,"segment_lookups":0,"segment_hits":0,"within_job_hits":0,"inflight_hits":0,"short_circuited_nodes":0}',
-		 failure_stage=NULL,last_error_code=NULL,last_error_message=NULL,started_at=NULL,finished_at=NULL,input_manifest=NULL,input_hash=NULL,target_hash=NULL,evaluation_hash=NULL,updated_at=clock_timestamp()
-		 WHERE root.id=$7 AND root.status IN ('done','failed','skipped') AND root.snapshot_status='complete' AND root.full_input_snapshot IS NOT NULL AND COALESCE(root.last_error_code,'')<>'no_text'
-		 RETURNING root.id`, actorID, snapshot.Revision, string(encoded), request.ReuseMode, nullIfEmpty(batchID), MaxEvaluationAttempts, item.JobID).Scan(&id)
-		if err == nil {
-			item.Status, item.JobID = "requeued", id
-			continue
-		}
-		if errors.Is(err, sql.ErrNoRows) {
-			var activeID int64
-			lookupErr := r.db.QueryRowContext(ctx, `SELECT id FROM sub2api_enhance.third_party_prompt_audit_jobs WHERE id=$1 AND status IN ('queued','processing','retry')`, item.JobID).Scan(&activeID)
-			if lookupErr == nil {
-				item.Status, item.Reason = "already_running", "该任务已在处理中"
-			} else if errors.Is(lookupErr, sql.ErrNoRows) {
-				item.Status, item.Reason = "skipped", "完整原文已不可用"
-			} else {
-				item.Status, item.Reason = "failed", lookupErr.Error()
-			}
-		} else {
+		err = r.appendRound(ctx, item.JobID, actorID, request.ReuseMode, snapshot.Revision, string(encoded))
+		switch {
+		case err == nil:
+			item.Status = "requeued"
+		case errors.Is(err, ErrNotFound):
+			item.Status, item.Reason = "skipped", "该任务已不可重新审核"
+		case errors.Is(err, ErrLeaseLost):
+			item.Status, item.Reason = "already_running", "该任务已在处理中"
+		default:
 			item.Status, item.Reason = "failed", err.Error()
 		}
 	}
 	return result, nil
 }
 
-func (r *Repository) SaveTarget(ctx context.Context, job *Job) error {
-	manifest, err := json.Marshal(job.Manifest)
+// appendRound 追加一轮目标并让任务重新排队；任务状态不是已结束时报 ErrLeaseLost。
+func (r *Repository) appendRound(ctx context.Context, jobID, actorID int64, reuseMode string, revision int64, configSnapshot string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	result, err := r.db.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs SET input_manifest=$3,input_hash=$4,target_hash=$5,evaluation_hash=$6,updated_at=clock_timestamp() WHERE id=$1 AND claim_generation=$2 AND status='processing' AND lease_until>clock_timestamp()`, job.ID, job.ClaimGeneration, string(manifest), job.InputHash, job.TargetHash, job.EvaluationHash)
-	return checkLeaseUpdate(result, err)
+	defer func() { _ = tx.Rollback() }()
+	var status string
+	var round int
+	err = tx.QueryRowContext(ctx, `SELECT status,current_round FROM sub2api_enhance.audit_jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&status, &round)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if !slices.Contains([]string{"done", "failed", "skipped"}, status) {
+		return ErrLeaseLost
+	}
+	next := round + 1
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.audit_job_targets(job_id,round,target_order,hash,kind)
+ SELECT job_id,$3,target_order,hash,kind FROM sub2api_enhance.audit_job_targets WHERE job_id=$1 AND round=$2`,
+		jobID, round, next); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.audit_jobs SET current_round=$2,current_run_kind='reaudit',current_requested_by=$3,
+ reuse_mode=$4,config_revision=$5,config_snapshot=$6,status='queued',attempts=0,max_attempts=$7,next_attempt_at=clock_timestamp(),
+ lease_until=NULL,failure_stage=NULL,last_error_code=NULL,last_error_message=NULL,started_at=NULL,finished_at=NULL,updated_at=clock_timestamp()
+ WHERE id=$1`, jobID, next, actorID, reuseMode, revision, configSnapshot, MaxEvaluationAttempts); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (r *Repository) ResumeResult(ctx context.Context, id int64) error {
-	result, err := r.db.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs SET status='retry',next_attempt_at=clock_timestamp(),finished_at=NULL,claim_generation=claim_generation+1,updated_at=clock_timestamp()
- WHERE id=$1 AND status='failed' AND failure_stage='result_persist' AND result_checkpoint IS NOT NULL`, id)
-	if err != nil {
-		return err
-	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if count != 1 {
-		return errors.New("该任务不具备可恢复的结果检查点，或已在处理中")
-	}
-	return nil
-}
+// jobFilterWhere 供统计与列表共用同一套过滤语义。
+func jobFilterWhere(filter Filter) (string, []any) { return filterSQL(filter, true) }

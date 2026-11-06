@@ -11,7 +11,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 )
 
 type Config struct {
@@ -21,7 +20,6 @@ type Config struct {
 	DatabaseConnections, IngressConnections                                 int
 	SMTPHost, SMTPPort, SMTPUser, SMTPPassword, SMTPFrom, SMTPFromName      string
 	SMTPUseTLS                                                              bool
-	AuditCacheTTL                                                           time.Duration
 }
 
 func Load() (*Config, error) {
@@ -38,11 +36,7 @@ func Load() (*Config, error) {
 	if c.EnhanceRedisURL == "" {
 		return nil, errors.New("必须配置 ENHANCE_REDIS_URL")
 	}
-	auditCacheTTL, err := time.ParseDuration(os.Getenv("ENHANCE_AUDIT_CACHE_TTL"))
-	if err != nil || auditCacheTTL <= 0 {
-		return nil, errors.New("ENHANCE_AUDIT_CACHE_TTL 必须是正数 Go 时长")
-	}
-	c.AuditCacheTTL = auditCacheTTL
+	// 回合键与响应映射的有效期是固定 30 分钟，不再由环境变量配置（决策 24）。
 	for _, v := range []struct{ name, value string }{{"SUB2API_INTERNAL_URL", c.OfficialURL}, {"ENHANCE_PUBLIC_ORIGIN", c.PublicOrigin}} {
 		u, err := url.Parse(v.value)
 		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {

@@ -12,20 +12,16 @@ const SettingKey = "third_party_prompt_audit_config"
 // MaxEvaluationAttempts 是每个新任务的模型评估预算，结果补写不消耗该预算。
 const MaxEvaluationAttempts = 3
 
-// ReuseModeAllow 和 ReuseModeForce 控制当前审核轮次是否读取历史及并发缓存。
+// ReuseModeAllow 和 ReuseModeForce 控制当前审核轮次是否读取历史审核结果与并发复用。
 const (
 	ReuseModeAllow = "allow"
 	ReuseModeForce = "force"
 )
 
-// 审核目标类型区分新分阶段目标和只读历史片段。
+// 审核轮次类型：原始请求与管理员发起的重新审核。
 const (
-	TargetKindLegacySegment      = "legacy_segment"
-	TargetKindCurrentUser        = "current_user"
-	TargetKindInstructionContext = "instruction_context"
-	TargetKindIntentBinding      = "intent_binding"
-	// TargetKindEffectiveBehavior 表示新增的 Agent/model/tool 有效行为目标。
-	TargetKindEffectiveBehavior = "effective_behavior"
+	RunKindRequest = "request"
+	RunKindReaudit = "reaudit"
 )
 
 type Decision string
@@ -44,102 +40,7 @@ type Identity struct {
 	Endpoint   string `json:"endpoint"`
 }
 
-type Job struct {
-	CapturedAt         time.Time       `json:"captured_at"`
-	CaptureID          *int64          `json:"capture_id"`
-	ID                 int64           `json:"id"`
-	CaptureKey         string          `json:"-"`
-	CurrentRunKind     string          `json:"current_run_kind"`
-	AuditRound         int             `json:"audit_round"`
-	CurrentRequestedBy *int64          `json:"current_requested_by"`
-	ReuseMode          string          `json:"reuse_mode"`
-	ReauditBatchID     string          `json:"reaudit_batch_id,omitempty"`
-	DisableCounted     bool            `json:"disable_counted"`
-	UserID             int64           `json:"user_id"`
-	APIKeyID           *int64          `json:"api_key_id"`
-	GroupID            *int64          `json:"group_id"`
-	RequestID          string          `json:"request_id"`
-	ConversationKey    string          `json:"conversation_key,omitempty"`
-	Identity           Identity        `json:"identity"`
-	DisplayUsername    string          `json:"display_username"`
-	DisplayEmail       string          `json:"display_email"`
-	Platform           string          `json:"platform"`
-	Protocol           string          `json:"protocol"`
-	IngressStage       string          `json:"ingress_stage"`
-	RequestedModel     string          `json:"requested_model"`
-	ExecutionMode      string          `json:"execution_mode"`
-	Config             ConfigSnapshot  `json:"config_snapshot,omitempty"`
-	DecisionConfig     *DecisionConfig `json:"decision_config,omitempty"`
-	FullInput          *InputSnapshot  `json:"full_input_snapshot,omitempty"`
-	SnapshotStatus     string          `json:"snapshot_status"`
-	Manifest           []SegmentMeta   `json:"input_manifest,omitempty"`
-	InputHash          string          `json:"input_hash"`
-	TargetHash         string          `json:"target_hash"`
-	EvaluationHash     string          `json:"evaluation_hash"`
-	Status             string          `json:"status"`
-	Attempts           int             `json:"attempts"`
-	MaxAttempts        int             `json:"max_attempts"`
-	ClaimGeneration    int64           `json:"claim_generation"`
-	LeaseUntil         *time.Time      `json:"lease_until"`
-	NextAttemptAt      time.Time       `json:"next_attempt_at"`
-	Checkpoint         *Evaluation     `json:"result_checkpoint,omitempty"`
-	Reuse              ReuseMetrics    `json:"reuse_metrics"`
-	FailureStage       string          `json:"failure_stage"`
-	LastErrorCode      string          `json:"last_error_code"`
-	LastErrorMessage   string          `json:"last_error_message"`
-	GatewayResult      string          `json:"gateway_result"`
-	GatewayCompleted   *time.Time      `json:"gateway_completed_at"`
-	GatewayDurationMS  *int64          `json:"gateway_duration_ms"`
-	StartedAt          *time.Time      `json:"started_at"`
-	FinishedAt         *time.Time      `json:"finished_at"`
-	DurationMS         *int64          `json:"duration_ms"`
-	CurrentUserCount   int             `json:"current_user_count"`
-	Outcome            *OutcomeView    `json:"outcome,omitempty"`
-	OriginalDecision   *Decision       `json:"original_decision,omitempty"`
-	CreatedAt          time.Time       `json:"created_at"`
-	UpdatedAt          time.Time       `json:"updated_at"`
-	Dispatched         bool            `json:"-"`
-}
-
-func (j *Job) auditRunKind() string {
-	if j.CurrentRunKind != "" {
-		return j.CurrentRunKind
-	}
-	return "request"
-}
-
-type ReuseMetrics struct {
-	WholeLookups   int `json:"whole_lookups"`
-	WholeHits      int `json:"whole_hits"`
-	SegmentLookups int `json:"segment_lookups"`
-	SegmentHits    int `json:"segment_hits"`
-	WithinJobHits  int `json:"within_job_hits"`
-	InflightHits   int `json:"inflight_hits"`
-	ShortCircuited int `json:"short_circuited_nodes"`
-}
-
-type SegmentResult struct {
-	ID              int64  `json:"id"`
-	UserID          int64  `json:"-"`
-	ModelID         string `json:"model_id"`
-	AuditKey        string `json:"audit_key"`
-	SourceAttemptID int64  `json:"-"`
-	SourceRole      string `json:"source_role"`
-	PolicyRole      string `json:"policy_role"`
-	TurnScope       string `json:"turn_scope"`
-	ContentHash     string `json:"content_hash"`
-	TargetKind      string `json:"target_kind"`
-	Score
-}
-
-type SegmentUse struct {
-	Order      int           `json:"order"`
-	SourcePath string        `json:"source_path"`
-	TargetKind string        `json:"target_kind"`
-	ReuseKind  string        `json:"reuse_kind"`
-	Result     SegmentResult `json:"result"`
-}
-
+// DispatchSnapshot 记录一次真实调用前的节点调度状态，用于任务详情排障。
 type DispatchSnapshot struct {
 	Order          int      `json:"order"`
 	Health         string   `json:"health"`
@@ -151,67 +52,17 @@ type DispatchSnapshot struct {
 	Reason         string   `json:"reason"`
 }
 
-type ModelResult struct {
-	Reused             bool              `json:"reused"`
-	ModelID            string            `json:"model_id"`
-	ModelName          string            `json:"model_name"`
-	Decision           Decision          `json:"decision,omitempty"`
-	Basis              string            `json:"basis"`
-	Confidence         *float64          `json:"confidence"`
-	Reason             string            `json:"reason"`
-	JointAttemptID     *int64            `json:"joint_attempt_id"`
-	Segments           []SegmentUse      `json:"segments"`
-	TargetUses         []SegmentUse      `json:"target_uses,omitempty"`
-	BindingTriggered   bool              `json:"binding_triggered,omitempty"`
-	Dispatch           *DispatchSnapshot `json:"dispatch,omitempty"`
-	Error              *AuditError       `json:"error,omitempty"`
-	Skipped            bool              `json:"skipped,omitempty"`
-	SkipReason         string            `json:"skip_reason,omitempty"`
-	BehaviorDecision   Decision          `json:"behavior_decision,omitempty"`
-	BehaviorConfidence *float64          `json:"behavior_confidence,omitempty"`
-	BehaviorReason     string            `json:"behavior_reason,omitempty"`
-	BehaviorUses       []SegmentUse      `json:"behavior_uses,omitempty"`
-	BehaviorError      *AuditError       `json:"behavior_error,omitempty"`
-}
-
-type Evaluation struct {
-	Decision            Decision      `json:"decision"`
-	Models              []ModelResult `json:"models"`
-	PartialFailure      bool          `json:"partial_failure"`
-	SourceOutcomeID     *int64        `json:"source_outcome_id"`
-	EnforcementEligible bool          `json:"enforcement_eligible"`
-	BehaviorDecision    Decision      `json:"behavior_decision,omitempty"`
-	BehaviorConfidence  *float64      `json:"behavior_confidence,omitempty"`
-	BehaviorReason      string        `json:"behavior_reason,omitempty"`
-	BehaviorUnavailable bool          `json:"behavior_unavailable,omitempty"`
-}
-
-type Outcome struct {
-	ID          int64          `json:"id"`
-	JobID       int64          `json:"job_id"`
-	UserID      int64          `json:"user_id"`
-	AuditRound  int            `json:"audit_round"`
-	RunKind     string         `json:"run_kind"`
-	RequestedBy *int64         `json:"requested_by"`
-	ReuseMode   string         `json:"reuse_mode"`
-	Config      ConfigSnapshot `json:"config_snapshot"`
-	Evaluation
-	StartedAt  *time.Time `json:"started_at"`
-	FinishedAt *time.Time `json:"finished_at"`
-	DurationMS *int64     `json:"duration_ms"`
-	CreatedAt  time.Time  `json:"created_at"`
-}
-
+// ModelAttempt 是一次真实模型调用流水；只在真实发出 HTTP 请求时写入。
 type ModelAttempt struct {
 	ID                int64           `json:"id"`
 	JobID             *int64          `json:"job_id"`
 	CallKind          string          `json:"call_kind"`
 	EvaluationRound   *int            `json:"evaluation_round"`
 	AuditRound        int             `json:"audit_round"`
+	TargetHash        string          `json:"target_hash,omitempty"`
 	ModelID           string          `json:"model_id"`
 	ModelSnapshot     ModelConfig     `json:"model_snapshot"`
 	Stage             string          `json:"stage"`
-	SegmentOrder      *int            `json:"segment_order"`
 	RepairOfAttemptID *int64          `json:"repair_of_attempt_id"`
 	RequestMetadata   json.RawMessage `json:"request_metadata"`
 	Status            string          `json:"status"`
@@ -238,6 +89,7 @@ type AuditError struct {
 
 func (e *AuditError) Error() string { return fmt.Sprintf("%s · %s", e.Message, e.Code) }
 
+// Filter 是任务列表与重新审核共用的过滤条件；字段都对应 audit_jobs 的真实列。
 type Filter struct {
 	IDs       []int64    `json:"ids,omitempty"`
 	From      *time.Time `json:"from,omitempty"`
@@ -251,9 +103,7 @@ type Filter struct {
 	Mode      string     `json:"mode,omitempty"`
 	Platform  string     `json:"platform,omitempty"`
 	RequestID string     `json:"request_id,omitempty"`
-	Keyword   string     `json:"keyword,omitempty"`
-	ModelID   string     `json:"model_id,omitempty"`
-	ModelName string     `json:"model_name,omitempty"`
+	Model     string     `json:"model,omitempty"`
 }
 
 type Page[T any] struct {
@@ -265,7 +115,6 @@ type Page[T any] struct {
 
 type ReauditRequest struct {
 	ReuseMode string `json:"reuse_mode" binding:"omitempty,oneof=allow force"`
-	BatchID   string `json:"-"`
 	Filter    Filter `json:"filter"`
 }
 
@@ -280,20 +129,4 @@ type ReauditResult struct {
 	Matched int64         `json:"matched"`
 	Ready   int64         `json:"ready"`
 	Items   []ReauditItem `json:"items"`
-}
-
-type RecoveryItem struct {
-	CaptureID  int64  `json:"capture_id"`
-	JobID      *int64 `json:"job_id,omitempty"`
-	Action     string `json:"action"`
-	Status     string `json:"status"`
-	Reason     string `json:"reason,omitempty"`
-	userID     int64
-	checkpoint bool
-}
-
-type RecoveryResult struct {
-	Matched int64          `json:"matched"`
-	Ready   int64          `json:"ready"`
-	Items   []RecoveryItem `json:"items"`
 }

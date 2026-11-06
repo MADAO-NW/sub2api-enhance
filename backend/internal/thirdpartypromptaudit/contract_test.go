@@ -45,14 +45,14 @@ func TestParseScoreRejectsAmbiguousAndInvalidResponses(t *testing.T) {
 }
 
 func TestFixedContractAlwaysFollowsEditablePolicy(t *testing.T) {
-	text := systemPromptSnapshot(ConfigSnapshot{Config: Config{AuditPrompt: "管理员测试政策"}, FixedContract: OutputContract}, "修正格式")
-	require.True(t, strings.HasPrefix(text, "管理员测试政策"))
-	require.True(t, strings.HasSuffix(text, OutputContract))
-	require.NotContains(t, text, "【联合审核】")
-	require.NotContains(t, text, "【片段审核】")
-	require.Contains(t, text, "audit_stage=current_user")
-	require.Contains(t, text, "audit_stage=instruction_context")
-	require.Contains(t, text, "audit_stage=intent_binding")
-	require.Contains(t, text, "audit_stage=effective_behavior")
-	require.Less(t, strings.Index(text, "修正格式"), strings.Index(text, "【固定返回协议"))
+	snapshot := ConfigSnapshot{Config: Config{AuditPrompt: "管理员测试政策"}, FixedContract: OutputContract}
+	instruction := systemPromptSnapshot(snapshot, PromptKindInstruction, "修正格式")
+	require.True(t, strings.HasPrefix(instruction, "管理员测试政策"))
+	require.True(t, strings.HasSuffix(instruction, OutputContract))
+	require.Contains(t, instruction, "target_kind=instruction")
+	require.NotContains(t, instruction, "target_kind=user")
+	require.Less(t, strings.Index(instruction, "修正格式"), strings.Index(instruction, "【固定返回协议"))
+	user := systemPromptSnapshot(snapshot, PromptKindUser, "")
+	require.Contains(t, user, "target_kind=user")
+	require.NotContains(t, user, "target_kind=instruction：")
 }

@@ -3,6 +3,8 @@ map $http_upgrade $enhance_connection_upgrade {
     default upgrade;
     '' close;
 }
+# 模型请求正文上限：与原版默认 256MB 一致；Nginx 默认 1MB 会拒绝 Claude Code 的长对话。
+client_max_body_size 256m;
 # 增强路径日志只保留 $uri，避免 token 查询参数进入访问日志。
 log_format enhance_safe '$remote_addr $request_method $uri $status';
 upstream sub2api_official { server 127.0.0.1:18080; }

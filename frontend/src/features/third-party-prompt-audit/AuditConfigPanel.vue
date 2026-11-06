@@ -335,8 +335,8 @@ watch(() => props.refreshKey, () => { void load(true) })
             <label class="space-y-2"><span class="text-sm font-medium">{{ label('mode') }}</span>
               <select v-model="draft.mode" class="input"><option v-for="mode in ['off', 'async', 'blocking']" :key="mode" :value="mode">{{ label(mode) }}</option></select>
             </label>
-            <label class="flex items-center gap-2 self-end pb-3 text-sm"><input v-model="draft.capture_when_audit_off" type="checkbox" />{{ label('captureWhenAuditOff') }}</label>
 			<label class="space-y-2"><span class="text-sm font-medium">{{ label('worker') }}</span><input v-model.number="draft.worker_count" class="input" type="number" min="1" step="1" required /></label>
+            <label class="space-y-2"><span class="text-sm font-medium">{{ label('retentionDays') }}</span><input v-model.number="draft.retention_days" class="input" type="number" min="1" max="365" step="1" required /><span class="text-xs text-gray-500">{{ label('retentionHint') }}</span></label>
           </div>
           <p class="mt-3 text-sm text-gray-500 dark:text-dark-400">{{ label('scopeHint') }}</p>
           <p class="mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('scopeExample') }}</p>

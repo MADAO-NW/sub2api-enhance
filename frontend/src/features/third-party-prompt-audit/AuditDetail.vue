@@ -1,77 +1,76 @@
 <script setup lang="ts">
-defineOptions({ name: 'AuditDetail' })
 import { computed, ref, watch } from 'vue'
 import BaseDialog from '@/components/common/BaseDialog.vue'
-import { thirdPartyPromptAuditAPI as api, type AuditCapture, type AuditStageTargets, type JobDetail, type ModelAttempt } from '@/api/admin/third-party-prompt-audit'
+import { thirdPartyPromptAuditAPI as api, type AuditAction, type JobDetail, type JobTarget, type ModelAttempt } from '@/api/admin/third-party-prompt-audit'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { formatMS, formatTime } from './viewModel'
 import { useAuditLabels } from './labels'
 import NodeDecision from './NodeDecision.vue'
-import CaptureBody from './CaptureBody.vue'
 
 const props = withDefaults(defineProps<{ id: number | null; refreshKey?: number }>(), { refreshKey: 0 })
 const emit = defineEmits<{ (event: 'close'): void; (event: 'changed'): void; (event: 'reaudit-created', ids: number[]): void }>()
 const label = useAuditLabels(), app = useAppStore()
 const detail = ref<JobDetail | null>(null)
 const loading = ref(false), pending = ref(false), error = ref('')
-const capture = ref<AuditCapture | null>(null), captureLoading = ref(false)
-const reauditReuseMode = ref<'allow' | 'force'>('allow')
+const reuseMode = ref<'allow' | 'force'>('allow')
 let generation = 0
 const job = computed(() => detail.value?.job)
 const pretty = (value: unknown) => JSON.stringify(value, null, 2)
-function stageTarget(targets: AuditStageTargets | undefined, kind?: string) {
-  if (!kind || !['current_user', 'instruction_context', 'intent_binding', 'effective_behavior'].includes(kind)) return null
-  return targets?.[kind as keyof AuditStageTargets] ?? null
-}
 function attemptRequest(attempt: ModelAttempt) {
   if (!attempt.request_metadata || typeof attempt.request_metadata !== 'object' || Array.isArray(attempt.request_metadata)) return null
   return (attempt.request_metadata as Record<string, unknown>).request_body ?? null
 }
 async function load() {
   const current = ++generation
-  if (!props.id) { detail.value = null; capture.value = null; return }
+  if (!props.id) { detail.value = null; return }
   loading.value = true
   error.value = ''
   detail.value = null
   try {
-	const result = await api.job(props.id)
-	if (current === generation) detail.value = result
-  } catch (err) { if (current === generation) error.value = extractApiErrorMessage(err, label('error')) }
-  finally { if (current === generation) loading.value = false }
+    const result = await api.job(props.id)
+    if (current !== generation) return
+    detail.value = result
+  } catch (err) {
+    if (current === generation) error.value = extractApiErrorMessage(err, label('error'))
+  } finally {
+    if (current === generation) loading.value = false
+  }
 }
-function close() { capture.value = null; emit('close') }
+function close() { emit('close') }
 async function copy(value: unknown) {
   try { await navigator.clipboard.writeText(typeof value === 'string' ? value : pretty(value)); app.showSuccess(label('copied')) }
   catch { app.showError(label('error')) }
 }
-async function restore(kind: 'result' | 'action', id: number) {
+async function retryAction(action: AuditAction) {
   pending.value = true
   try {
-    if (kind === 'result') await api.resume(id)
-    else await api.retryAction(id)
+    await api.retryAction(action.id)
     app.showSuccess(label('resumed'))
     emit('changed')
     await load()
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { pending.value = false }
 }
-async function showCapture() {
-  if (!job.value?.capture_id) return
-  captureLoading.value = true
-  try { capture.value = await api.capture(job.value.capture_id) }
-  catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
-  finally { captureLoading.value = false }
+async function toggleTrust(target: JobTarget) {
+  pending.value = true
+  try {
+    if (target.trusted) await api.untrust(target.hash)
+    else await api.trust(target.hash, `任务 #${props.id} 详情手工信任`)
+    app.showSuccess(label('saved'))
+    emit('changed')
+    await load()
+  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { pending.value = false }
 }
 async function reaudit() {
   if (!props.id) return
   pending.value = true
   try {
-	const result = await api.reaudit({ reuse_mode: reauditReuseMode.value, filter: { ids: [props.id] } })
-    const ids = result.items.flatMap(item => item.job_id && ['requeued', 'already_running'].includes(item.status) ? [item.job_id] : [])
+    const result = await api.reaudit({ reuse_mode: reuseMode.value, filter: { ids: [props.id] } })
+    const ids = result.items.flatMap(item => ['requeued', 'already_running'].includes(item.status) ? [item.job_id] : [])
     if (ids.length) {
-      const created = result.items.filter(item => item.status === 'requeued').length
-      app.showSuccess(created ? `${label('createdJobs')}: ${created}` : label('already_running'))
+      app.showSuccess(label('createdJobs'))
       emit('reaudit-created', ids)
       emit('changed')
       await load()
@@ -86,56 +85,93 @@ watch(() => [props.id, props.refreshKey], load, { immediate: true })
 
 <template>
   <BaseDialog :show="id !== null" :title="`${label('detail')} #${id ?? ''}`" width="full" :close-on-click-outside="true" @close="close">
-    <p v-if="loading" role="status">{{ label('loading') }}</p><p v-if="error" role="alert" class="text-red-600 dark:text-red-400">{{ error }}</p>
+    <p v-if="loading" role="status">{{ label('loading') }}</p>
+    <p v-if="error" role="alert" class="text-red-600 dark:text-red-400">{{ error }}</p>
     <div v-if="detail && job" class="space-y-6">
-      <div class="flex flex-wrap items-center gap-3"><button v-if="job.capture_id" class="btn btn-secondary" :disabled="captureLoading" @click="showCapture">{{ label(captureLoading ? 'loading' : 'viewCapture') }}</button><label class="flex items-center gap-2 text-sm"><span>{{ label('reauditReuseMode') }}</span><select v-model="reauditReuseMode" class="input w-auto"><option value="allow">{{ label('reuseAllow') }}</option><option value="force">{{ label('reuseForce') }}</option></select></label><button class="btn btn-secondary" :disabled="pending" @click="reaudit">{{ label(pending ? 'loading' : 'reaudit') }}</button></div>
+      <div class="flex flex-wrap items-center gap-3">
+        <label class="flex items-center gap-2 text-sm"><span>{{ label('reauditReuseMode') }}</span>
+          <select v-model="reuseMode" class="input w-auto"><option value="allow">{{ label('reuseAllow') }}</option><option value="force">{{ label('reuseForce') }}</option></select>
+        </label>
+        <button class="btn btn-secondary" :disabled="pending" @click="reaudit">{{ label(pending ? 'loading' : 'reaudit') }}</button>
+      </div>
       <section class="space-y-3">
-        <div class="flex flex-wrap gap-3"><strong>Job #{{ job.id }}</strong><span>{{ label(job.current_run_kind || 'request') }} · {{ label(job.status) }}</span><span>{{ label('auditRound') }} {{ job.audit_round }}</span><span>{{ label(job.execution_mode) }}</span><span>{{ label(job.gateway_result) }}</span></div>
+        <div class="flex flex-wrap gap-3">
+          <strong>Job #{{ job.id }}</strong>
+          <span>{{ label(job.current_run_kind) }} · {{ label(job.status) }}</span>
+          <span>{{ label('auditRound') }} {{ job.current_round }}</span>
+          <span>{{ label(job.mode) }}</span>
+          <strong v-if="job.decision" :class="job.decision === 'block' ? 'text-red-600 dark:text-red-400' : job.decision === 'review' ? 'text-amber-700 dark:text-amber-400' : ''">{{ label(job.decision) }}</strong>
+        </div>
         <p class="break-words text-sm">{{ job.identity.username }} · {{ job.identity.user_email }} · {{ job.identity.api_key_name }} · {{ job.identity.group_name }}</p>
-        <p class="break-all text-sm text-gray-500 dark:text-dark-400">{{ label('requestID') }}: {{ job.request_id || '—' }} · {{ job.identity.endpoint }} · {{ job.protocol }} · {{ job.requested_model }}</p>
-        <p class="break-all text-sm text-gray-500 dark:text-dark-400">Conversation: {{ job.conversation_key || label('conversationUnavailable') }}</p>
-        <p class="text-sm">{{ label('created') }}: {{ formatTime(job.created_at) }} · {{ label('attempts') }}: {{ job.attempts }} / {{ job.max_attempts }} · {{ label('inputStatus') }}: {{ label(job.snapshot_status) }}</p>
-        <p v-if="job.original_decision && detail.outcome" class="text-sm">{{ label('originalDecision') }}: {{ label(job.original_decision) }} → {{ label('latestDecision') }}: {{ label(detail.outcome.decision) }}</p>
-        <p v-if="detail.outcome" class="text-sm"><strong>{{ label('decision') }}: {{ label(detail.outcome.decision) }}</strong><span v-if="detail.outcome.partial_failure"> · {{ label('partial_failure') }}</span><span v-if="detail.outcome.source_outcome_id"> · {{ label('sourceReference') }} #{{ detail.outcome.source_outcome_id }}</span></p>
-        <div v-if="job.last_error_message" class="rounded-xl bg-red-50 p-3 text-sm dark:bg-red-950/30"><p class="text-red-700 dark:text-red-300">{{ label(job.failure_stage) }} · {{ job.last_error_code }}</p><pre class="mt-2 whitespace-pre-wrap break-words">{{ job.last_error_message }}</pre></div>
-        <button v-if="job.status === 'failed' && job.failure_stage === 'result_persist' && job.result_checkpoint" class="btn btn-secondary" :disabled="pending" @click="restore('result', job.id)">{{ label('resume') }}</button>
+        <p class="break-all text-sm text-gray-500 dark:text-dark-400">{{ label('requestID') }}: {{ job.request_id || '—' }} · {{ job.identity.endpoint }} · {{ job.protocol }} · {{ job.model }}</p>
+        <p class="text-sm">{{ label('created') }}: {{ formatTime(job.created_at) }} · {{ label('attempts') }}: {{ job.attempts }} / {{ job.max_attempts }} · {{ label('clientFingerprint') }}: {{ job.client_fingerprint }}</p>
+        <p v-if="job.orphan_continuation" class="text-sm text-amber-700 dark:text-amber-400">{{ label('orphanContinuation') }}</p>
+        <p class="text-sm">{{ label('enforcement') }}: {{ job.enforcement_eligible ? label('eligible') : label('notEligible') }}<span v-if="job.violation_counted"> · {{ label('violationCounted') }}</span><span v-if="job.disable_counted"> · {{ label('disableCounted') }}</span></p>
+        <div v-if="job.last_error_message" class="rounded-xl bg-red-50 p-3 text-sm dark:bg-red-950/30">
+          <p class="text-red-700 dark:text-red-300">{{ label(job.failure_stage) }} · {{ job.last_error_code }}</p>
+          <pre class="mt-2 whitespace-pre-wrap break-words">{{ job.last_error_message }}</pre>
+        </div>
       </section>
       <section class="space-y-3 border-t border-gray-200 pt-5 dark:border-dark-700">
-        <div class="flex flex-wrap justify-between gap-3"><h3 class="font-semibold">{{ label('rawInput') }}</h3><button v-if="detail.input_json" class="btn btn-secondary btn-sm" @click="copy(detail.input_json)">{{ label('copy') }}</button></div>
-        <p v-if="!detail.input_json" class="text-amber-700 dark:text-amber-400">{{ label('inputNotAvailable') }}</p>
-        <template v-else>
-          <div v-if="detail.input_parts.length" class="space-y-2"><h4 class="text-sm font-medium">{{ label('parsedPrompts') }}</h4><p class="text-xs text-gray-500">{{ label('roleExplanation') }}</p><details v-for="part in detail.input_parts" :key="part.order" class="rounded-lg border border-gray-100 p-3 text-sm dark:border-dark-700"><summary class="cursor-pointer break-words">#{{ part.order }} · {{ part.source_role }} → {{ part.policy_role }} · {{ label(part.turn_scope === 'active' ? 'activeInstruction' : part.turn_scope) }} · {{ label(part.selection_reason === 'empty' ? 'selectionEmpty' : (part.selection_reason || (part.selected ? 'selected' : 'notSelected'))) }} · {{ part.source_path }}</summary><pre class="mt-3 max-h-96 overflow-auto whitespace-pre-wrap break-words">{{ part.content.map(block => block.text).join('\n') || label('emptyContentNotCalled') }}</pre></details></div>
-          <div v-if="detail.audit_targets && Object.keys(detail.audit_targets).length" class="space-y-2"><h4 class="text-sm font-medium">{{ label('stageTargets') }}</h4><p class="text-xs text-gray-500">{{ label('stageTargetsHint') }}</p><details v-for="kind in ['current_user', 'instruction_context', 'intent_binding']" v-show="stageTarget(detail.audit_targets, kind)" :key="kind" class="rounded-lg border border-gray-100 p-3 text-sm dark:border-dark-700"><summary class="cursor-pointer">{{ label(kind) }}</summary><pre class="mt-3 max-h-[36rem] overflow-auto whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-4 text-xs dark:bg-dark-900">{{ pretty(stageTarget(detail.audit_targets, kind)) }}</pre></details></div>
-          <p v-if="detail.non_text?.length" class="text-sm text-amber-700 dark:text-amber-400">{{ label('notText') }}: {{ detail.non_text.map(part => `${part.source_path} (${part.type})`).join(' · ') }}</p>
-          <details><summary class="cursor-pointer text-sm">JSON · {{ label('rawInput') }}</summary><pre class="mt-3 max-h-[36rem] overflow-auto whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-4 text-xs dark:bg-dark-900">{{ detail.input_json }}</pre></details>
-        </template>
+        <h3 class="font-semibold">{{ label('targets') }}</h3>
+        <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('targetsHint') }}</p>
+        <article v-for="target in detail.targets" :key="target.order" class="space-y-3 rounded-xl bg-gray-50 p-4 dark:bg-dark-900">
+          <div class="flex flex-wrap items-center gap-3 text-sm">
+            <strong>#{{ target.order }} · {{ label(target.kind) }}</strong>
+            <span>{{ target.bytes }} B</span>
+            <span class="break-all font-mono text-xs text-gray-500">{{ target.hash }}</span>
+            <span v-if="target.resolution">{{ label('resolution') }}: {{ label(target.resolution) }}</span>
+            <strong v-if="target.decision" :class="target.decision === 'block' ? 'text-red-600 dark:text-red-400' : target.decision === 'review' ? 'text-amber-700 dark:text-amber-400' : ''">{{ label(target.decision) }}</strong>
+            <button v-if="target.kind === 'instruction'" class="btn btn-secondary btn-sm" :disabled="pending" @click="toggleTrust(target)">{{ label(target.trusted ? 'untrust' : 'trust') }}</button>
+          </div>
+          <p v-if="target.error_code" class="text-sm text-red-600 dark:text-red-400">{{ target.error_code }} · {{ target.error_message }}</p>
+          <details open><summary class="cursor-pointer text-sm font-medium">{{ label('auditedText') }}</summary>
+            <pre class="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white p-3 text-xs dark:bg-dark-950">{{ target.text || '—' }}</pre>
+          </details>
+          <div v-if="target.review" class="space-y-2">
+            <p class="text-sm">{{ label('score') }}: {{ target.review.score ?? '—' }} · {{ target.review.reason }}</p>
+            <div v-for="node in target.review.nodes" :key="node.model_id" class="rounded-lg border border-gray-100 p-3 text-sm dark:border-dark-700">
+              <NodeDecision :node="node" />
+            </div>
+          </div>
+        </article>
+        <p v-if="!detail.targets.length" class="text-sm text-gray-500">{{ label('empty') }}</p>
       </section>
-      <section class="space-y-3 border-t border-gray-200 pt-5 dark:border-dark-700"><h3 class="font-semibold">{{ label('modelsDetail') }}</h3>
-        <article v-for="model in detail.outcome?.models ?? job.result_checkpoint?.models ?? []" :key="model.model_id" class="space-y-3 rounded-xl bg-gray-50 p-4 dark:bg-dark-900">
-          <strong>{{ model.model_name || model.model_id }}</strong>
-          <NodeDecision :model="model" :config="detail.outcome?.decision_config ?? job.decision_config" />
-          <p class="text-sm">{{ label('basis') }}: {{ label(model.basis) }} <span v-if="model.reused"> · {{ label(model.segments.some(segment => segment.reuse_kind === 'inflight') ? 'inflight' : 'full_evaluation') }}</span></p><p v-if="model.skipped" class="text-sm text-gray-500">{{ label(model.skip_reason || 'aggregation_decided') }}</p><p class="whitespace-pre-wrap break-words text-sm">{{ model.reason }}</p><p v-if="model.error" class="text-sm text-red-600 dark:text-red-400">{{ model.error.message }} · {{ model.error.code }}</p>
-          <div v-if="model.behavior_decision || model.behavior_error || model.behavior_uses?.length" class="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm dark:border-amber-800 dark:bg-amber-950/30"><p><strong>{{ label('effectiveBehavior') }}</strong> · {{ label(model.behavior_decision || (model.behavior_error ? 'unavailable' : 'pass')) }}<span v-if="model.behavior_confidence !== null && model.behavior_confidence !== undefined"> · {{ model.behavior_confidence }}</span></p><p v-if="model.behavior_reason" class="mt-1 whitespace-pre-wrap break-words">{{ model.behavior_reason }}</p><p v-if="model.behavior_error" class="mt-1 text-red-600 dark:text-red-400">{{ model.behavior_error.message }} · {{ model.behavior_error.code }}</p></div>
-          <details v-for="part in model.behavior_uses ?? []" :key="`behavior-${part.target_kind || 'effective_behavior'}-${part.order}`" class="text-sm"><summary class="cursor-pointer">#{{ part.order }} · {{ label('effective_behavior') }} · {{ label(part.reuse_kind) }} · {{ part.result.confidence }} · {{ part.source_path }}</summary><p class="mt-2 whitespace-pre-wrap break-words">{{ part.result.reason }}</p><details v-if="stageTarget(detail.outcome?.audit_targets, 'effective_behavior')" class="mt-3"><summary class="cursor-pointer font-medium">{{ label('auditedContent') }}</summary><pre class="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white p-3 text-xs dark:bg-dark-950">{{ pretty(stageTarget(detail.outcome?.audit_targets, 'effective_behavior')) }}</pre></details></details>
-          <details v-for="part in model.target_uses ?? model.segments" :key="`${part.target_kind || 'legacy_segment'}-${part.order}`" class="text-sm"><summary class="cursor-pointer">#{{ part.order }} · {{ label(part.target_kind || 'legacy_segment') }} · {{ label(part.reuse_kind) }} · {{ part.result.confidence }} · {{ part.source_path }}</summary><p class="mt-2 whitespace-pre-wrap break-words">{{ part.result.reason }}</p><p class="mt-1 text-xs">Target #{{ part.result.id }}</p><details v-if="stageTarget(detail.outcome?.audit_targets, part.target_kind)" class="mt-3"><summary class="cursor-pointer font-medium">{{ label('auditedContent') }}</summary><pre class="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white p-3 text-xs dark:bg-dark-950">{{ pretty(stageTarget(detail.outcome?.audit_targets, part.target_kind)) }}</pre></details></details>
+      <section class="space-y-3 border-t border-gray-200 pt-5 dark:border-dark-700">
+        <h3 class="font-semibold">{{ label('actionsDetail') }}</h3>
+        <article v-for="action in detail.actions" :key="action.id" class="space-y-3 rounded-lg border border-gray-100 p-3 text-sm dark:border-dark-700">
+          <p>#{{ action.id }} · {{ label(action.action_type) }} · {{ label(action.execution_status || 'unknown') }} · {{ formatTime(action.applied_at) }} · {{ label(action.notification_status) }}</p>
+          <details><summary class="cursor-pointer">{{ label('detail') }}</summary><pre class="mt-2 overflow-auto whitespace-pre-wrap break-words text-xs">{{ pretty({ rule: action.rule_snapshot, transition: action.business_snapshot }) }}</pre></details>
+          <div v-for="delivery in action.deliveries" :key="delivery.recipient + delivery.kind">
+            <p>{{ delivery.recipient }} · {{ label(delivery.status) }} · {{ delivery.last_error }}</p>
+          </div>
+          <button v-if="['failed', 'unknown'].includes(action.execution_status || '') || action.notification_status === 'failed'" class="btn btn-secondary" :disabled="pending" @click="retryAction(action)">{{ label('retryAction') }}</button>
+        </article>
+        <p v-if="!detail.actions.length" class="text-sm text-gray-500">{{ label('empty') }}</p>
+      </section>
+      <section v-if="detail.rounds.length" class="space-y-3 border-t border-gray-200 pt-5 dark:border-dark-700">
+        <h3 class="font-semibold">{{ label('roundHistory') }}</h3>
+        <article v-for="round in detail.rounds" :key="round.round" class="rounded-lg border border-gray-100 p-3 text-sm dark:border-dark-700">
+          <p><strong>{{ label('auditRound') }} {{ round.round }}</strong> · {{ label(round.run_kind) }} · {{ label(round.decision) }} · {{ label(round.reuse_mode === 'force' ? 'reuseForce' : 'reuseAllow') }} · {{ label('trigger') }}: {{ round.trigger_kind ? label(round.trigger_kind) : '—' }}</p>
+          <p class="mt-1 text-gray-500">{{ formatTime(round.started_at) }} — {{ formatTime(round.finished_at) }}<span v-if="round.requested_by"> · {{ label('userID') }} {{ round.requested_by }}</span><span v-if="round.config_revision"> · {{ label('revision') }} {{ round.config_revision }}</span></p>
         </article>
       </section>
-      <section class="space-y-3 border-t border-gray-200 pt-5 dark:border-dark-700"><h3 class="font-semibold">{{ label('callsDetail') }}</h3>
-        <details v-for="attempt in detail.attempts" :key="attempt.id" class="rounded-lg border border-gray-100 p-3 text-sm dark:border-dark-700"><summary class="cursor-pointer break-words">#{{ attempt.id }} · {{ label('auditRound') }} {{ attempt.audit_round }} · Job #{{ attempt.job_id }} · {{ attempt.model_snapshot.name || attempt.model_id }} · {{ label(attempt.stage) }} · {{ label(attempt.status) }} · HTTP {{ attempt.http_status ?? '—' }} · {{ formatMS(attempt.latency_ms) }}</summary>
-          <p class="mt-3">{{ formatTime(attempt.dispatch_started_at) }} — {{ formatTime(attempt.finished_at) }} · Token {{ attempt.input_tokens ?? '—' }} / {{ attempt.output_tokens ?? '—' }} · {{ label('attempts') }} {{ attempt.evaluation_round }}</p><p v-if="attempt.repair_of_attempt_id">{{ label('format_repair') }} ← #{{ attempt.repair_of_attempt_id }}</p>
+      <section class="space-y-3 border-t border-gray-200 pt-5 dark:border-dark-700">
+        <div class="flex flex-wrap justify-between gap-3"><h3 class="font-semibold">{{ label('callsDetail') }}</h3></div>
+        <p v-if="!detail.attempts.length" class="text-sm text-gray-500">{{ label('callsInJobHint') }}</p>
+        <details v-for="attempt in detail.attempts" :key="attempt.id" class="rounded-lg border border-gray-100 p-3 text-sm dark:border-dark-700">
+          <summary class="cursor-pointer break-words">#{{ attempt.id }} · {{ label('auditRound') }} {{ attempt.audit_round }} · {{ attempt.model_snapshot.name || attempt.model_id }} · {{ label(attempt.stage) }} · {{ label(attempt.status) }} · HTTP {{ attempt.http_status ?? '—' }} · {{ formatMS(attempt.latency_ms) }}</summary>
           <pre v-if="attempt.error_message" class="my-3 whitespace-pre-wrap break-words text-red-600 dark:text-red-400">{{ attempt.error_code }} · {{ attempt.error_message }}</pre>
-          <details v-if="attemptRequest(attempt)" class="my-3"><summary class="cursor-pointer font-medium">{{ label('actualModelRequest') }}</summary><pre class="mt-2 max-h-[36rem] overflow-auto whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-3 text-xs dark:bg-dark-900">{{ pretty(attemptRequest(attempt)) }}</pre></details><p v-else class="my-3 text-xs text-gray-500">{{ label('requestBodyUnavailable') }}</p>
-          <div class="my-3 flex justify-between"><strong>{{ label('rawResponse') }}</strong><button v-if="attempt.raw_response !== null" class="btn btn-secondary btn-sm" @click="copy(attempt.raw_response)">{{ label('copy') }}</button></div><pre class="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-3 text-xs dark:bg-dark-900">{{ attempt.raw_response ?? '—' }}</pre>
-          <details class="mt-3"><summary>Request metadata</summary><pre class="mt-2 overflow-auto whitespace-pre-wrap break-words text-xs">{{ pretty(attempt.request_metadata) }}</pre></details>
-        </details><p v-if="!detail.attempts.length" class="text-sm text-gray-500">{{ label('empty') }}</p>
+          <details v-if="attemptRequest(attempt)" class="my-3"><summary class="cursor-pointer font-medium">{{ label('actualModelRequest') }}</summary><pre class="mt-2 max-h-[36rem] overflow-auto whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-3 text-xs dark:bg-dark-900">{{ pretty(attemptRequest(attempt)) }}</pre></details>
+          <div class="my-3 flex justify-between"><strong>{{ label('rawResponse') }}</strong><button v-if="attempt.raw_response !== null" class="btn btn-secondary btn-sm" @click="copy(attempt.raw_response)">{{ label('copy') }}</button></div>
+          <pre class="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-3 text-xs dark:bg-dark-900">{{ attempt.raw_response ?? '—' }}</pre>
+        </details>
       </section>
-      <section class="space-y-3 border-t border-gray-200 pt-5 dark:border-dark-700"><h3 class="font-semibold">{{ label('actionsDetail') }}</h3>
-        <div v-if="detail.enforcement" class="rounded-lg bg-gray-50 p-3 text-sm dark:bg-dark-900"><p>{{ label('warning') }}: {{ label(detail.enforcement.warning_reason) }} · {{ detail.enforcement.window_violations }} / {{ detail.enforcement.window_size }}</p><p class="mt-1">{{ label('disable') }}: {{ label(detail.enforcement.disable_reason) }} · {{ label('disableViolationCount') }} {{ detail.enforcement.disable_violation_count }}</p></div>
-        <article v-for="action in detail.actions" :key="action.id" class="space-y-3 rounded-lg border border-gray-100 p-3 text-sm dark:border-dark-700"><p>#{{ action.id }} · {{ label(action.action_type) }} · {{ label(action.execution_status || 'unknown') }} · {{ formatTime(action.applied_at) }} · {{ label(action.notification_status) }}</p><details><summary class="cursor-pointer">{{ label('detail') }}</summary><pre class="mt-2 overflow-auto whitespace-pre-wrap break-words text-xs">{{ pretty({ rule: action.rule_snapshot, transition: action.business_snapshot }) }}</pre></details><details v-if="action.attempt_history?.length"><summary>{{label('accountAttempts')}}</summary><pre class="overflow-auto whitespace-pre-wrap text-xs">{{pretty(action.attempt_history)}}</pre></details><p>{{ label('authCacheStock') }}: {{ label(action.auth_cache_status) }} {{ action.auth_cache_error }}</p><div v-for="delivery in action.deliveries" :key="delivery.recipient + delivery.kind"><p>{{ delivery.recipient }} · {{ label(delivery.status) }} · {{ delivery.last_error }}</p><details><summary>{{ label('attempts') }}: {{ delivery.attempts.length }}</summary><pre class="overflow-auto whitespace-pre-wrap text-xs">{{ pretty(delivery.attempts) }}</pre></details></div><button v-if="action.notification_status === 'failed' || action.execution_status === 'failed' || action.execution_status === 'unknown'" class="btn btn-secondary" :disabled="pending" @click="restore('action', action.id)">{{ label('retryAction') }}</button></article>
-      </section>
-      <details class="border-t border-gray-200 pt-5 dark:border-dark-700"><summary class="cursor-pointer font-semibold">{{ label('policySnapshot') }}</summary><p class="mt-2 text-sm text-gray-500">{{ label('snapshotHint') }}</p><pre class="mt-3 overflow-auto whitespace-pre-wrap break-words text-xs">{{ pretty(job.config_snapshot) }}</pre></details>
-      <section v-if="detail.rounds?.length" class="space-y-3 border-t border-gray-200 pt-5 dark:border-dark-700"><h3 class="font-semibold">{{ label('roundHistory') }}</h3><article v-for="round in detail.rounds" :key="round.id" class="rounded-lg border border-gray-100 p-3 text-sm dark:border-dark-700"><p><strong>{{ label('auditRound') }} {{ round.audit_round }}</strong> · {{ label(round.run_kind) }} · {{ label(round.decision) }} · {{ label(round.reuse_mode === 'force' ? 'reuseForce' : 'reuseAllow') }} · {{ formatMS(round.duration_ms) }}</p><p class="mt-1 text-gray-500">{{ formatTime(round.started_at) }} — {{ formatTime(round.finished_at) }}<span v-if="round.requested_by"> · {{ label('userID') }} {{ round.requested_by }}</span></p><details class="mt-2"><summary class="cursor-pointer">{{ label('modelsDetail') }}</summary><pre class="mt-2 overflow-auto whitespace-pre-wrap break-words text-xs">{{ pretty(round.models) }}</pre></details><details v-if="round.audit_targets && Object.keys(round.audit_targets).length" class="mt-2"><summary class="cursor-pointer">{{ label('stageTargets') }}</summary><pre class="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words text-xs">{{ pretty(round.audit_targets) }}</pre></details></article></section>
+      <details class="border-t border-gray-200 pt-5 dark:border-dark-700">
+        <summary class="cursor-pointer font-semibold">{{ label('policySnapshot') }}</summary>
+        <p class="mt-2 text-sm text-gray-500">{{ label('snapshotHint') }}</p>
+        <pre class="mt-3 max-h-96 overflow-auto whitespace-pre-wrap break-words text-xs">{{ pretty(job.config_revision ? { revision: job.config_revision, mode: job.mode, skill: job.client_fingerprint } : null) }}</pre>
+      </details>
     </div>
-    <BaseDialog :show="!!capture" :title="label('captureDetail')" :close-on-click-outside="true" @close="capture = null"><CaptureBody v-if="capture" :capture="capture" /></BaseDialog>
   </BaseDialog>
 </template>

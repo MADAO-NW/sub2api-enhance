@@ -4,61 +4,51 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
 	"io"
-	"log"
-	"mime"
-	"mime/multipart"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
-	"strconv"
 	"strings"
+	"time"
+
+	"github.com/gorilla/websocket"
 	"sub2api-enhance/internal/sub2api"
 	audit "sub2api-enhance/internal/thirdpartypromptaudit"
-	"sync"
-	"time"
-	"unicode/utf8"
 )
 
-type captureStore interface {
-	Save(context.Context, *audit.Capture) error
-	Observe(context.Context, int64, string, map[string]any) error
-	Finish(context.Context, int64, string, string) error
-}
 type auditor interface {
 	Mode() string
 	ModeForUser(int64) string
-	CaptureWhenAuditOff() bool
-	RequiresAudit(int64, *int64, string) bool
-	AuditCapture(context.Context, *audit.Capture) (*audit.IntakeDecision, error)
-	ObserveGateway(context.Context, *audit.IntakeDecision, audit.IngressDecision, time.Duration)
+	Check(context.Context, audit.IntakeRequest) *audit.IntakeDecision
+	RegisterResponseID(context.Context, string, string)
+	RejectContinuation(*audit.IntakeDecision, int64, string)
 }
+
 type identityResolver interface {
 	Resolve(context.Context, *http.Request, string) (sub2api.Identity, error)
 }
+
 type Proxy struct {
 	upstream *url.URL
 	http     *httputil.ReverseProxy
-	captures captureStore
 	audit    auditor
 	identity identityResolver
 }
+
 type requestContext struct {
 	clientIP string
-	capture  *audit.Capture
+	turnKey  string
 	started  time.Time
 }
+
 type contextKey struct{}
 
-func New(upstream string, captures captureStore, service auditor, identities identityResolver) (*Proxy, error) {
+func New(upstream string, service auditor, identities identityResolver) (*Proxy, error) {
 	u, err := url.Parse(upstream)
 	if err != nil {
 		return nil, err
 	}
-	p := &Proxy{upstream: u, captures: captures, audit: service, identity: identities}
+	p := &Proxy{upstream: u, audit: service, identity: identities}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	p.http = &httputil.ReverseProxy{Transport: transport, FlushInterval: -1, Rewrite: func(r *httputil.ProxyRequest) {
@@ -67,60 +57,92 @@ func New(upstream string, captures captureStore, service auditor, identities ide
 		r.Out.Header.Del("Forwarded")
 		r.Out.Header.Del("X-Forwarded-For")
 		r.Out.Header.Del("X-Real-IP")
+		// 增强专用请求头继续剥离，不交给原版。
 		r.Out.Header.Del("X-Enhance-Capture")
 		r.Out.Header.Del("X-Enhance-Conversation-ID")
 		if state, ok := r.In.Context().Value(contextKey{}).(*requestContext); ok {
 			r.Out.Header.Set("X-Forwarded-For", state.clientIP)
 			r.Out.Header.Set("X-Real-IP", state.clientIP)
 		}
-	}, ModifyResponse: func(r *http.Response) error {
-		state, _ := r.Request.Context().Value(contextKey{}).(*requestContext)
-		if state != nil && state.capture != nil {
-			p.observe(r.Request.Context(), state.capture.ID, "response_started", map[string]any{"http_status": r.StatusCode})
-			r.Body = &observedBody{ReadCloser: r.Body, done: func(status string) {
-				p.observe(r.Request.Context(), state.capture.ID, status, map[string]any{"http_status": r.StatusCode})
-			}}
+	}, ModifyResponse: func(response *http.Response) error {
+		state, _ := response.Request.Context().Value(contextKey{}).(*requestContext)
+		if state == nil || state.turnKey == "" || response.Body == nil {
+			return nil
 		}
+		// 只在前缀范围内嗅探响应 ID，不缓存整个响应体。
+		response.Body = &idSniffer{ReadCloser: response.Body, turnKey: state.turnKey, service: p.audit,
+			context: response.Request.Context(), streaming: strings.Contains(response.Header.Get("Content-Type"), "event-stream")}
 		return nil
 	}, ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-		state, _ := r.Context().Value(contextKey{}).(*requestContext)
-		if state != nil && state.capture != nil {
-			p.observe(r.Context(), state.capture.ID, "unknown", map[string]any{"reason": "原版响应未完成确认"})
-		}
 		writeError(w, protocol(r.URL.Path), 502, "upstream_unavailable", "原版服务暂不可用")
 	}}
 	return p, nil
 }
 
-type observedBody struct {
+// 响应 ID 嗅探只在前 256KB 内进行，避免代理缓存长响应。
+const responseIDSniffLimit = 256 << 10
+
+type idSniffer struct {
 	io.ReadCloser
-	done func(string)
-	once sync.Once
+	buffer    []byte
+	turnKey   string
+	service   auditor
+	context   context.Context
+	streaming bool
+	finished  bool
 }
 
-func (b *observedBody) Read(p []byte) (int, error) {
-	n, err := b.ReadCloser.Read(p)
-	if err != nil {
-		status := "unknown"
-		if errors.Is(err, io.EOF) {
-			status = "complete"
+func (s *idSniffer) Read(p []byte) (int, error) {
+	n, err := s.ReadCloser.Read(p)
+	if n > 0 && !s.finished {
+		remaining := responseIDSniffLimit - len(s.buffer)
+		if remaining > 0 {
+			s.buffer = append(s.buffer, p[:min(n, remaining)]...)
 		}
-		b.once.Do(func() { b.done(status) })
+		if id := extractResponseID(s.buffer, s.streaming); id != "" {
+			s.finished, s.buffer = true, nil
+			s.service.RegisterResponseID(s.context, id, s.turnKey)
+		} else if len(s.buffer) >= responseIDSniffLimit {
+			s.finished, s.buffer = true, nil
+		}
+	}
+	if err != nil && !s.finished {
+		s.finished, s.buffer = true, nil
 	}
 	return n, err
 }
-func (b *observedBody) Close() error {
-	err := b.ReadCloser.Close()
-	b.once.Do(func() { b.done("unknown") })
-	return err
-}
-func (p *Proxy) observe(ctx context.Context, id int64, status string, detail map[string]any) {
-	save, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	if err := p.captures.Observe(save, id, status, detail); err != nil {
-		log.Printf("采集转发观测补写失败 capture_id=%d status=%s", id, status)
+
+// extractResponseID 从非流式响应或 SSE 的 response.created 事件中取出响应 ID。
+func extractResponseID(raw []byte, streaming bool) string {
+	if !streaming {
+		var value struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return ""
+		}
+		return value.ID
 	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") || !strings.Contains(line, "response.created") {
+			continue
+		}
+		var event struct {
+			Response struct {
+				ID string `json:"id"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &event); err != nil {
+			continue
+		}
+		if event.Response.ID != "" {
+			return event.Response.ID
+		}
+	}
+	return ""
 }
+
 func protocol(path string) string {
 	switch {
 	case strings.Contains(path, "/responses"):
@@ -141,6 +163,7 @@ func protocol(path string) string {
 		return "unsupported"
 	}
 }
+
 func writeError(w http.ResponseWriter, protocol string, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -165,16 +188,11 @@ func auditDeniedMessage(kind audit.IngressDecisionKind) string {
 func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 	state := &requestContext{clientIP: clientIP, started: time.Now()}
 	r = r.WithContext(context.WithValue(r.Context(), contextKey{}, state))
-	auditOff := p.audit.Mode() == "off"
-	if auditOff && !p.audit.CaptureWhenAuditOff() {
+	if p.audit.Mode() == "off" {
 		p.http.ServeHTTP(w, r)
 		return
 	}
 	if websocket.IsWebSocketUpgrade(r) {
-		if auditOff && protocol(r.URL.Path) != "responses" {
-			p.http.ServeHTTP(w, r)
-			return
-		}
 		p.websocket(w, r, state)
 		return
 	}
@@ -183,180 +201,125 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 		return
 	}
 	kind := protocol(r.URL.Path)
-	file, err := os.CreateTemp("", "sub2api-enhance-input-*")
+	body, err := spoolRequest(r)
 	if err != nil {
-		writeError(w, kind, 503, "capture_unavailable", "无法保存请求输入")
+		switch {
+		case errors.Is(err, ErrBodyTooLarge):
+			writeError(w, kind, http.StatusRequestEntityTooLarge, "request_too_large", "请求体解压后超过 64MB 上限，未转发")
+		case errors.Is(err, ErrUnsupportedEncoding):
+			writeError(w, kind, http.StatusUnsupportedMediaType, "unsupported_encoding", "请求内容编码暂不支持审核解析")
+		default:
+			writeError(w, kind, http.StatusServiceUnavailable, "input_unavailable", "无法读取请求输入")
+		}
 		return
 	}
-	defer func() { _ = file.Close(); _ = os.Remove(file.Name()) }()
-	count, readErr := io.Copy(file, r.Body)
-	_ = r.Body.Close()
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		writeError(w, kind, 503, "capture_unavailable", "无法读取已接收输入")
-		return
+	defer body.close()
+	if body.encoding != "" {
+		r.Header.Del("Content-Encoding")
 	}
-	raw, err := io.ReadAll(file)
-	if err != nil {
-		writeError(w, kind, 503, "capture_unavailable", "无法读取已接收输入")
-		return
+	parsedProtocol := kind
+	if body.format == "multipart_text_fields" {
+		parsedProtocol = "chat_completions"
 	}
-	c := &audit.Capture{Key: uuid.NewString(), ConversationKey: r.Header.Get("X-Enhance-Conversation-ID"), Transport: "http", Protocol: kind, Format: "entity_bytes", Raw: raw, SnapshotStatus: "complete", Metadata: map[string]string{"path": r.URL.Path, "method": r.Method, "content_type": r.Header.Get("Content-Type"), "content_encoding": r.Header.Get("Content-Encoding"), "client_ip": clientIP, "mode": p.audit.Mode()}}
-	if readErr != nil {
-		c.SnapshotStatus = "incomplete"
-		c.Error = "客户端正文未接收完整"
-	}
-	if contentType, params, e := mime.ParseMediaType(r.Header.Get("Content-Type")); e == nil && contentType == "multipart/form-data" && readErr == nil {
-		if _, err := file.Seek(0, io.SeekStart); err != nil {
-			writeError(w, kind, 503, "capture_unavailable", "无法读取媒体输入")
+	identityCtx, identityCancel := context.WithTimeout(r.Context(), 5*time.Second)
+	identity, identityErr := p.identity.Resolve(identityCtx, r, clientIP)
+	identityCancel()
+	if identityErr != nil {
+		// 身份解析失败：blocking 沿用 eligibility_unknown 拒绝，async 直接转发且不落库（决策 12）。
+		if p.audit.ModeForUser(identity.UserID) == "blocking" {
+			writeError(w, kind, http.StatusServiceUnavailable, "eligibility_unknown", "身份暂不可验证，当前为同步审核模式，请求未转发")
 			return
 		}
-		fields := []map[string]any{}
-		reader := multipart.NewReader(file, params["boundary"])
-		sequence := 0
-		for {
-			part, e := reader.NextRawPart()
-			if errors.Is(e, io.EOF) {
-				break
-			}
-			if e != nil {
-				c.Error = "媒体表单未完整解析"
-				c.SnapshotStatus = "incomplete"
-				break
-			}
-			sequence++
-			entry := map[string]any{"name": part.FormName(), "order": sequence, "content_type": part.Header.Get("Content-Type"), "headers": part.Header}
-			if part.FileName() == "" {
-				data, e := io.ReadAll(part)
-				if e != nil {
-					c.SnapshotStatus = "incomplete"
-					c.Error = "媒体文本字段读取失败"
-				}
-				entry["raw_base64"] = data
-				if utf8.Valid(data) {
-					entry["text"] = string(data)
-				}
-			} else {
-				entry["filename"] = part.FileName()
-				entry["binary_omitted"] = true
-				_, _ = io.Copy(io.Discard, part)
-			}
-			_ = part.Close()
-			fields = append(fields, entry)
-		}
-		c.Raw, err = json.Marshal(fields)
-		if err != nil {
-			writeError(w, kind, 503, "capture_unavailable", "媒体文本封装失败")
+		p.forward(w, r, kind, body)
+		return
+	}
+	if parsedProtocol == "unsupported" {
+		if p.audit.ModeForUser(identity.UserID) == "blocking" {
+			writeError(w, kind, http.StatusServiceUnavailable, "eligibility_unknown", "该协议尚不支持审核，当前为同步审核模式，请求未转发")
 			return
 		}
-		c.Format = "multipart_text_fields"
-		c.Metadata["content_encoding"] = ""
+		p.forward(w, r, kind, body)
+		return
 	}
-	identityCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	c.Identity, err = p.identity.Resolve(identityCtx, r, clientIP)
-	cancel()
-	c.Metadata["mode"] = p.audit.ModeForUser(c.Identity.UserID)
-	auditRequired := kind != "unsupported" && p.audit.RequiresAudit(c.Identity.UserID, c.Identity.GroupID, c.Identity.Platform)
-	c.Metadata["audit_required"] = strconv.FormatBool(auditRequired)
-	if err != nil {
-		c.Error = c.Identity.Reason
+	if err := body.rewind(); err != nil {
+		writeError(w, kind, http.StatusServiceUnavailable, "input_unavailable", "无法读取请求输入")
+		return
 	}
-	save, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-	err = p.captures.Save(save, c)
-	cancel()
+	parsed, err := audit.ParsePrompt(parsedProtocol, body.file, audit.DetectClient(r.Header))
 	if err != nil {
-		log.Printf("请求原文保存失败 capture_key=%s error=%v", c.Key, err)
-		if auditRequired {
-			writeError(w, kind, 503, "capture_unavailable", "原文尚未确认保存，未转发请求")
+		if errors.Is(err, audit.ErrNotAuditable) {
+			// 非生成请求直接转发，不建任务、不落库。
+			p.forward(w, r, kind, body)
 			return
 		}
-	} else {
-		state.capture = c
-	}
-	if readErr != nil || c.SnapshotStatus != "complete" {
-		writeError(w, kind, 400, "incomplete_input", "请求输入不完整")
-		return
-	}
-	var decision *audit.IntakeDecision
-	if err == nil {
-		if auditRequired {
-			decision = p.evaluate(r.Context(), c)
-		} else {
-			finish, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-			if finishErr := p.captures.Finish(finish, c.ID, "awaiting_review", "仅采集原文，等待管理员审核"); finishErr != nil {
-				log.Printf("采集待审核状态补写失败 capture_id=%d error=%v", c.ID, finishErr)
-			}
-			cancel()
+		if p.audit.ModeForUser(identity.UserID) == "blocking" {
+			writeError(w, kind, http.StatusServiceUnavailable, "input_parse_failed", "请求无法按协议解析，当前为同步审核模式，请求未转发")
+			return
 		}
-	}
-	if !p.allow(w, kind, c, decision) {
+		p.forward(w, r, kind, body)
 		return
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		writeError(w, kind, 503, "capture_unavailable", "请求转发准备失败")
+	decision := p.audit.Check(r.Context(), audit.IntakeRequest{
+		Parsed: parsed, UserID: identity.UserID, APIKeyID: identity.APIKeyID, GroupID: identity.GroupID,
+		Identity: audit.Identity{Username: identity.Username, UserEmail: identity.UserEmail, APIKeyName: identity.APIKeyName, GroupName: identity.GroupName, Endpoint: r.URL.Path},
+		Provider: identity.Platform, Model: parsed.Model, RequestID: headerValue(r, "X-Request-Id"),
+	})
+	if !p.allow(w, kind, identity.APIKeyID, decision) {
 		return
 	}
-	r.Body = io.NopCloser(file)
-	r.ContentLength = count
-	r.GetBody = nil
-	if state.capture != nil {
-		p.observe(r.Context(), c.ID, "started", map[string]any{"transport": "http"})
-	}
-	p.http.ServeHTTP(w, r)
 	if decision != nil {
-		p.audit.ObserveGateway(r.Context(), decision, audit.IngressDecision{AllowNextStage: true, Kind: audit.IngressDecisionAllow}, time.Since(state.started))
+		state.turnKey = decision.TurnKey
 	}
+	p.forward(w, r, kind, body)
 }
-func (p *Proxy) evaluate(ctx context.Context, c *audit.Capture) *audit.IntakeDecision {
-	mode := c.Metadata["mode"]
-	if mode == "" {
-		mode = p.audit.ModeForUser(c.Identity.UserID)
+
+// forward 用已落盘的正文转发原请求，保留原始长度与查询参数。
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, kind string, body *spooledBody) {
+	if err := body.rewind(); err != nil {
+		writeError(w, kind, http.StatusServiceUnavailable, "input_unavailable", "请求转发准备失败")
+		return
 	}
-	if c.Identity.Eligibility != "passed" || c.Protocol == "unsupported" {
-		finish, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		if err := p.captures.Finish(finish, c.ID, "awaiting_review", "输入身份或协议不满足自动审核条件，等待管理员审核"); err != nil {
-			log.Printf("采集待审核状态补写失败 capture_id=%d error=%v", c.ID, err)
-		}
-		cancel()
-		if mode == "blocking" {
-			return &audit.IntakeDecision{Mode: "blocking", Kind: audit.IngressDecisionUnavailable, ErrorCode: "eligibility_unknown"}
-		}
-		return nil
-	}
-	result, err := p.audit.AuditCapture(ctx, c)
-	status := "done"
-	message := ""
-	if err != nil {
-		status = "failed"
-		message = err.Error()
-		if mode == "blocking" {
-			result = &audit.IntakeDecision{Mode: "blocking", Kind: audit.IngressDecisionUnavailable, ErrorCode: "input_parse_failed"}
-		}
-	} else if result == nil {
-		status = "awaiting_review"
-		message = "仅采集原文，等待管理员审核"
-	} else if result.ErrorCode == "current_user_not_found" {
-		status = "skipped"
-		message = "当前任务没有可审核的 user 文本"
-	} else if result.JobID == 0 {
-		status = "retry"
-	}
-	finish, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	if err := p.captures.Finish(finish, c.ID, status, message); err != nil {
-		log.Printf("采集处理状态补写失败 capture_id=%d", c.ID)
-	}
-	return result
+	r.Body = io.NopCloser(body.file)
+	r.ContentLength = body.size
+	r.GetBody = nil
+	p.http.ServeHTTP(w, r)
 }
-func (p *Proxy) allow(w http.ResponseWriter, kind string, c *audit.Capture, d *audit.IntakeDecision) bool {
-	// 异步审核不可用时不阻断原请求；任务状态和失败原因由后台任务记录。
-	if d == nil || d.Kind == audit.IngressDecisionAllow || d.Kind == audit.IngressDecisionFlag || (d.Mode == "async" && d.Kind == audit.IngressDecisionUnavailable) {
+
+func headerValue(r *http.Request, name string) string {
+	if value := r.Header.Get(name); value != "" {
+		return value
+	}
+	return ""
+}
+
+// allow 决定是否继续转发：异步审核不可用时不阻断原请求。
+func (p *Proxy) allow(w http.ResponseWriter, kind string, apiKeyID int64, d *audit.IntakeDecision) bool {
+	if d == nil || d.Kind == audit.IngressDecisionAllow || d.Kind == audit.IngressDecisionFlag ||
+		(d.Mode == "async" && d.Kind == audit.IngressDecisionUnavailable) {
 		return true
 	}
-	status := 503
+	status := http.StatusServiceUnavailable
 	if d.Kind == audit.IngressDecisionBlock {
-		status = 403
+		status = http.StatusForbidden
+		p.audit.RejectContinuation(d, apiKeyID, d.ErrorCode)
 	}
-	p.observe(context.Background(), c.ID, "blocked", map[string]any{"code": d.ErrorCode})
 	writeError(w, kind, status, d.ErrorCode, auditDeniedMessage(d.Kind))
 	return false
+}
+
+// responseIDFromEvent 读取 WebSocket 事件里的 response.created 响应 ID。
+func responseIDFromEvent(raw []byte) string {
+	var event struct {
+		Type     string `json:"type"`
+		Response struct {
+			ID string `json:"id"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(raw, &event); err != nil {
+		return ""
+	}
+	if event.Type != "response.created" {
+		return ""
+	}
+	return event.Response.ID
 }

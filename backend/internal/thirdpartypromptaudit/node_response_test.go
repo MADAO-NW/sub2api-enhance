@@ -25,7 +25,7 @@ func TestSemanticUpstreamFailuresDoNotTriggerFormatRepair(t *testing.T) {
 			require.NoError(t, err)
 			defer client.CloseIdleConnections()
 			c := &ModelClient{attempts: store}
-			score, _, failure := c.EvaluateTarget(context.Background(), nil, model, "", ConfigSnapshot{}, client, url, "probe", map[string]string{"text": "test"}, nil)
+			score, _, failure := c.EvaluateTarget(context.Background(), nil, model, "", ConfigSnapshot{}, client, url, "probe", `{"text":"test"}`, "", nil)
 			require.Nil(t, score)
 			require.NotNil(t, failure)
 			require.Equal(t, test.code, failure.Code)
@@ -50,7 +50,7 @@ func TestProtocolFailuresReceiveOneFormatRepair(t *testing.T) {
 			client, url, err := nodeHTTPClient(model)
 			require.NoError(t, err)
 			defer client.CloseIdleConnections()
-			_, _, failure := (&ModelClient{attempts: store}).EvaluateTarget(context.Background(), nil, model, "", ConfigSnapshot{}, client, url, "probe", nil, nil)
+			_, _, failure := (&ModelClient{attempts: store}).EvaluateTarget(context.Background(), nil, model, "", ConfigSnapshot{}, client, url, "probe", "", "", nil)
 			require.Equal(t, "upstream_protocol_error", failure.Code)
 			require.Equal(t, 2, calls)
 			require.Equal(t, "format_repair", store.attempts[1].Stage)
@@ -76,7 +76,7 @@ func TestOnlyScoreFormatFailureIsRepaired(t *testing.T) {
 	require.NoError(t, err)
 	defer client.CloseIdleConnections()
 	c := &ModelClient{attempts: store}
-	score, _, failure := c.EvaluateTarget(context.Background(), nil, model, "", ConfigSnapshot{}, client, url, "probe", nil, nil)
+	score, _, failure := c.EvaluateTarget(context.Background(), nil, model, "", ConfigSnapshot{}, client, url, "probe", `{"text":"test"}`, "", nil)
 	require.Nil(t, failure)
 	require.Equal(t, 0.9, score.Confidence)
 	require.Equal(t, 2, calls)

@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"sub2api-enhance/internal/pkg/response"
+	"sub2api-enhance/internal/sub2api"
 )
 
 type AuditUser struct {
@@ -56,4 +57,14 @@ func (h *AdminHandler) ListAuditUsers(c *gin.Context) {
 		return
 	}
 	response.Success(c, users)
+}
+
+// ListGroups 返回可配置审核范围的分组，只读原版公开表。
+func (h *AdminHandler) ListGroups(c *gin.Context) {
+	result, err := sub2api.NewIdentityStore(h.repo.db).Groups(c.Request.Context())
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, result)
 }
