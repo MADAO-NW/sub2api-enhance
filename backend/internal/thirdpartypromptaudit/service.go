@@ -175,7 +175,7 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		if parsed.PreviousResponseID != "" {
 			resolved, err := s.resolveResponseTurn(ctx, parsed.PreviousResponseID)
 			if err != nil {
-				return s.redisFailure(mode, "response_mapping_unavailable")
+				return s.redisFailure(mode, "response_mapping_unavailable", err)
 			}
 			if resolved != "" {
 				bound = resolved
@@ -183,7 +183,7 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		}
 		state, err := s.getTurn(ctx, bound)
 		if err != nil {
-			return s.redisFailure(mode, "turn_key_unavailable")
+			return s.redisFailure(mode, "turn_key_unavailable", err)
 		}
 		if state != nil {
 			return s.boundDecision(state, mode, turnKey)
@@ -191,7 +191,7 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 	}
 	state, err := s.getTurn(ctx, turnKey)
 	if err != nil {
-		return s.redisFailure(mode, "turn_key_unavailable")
+		return s.redisFailure(mode, "turn_key_unavailable", err)
 	}
 	if state != nil {
 		return s.boundDecision(state, mode, turnKey)
@@ -265,8 +265,8 @@ func excludedByScope(snapshot ConfigSnapshot, request IntakeRequest) bool {
 }
 
 // redisFailure 处理回合键读写失败：async 放行并记运行日志，blocking 沿用不可用语义（决策 11）。
-func (s *Service) redisFailure(mode, code string) *IntakeDecision {
-	s.noteError(code, errors.New("回合键读写失败"))
+func (s *Service) redisFailure(mode, code string, err error) *IntakeDecision {
+	s.noteError(code, err)
 	if mode == "async" {
 		return &IntakeDecision{Mode: mode, Kind: IngressDecisionAllow, ErrorCode: code}
 	}

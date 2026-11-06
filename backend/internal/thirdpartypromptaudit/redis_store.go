@@ -11,7 +11,9 @@ import (
 )
 
 // redisKeyPrefix 隔离增强审计回合键与原版 Sub2API 业务键。
-const redisKeyPrefix = "sub2api_enhance:tppa:v2:"
+// 沿用部署侧已授予的 v1 前缀（`sub2api_enhance:tppa:v1:*`），键内再按类型分命名空间：
+// turn:<回合键> 与 response:<响应 ID>，与旧版片段/统计键不冲突。
+const redisKeyPrefix = "sub2api_enhance:tppa:v1:"
 
 // turnKeyTTL 是回合键与 previous_response_id 映射的固定有效期，命中时刷新（决策 24）。
 const turnKeyTTL = 30 * time.Minute
@@ -72,10 +74,11 @@ func (s *RedisStore) noteSuccess() {
 	s.state.OK, s.state.Status, s.state.Error, s.state.LastSuccess = true, "ok", "", &now
 }
 
-func (s *RedisStore) noteError() {
+// noteError 记录 Redis 故障原文，便于区分权限、网络和超时问题。
+func (s *RedisStore) noteError(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.state.OK, s.state.Status, s.state.Error = false, "degraded", "增强 Redis 暂时不可用"
+	s.state.OK, s.state.Status, s.state.Error = false, "degraded", "增强 Redis 暂时不可用: "+err.Error()
 }
 
 // GetTurn 读取回合键并在命中时刷新有效期（滑动过期）。
@@ -85,7 +88,7 @@ func (s *RedisStore) GetTurn(ctx context.Context, key string) (*turnState, error
 		return nil, nil
 	}
 	if err != nil {
-		s.noteError()
+		s.noteError(err)
 		return nil, err
 	}
 	var state turnState
@@ -93,8 +96,9 @@ func (s *RedisStore) GetTurn(ctx context.Context, key string) (*turnState, error
 		return nil, err
 	}
 	s.noteSuccess()
-	if err := s.client.Expire(ctx, redisKeyPrefix+"turn:"+key, turnKeyTTL).Err(); err != nil {
-		s.noteError()
+	// 滑动过期用带 TTL 的 SET 重写，兼容只授予 GET/SET 的 Redis ACL。
+	if err := s.client.Set(ctx, redisKeyPrefix+"turn:"+key, raw, turnKeyTTL).Err(); err != nil {
+		s.noteError(err)
 	}
 	return &state, nil
 }
@@ -106,7 +110,7 @@ func (s *RedisStore) SaveTurn(ctx context.Context, key string, state turnState) 
 		return err
 	}
 	if err := s.client.Set(ctx, redisKeyPrefix+"turn:"+key, raw, turnKeyTTL).Err(); err != nil {
-		s.noteError()
+		s.noteError(err)
 		return err
 	}
 	s.noteSuccess()
@@ -121,12 +125,13 @@ func (s *RedisStore) GetResponseTurn(ctx context.Context, responseID string) (st
 		return "", nil
 	}
 	if err != nil {
-		s.noteError()
+		s.noteError(err)
 		return "", err
 	}
 	s.noteSuccess()
-	if err := s.client.Expire(ctx, key, turnKeyTTL).Err(); err != nil {
-		s.noteError()
+	// 同样用带 TTL 的 SET 刷新映射有效期，避免依赖 EXPIRE 权限。
+	if err := s.client.Set(ctx, key, value, turnKeyTTL).Err(); err != nil {
+		s.noteError(err)
 	}
 	return value, nil
 }
@@ -134,7 +139,7 @@ func (s *RedisStore) GetResponseTurn(ctx context.Context, responseID string) (st
 // SaveResponseTurn 登记 previous_response_id 到回合键的映射。
 func (s *RedisStore) SaveResponseTurn(ctx context.Context, responseID, turnKey string) error {
 	if err := s.client.Set(ctx, redisKeyPrefix+"response:"+responseID, turnKey, turnKeyTTL).Err(); err != nil {
-		s.noteError()
+		s.noteError(err)
 		return err
 	}
 	s.noteSuccess()
