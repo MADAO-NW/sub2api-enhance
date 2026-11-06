@@ -86,7 +86,7 @@ func run(info systemupdate.BuildInfo) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	redisCtx, redisCancel := context.WithTimeout(ctx, 5*time.Second)
-	redisStore, err := audit.NewRedisStore(redisCtx, cfg.EnhanceRedisURL, cfg.AuditCacheTTL)
+	redisStore, err := audit.NewRedisStore(redisCtx, cfg.EnhanceRedisURL)
 	redisCancel()
 	if err != nil {
 		return err
@@ -98,15 +98,14 @@ func run(info systemupdate.BuildInfo) error {
 	if err != nil {
 		return err
 	}
-	captures := audit.NewCaptureStore(ingressDB)
-	core, err := initializeCore(db, cfg, captures)
+	core, err := initializeCore(db, cfg)
 	if err != nil {
 		return err
 	}
 	core.Service.SetRedisStore(redisStore)
 	client := sub2api.NewClient(cfg)
 	core.Service.SetAccountClient(client)
-	proxy, err := ingress.New(cfg.OfficialURL, captures, core.Service, sub2api.NewIdentityStore(ingressDB))
+	proxy, err := ingress.New(cfg.OfficialURL, core.Service, sub2api.NewIdentityStore(ingressDB))
 	if err != nil {
 		return err
 	}

@@ -1,27 +1,28 @@
 package ingress
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
-	"log"
 	"net/http"
-	"strconv"
 	"strings"
-	audit "sub2api-enhance/internal/thirdpartypromptaudit"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"sub2api-enhance/internal/sub2api"
+	audit "sub2api-enhance/internal/thirdpartypromptaudit"
 )
 
+// websocket 只透传 Responses 的 WebSocket 会话，逐条审核 response.create 并登记响应 ID。
 func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *requestContext) {
 	if protocol(r.URL.Path) != "responses" {
-		writeError(w, "responses", 503, "unsupported_websocket", "该 WebSocket 协议尚未通过采集适配")
+		writeError(w, "responses", http.StatusServiceUnavailable, "unsupported_websocket", "该 WebSocket 协议尚不支持审核")
 		return
 	}
 	identity, err := p.identity.Resolve(r.Context(), r, state.clientIP)
 	if err != nil && p.audit.ModeForUser(identity.UserID) == "blocking" {
-		writeError(w, "responses", 503, "identity_unavailable", "身份暂不可验证")
+		writeError(w, "responses", http.StatusServiceUnavailable, "eligibility_unknown", "身份暂不可验证")
 		return
 	}
 	u := *p.upstream
@@ -32,7 +33,8 @@ func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *request
 		u.Scheme = "wss"
 	}
 	headers := r.Header.Clone()
-	for _, key := range []string{"Connection", "Upgrade", "Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Extensions", "Sec-WebSocket-Protocol", "Forwarded", "X-Forwarded-For", "X-Real-IP", "X-Enhance-Capture", "X-Enhance-Conversation-ID"} {
+	for _, key := range []string{"Connection", "Upgrade", "Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Extensions", "Sec-WebSocket-Protocol",
+		"Forwarded", "X-Forwarded-For", "X-Real-IP", "X-Enhance-Capture", "X-Enhance-Conversation-ID"} {
 		headers.Del(key)
 	}
 	headers.Set("X-Forwarded-For", state.clientIP)
@@ -40,7 +42,7 @@ func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *request
 	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second, Subprotocols: websocket.Subprotocols(r), EnableCompression: true, Proxy: nil}
 	upstream, response, err := dialer.DialContext(r.Context(), u.String(), headers)
 	if err != nil {
-		status := 502
+		status := http.StatusBadGateway
 		if response != nil {
 			status = response.StatusCode
 			_ = response.Body.Close()
@@ -58,8 +60,6 @@ func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *request
 	defer client.Close()
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	connectionKey := uuid.NewString()
-	var sequence int64
 	var writes sync.Mutex
 	stop := context.AfterFunc(ctx, func() { _ = upstream.Close(); _ = client.Close() })
 	defer stop()
@@ -75,14 +75,28 @@ func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *request
 			return dest.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, text), time.Now().Add(5*time.Second))
 		})
 	}
-	done := make(chan struct{})
+	turnKeys := make(chan string, 8)
+	reader := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer close(reader)
 		defer cancel()
 		for {
 			kind, body, err := upstream.ReadMessage()
 			if err != nil {
 				return
+			}
+			select {
+			case turnKey := <-turnKeys:
+				if id := responseIDFromEvent(body); id != "" {
+					p.audit.RegisterResponseID(ctx, id, turnKey)
+				} else {
+					// 事件顺序变化时放回，等下一个事件确认映射。
+					select {
+					case turnKeys <- turnKey:
+					default:
+					}
+				}
+			default:
 			}
 			writes.Lock()
 			err = client.WriteMessage(kind, body)
@@ -92,7 +106,7 @@ func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *request
 			}
 		}
 	}()
-	defer func() { cancel(); <-done }()
+	defer func() { cancel(); <-reader }()
 	sendError := func(code, message string) {
 		writes.Lock()
 		defer writes.Unlock()
@@ -104,54 +118,56 @@ func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *request
 			return
 		}
 		if kind != websocket.TextMessage {
-			sendError("unsupported_input", "Responses 采集仅支持文本业务消息")
+			sendError("unsupported_input", "Responses WebSocket 仅支持文本业务消息")
 			return
 		}
-		identity, err = p.identity.Resolve(ctx, r, state.clientIP)
-		if err != nil {
-			identity.Eligibility = "unknown"
-			identity.Reason = "身份查询不可用"
-		}
-		sequence++
-		seq := sequence
-		c := &audit.Capture{Key: uuid.NewString(), ConversationKey: connectionKey, Transport: "websocket", ConnectionKey: &connectionKey, Sequence: &seq, Protocol: "responses_websocket", Format: "websocket_message", Raw: raw, SnapshotStatus: "complete", Identity: identity, Metadata: map[string]string{"path": r.URL.Path, "mode": p.audit.ModeForUser(identity.UserID), "client_ip": state.clientIP, "content_type": "application/json"}}
-		auditRequired := p.audit.RequiresAudit(identity.UserID, identity.GroupID, identity.Platform)
-		c.Metadata["audit_required"] = strconv.FormatBool(auditRequired)
-		if err := p.captures.Save(ctx, c); err != nil {
-			if auditRequired {
-				sendError("capture_unavailable", "原文尚未确认保存，未转发消息")
-				return
-			}
-			log.Printf("WebSocket 原文保存失败 capture_key=%s error=%v", c.Key, err)
-			if err := upstream.WriteMessage(kind, raw); err != nil {
-				return
-			}
-			continue
-		}
-		var event struct {
-			Type string `json:"type"`
-		}
-		_ = json.Unmarshal(raw, &event)
-		// 初始化及更新消息留存但不当作一次违规生成；已有提取器负责 response.create 内的字段。
-		if !auditRequired {
-			if err := p.captures.Finish(ctx, c.ID, "awaiting_review", "仅采集原文，等待管理员审核"); err != nil {
-				log.Printf("WebSocket 采集待审核状态补写失败 capture_id=%d error=%v", c.ID, err)
-			}
-		} else if strings.TrimSpace(event.Type) == "response.create" {
-			decision := p.evaluate(ctx, c)
-			if decision != nil && decision.Kind != audit.IngressDecisionAllow && decision.Kind != audit.IngressDecisionFlag {
-				p.observe(ctx, c.ID, "blocked", map[string]any{"code": decision.ErrorCode})
+		if eventType(raw) == "response.create" {
+			decision := p.auditMessage(ctx, r, identity, raw)
+			if decision != nil && decision.Kind != audit.IngressDecisionAllow && decision.Kind != audit.IngressDecisionFlag &&
+				!(decision.Mode == "async" && decision.Kind == audit.IngressDecisionUnavailable) {
+				p.audit.RejectContinuation(decision, identity.APIKeyID, decision.ErrorCode)
 				sendError(decision.ErrorCode, auditDeniedMessage(decision.Kind))
 				continue
 			}
-		} else {
-			_ = p.captures.Finish(ctx, c.ID, "skipped", "非生成业务消息，仅保留原文")
+			if decision != nil && decision.TurnKey != "" {
+				select {
+				case turnKeys <- decision.TurnKey:
+				default:
+				}
+			}
 		}
-		p.observe(ctx, c.ID, "started", map[string]any{"transport": "websocket"})
 		if err := upstream.WriteMessage(kind, raw); err != nil {
-			p.observe(ctx, c.ID, "unknown", map[string]any{"reason": "消息发送未完成确认"})
 			return
 		}
-		p.observe(ctx, c.ID, "complete", map[string]any{"phase": "client_message_forwarded", "upstream_result": "not_observed"})
 	}
+}
+
+// auditMessage 把一条 WebSocket 业务消息按 Responses 协议解析后交给审核服务。
+func (p *Proxy) auditMessage(ctx context.Context, r *http.Request, identity sub2api.Identity, raw []byte) *audit.IntakeDecision {
+	parsed, err := audit.ParsePrompt("responses_websocket", bytes.NewReader(raw), audit.DetectClient(r.Header))
+	if err != nil {
+		if strings.Contains(err.Error(), "不是可审核的生成请求") {
+			return nil
+		}
+		if p.audit.ModeForUser(identity.UserID) == "blocking" {
+			return &audit.IntakeDecision{Mode: "blocking", Kind: audit.IngressDecisionUnavailable, ErrorCode: "input_parse_failed"}
+		}
+		return nil
+	}
+	return p.audit.Check(ctx, audit.IntakeRequest{
+		Parsed: parsed, UserID: identity.UserID, APIKeyID: identity.APIKeyID, GroupID: identity.GroupID,
+		Identity: audit.Identity{Username: identity.Username, UserEmail: identity.UserEmail, APIKeyName: identity.APIKeyName, GroupName: identity.GroupName, Endpoint: r.URL.Path},
+		Provider: identity.Platform, Model: parsed.Model,
+	})
+}
+
+// eventType 只读取 WebSocket 事件的类型字段。
+func eventType(raw []byte) string {
+	var event struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &event); err != nil {
+		return ""
+	}
+	return event.Type
 }

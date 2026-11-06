@@ -19,7 +19,7 @@ import (
 
 // Injectors from wire.go:
 
-func initializeCore(db *sql.DB, cfg *config.Config, captures *thirdpartypromptaudit.CaptureStore) (*Core, error) {
+func initializeCore(db *sql.DB, cfg *config.Config) (*Core, error) {
 	repository := thirdpartypromptaudit.NewRepository(db)
 	encryptor, err := config.NewEncryptor(cfg)
 	if err != nil {
@@ -30,7 +30,7 @@ func initializeCore(db *sql.DB, cfg *config.Config, captures *thirdpartypromptau
 	evaluator := thirdpartypromptaudit.NewEvaluator(repository, modelClient)
 	smtp := notify.NewSMTP(db, cfg)
 	service := thirdpartypromptaudit.NewService(repository, configManager, evaluator, modelClient, smtp)
-	adminHandler := thirdpartypromptaudit.NewAdminHandler(service, configManager, repository, captures)
+	adminHandler := thirdpartypromptaudit.NewAdminHandler(service, configManager, repository)
 	core := &Core{
 		Service: service,
 		Handler: adminHandler,
