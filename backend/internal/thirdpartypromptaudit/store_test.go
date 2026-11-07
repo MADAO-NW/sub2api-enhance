@@ -219,12 +219,13 @@ func TestRetentionKeepsEnforcementMarksBreakersAndTrust(t *testing.T) {
 	mock.ExpectExec(`DELETE FROM sub2api_enhance.audit_jobs`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, retentionBatchSize))
 	mock.ExpectExec(`DELETE FROM sub2api_enhance.audit_jobs`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 3))
 	mock.ExpectExec(`DELETE FROM sub2api_enhance.model_attempts`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(`DELETE FROM sub2api_enhance.prompt_reviews`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec(`row_number\(\) OVER \(PARTITION BY r.hash,r.eval_hash`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`DELETE FROM sub2api_enhance.prompt_reviews WHERE id IN \(SELECT r.id`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectExec(`DELETE FROM sub2api_enhance.prompt_texts`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 4))
 	repo := NewRepository(db)
 	result, err := repo.RunRetention(context.Background(), 30)
 	require.NoError(t, err)
-	require.Equal(t, RetentionResult{Jobs: retentionBatchSize + 3, ProbeAttempts: 1, Reviews: 2, Texts: 4}, result)
+	require.Equal(t, RetentionResult{Jobs: retentionBatchSize + 3, ProbeAttempts: 1, ReviewDuplicates: 1, Reviews: 2, Texts: 4}, result)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -292,7 +293,7 @@ func TestCreateAuditJobStoresTextsJobAndTargetsInOneTransaction(t *testing.T) {
 	defer db.Close()
 	targets := []PromptText{newPromptText(PromptKindInstruction, "S"), newPromptText(PromptKindUser, "U")}
 	mock.ExpectBegin()
-	mock.ExpectExec(`INSERT INTO sub2api_enhance.prompt_texts\(hash,kind,text,bytes\).*ON CONFLICT \(hash\) DO NOTHING`).WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec(`INSERT INTO sub2api_enhance.prompt_texts\(hash,kind,text,bytes,simhash\).*ON CONFLICT \(hash\) DO NOTHING`).WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectQuery(`INSERT INTO sub2api_enhance.audit_jobs`).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at", "updated_at", "lease_until", "started_at", "next_attempt_at"}).
 		AddRow(int64(11), nowForTest(), nowForTest(), nil, nil, nowForTest()))
 	mock.ExpectExec(`INSERT INTO sub2api_enhance.audit_job_targets`).WillReturnResult(sqlmock.NewResult(0, 2))

@@ -107,7 +107,7 @@ onMounted(() => { void loadBreakers(); void loadTrust() })
                 <pre class="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words text-xs">{{ item.preview }}</pre>
               </td>
               <td class="p-2">{{ label('breaker' + item.status.charAt(0).toUpperCase() + item.status.slice(1)) }}</td>
-              <td class="p-2">{{ item.distinct_users }}</td>
+              <td class="p-2">{{ item.distinct_users }}<span v-if="item.user_ids?.length" class="mt-1 block text-xs text-gray-500">#{{ item.user_ids.join(' #') }}</span><span v-if="item.similar" class="mt-1 block text-xs text-amber-700">{{ label('similarBlocks') }}: {{ item.similar }}</span></td>
               <td class="whitespace-nowrap p-2">{{ formatTime(item.tripped_at) }}</td>
               <td class="space-y-2 p-2">
                 <template v-if="item.status === 'tripped'">

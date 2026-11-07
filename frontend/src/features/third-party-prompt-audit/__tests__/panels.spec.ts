@@ -12,7 +12,7 @@ import type { AuditJob, BreakerEntry, JobDetail, SavedConfig, TrustEntry } from 
 const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(), saveConfig: vi.fn(), testAdminEmail: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(),
   listModels: vi.fn(), enableAndReset: vi.fn(), probeDetails: vi.fn(), probe: vi.fn(), userKeys: vi.fn(),
-  jobs: vi.fn(), job: vi.fn(), jobPrompts: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), trustList: vi.fn(), trust: vi.fn(), untrust: vi.fn(),
+  jobs: vi.fn(), job: vi.fn(), jobPrompts: vi.fn(), templateChurn: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), trustList: vi.fn(), trust: vi.fn(), untrust: vi.fn(),
   breakerList: vi.fn(), confirmBreaker: vi.fn(), retryAction: vi.fn(), stats: vi.fn(), runtime: vi.fn(),
   showError: vi.fn(), showSuccess: vi.fn(),
 }))
@@ -81,9 +81,10 @@ beforeEach(() => {
   mocks.userKeys.mockResolvedValue([])
   mocks.jobs.mockResolvedValue({ items: [job()], total: 1, page: 1, page_size: 20 })
   mocks.job.mockResolvedValue(detail())
+  mocks.templateChurn.mockResolvedValue({ items: [{ client: 'generic', jobs: 10, distinct: 4, churn_rate: 0.4 }] })
   mocks.jobPrompts.mockResolvedValue({ targets: [
-    { order: 1, kind: 'instruction', hash: 'a'.repeat(64), text: '系统提示词正文', bytes: 12, resolution: 'cache', decision: 'pass', reason: '正常', score: 0.02 },
-    { order: 2, kind: 'user', hash: 'b'.repeat(64), text: '违规用户提示词', bytes: 20, resolution: 'model', decision: 'block', reason: '违规', score: 0.95 },
+    { order: 1, kind: 'instruction', hash: 'a'.repeat(64), text: '系统提示词正文', bytes: 12, resolution: 'cache', decision: 'pass', reason: '正常', score: 0.02, trusted: false },
+    { order: 2, kind: 'user', hash: 'b'.repeat(64), text: '违规用户提示词', bytes: 20, resolution: 'model', decision: 'block', reason: '违规', score: 0.95, trusted: false },
   ] })
   mocks.preview.mockResolvedValue({ matched: 1, ready: 1, items: [{ job_id: 7, status: 'ready', reason: '' }] })
   mocks.reaudit.mockResolvedValue({ matched: 1, ready: 1, items: [{ job_id: 7, status: 'requeued', reason: '' }] })
@@ -93,6 +94,7 @@ beforeEach(() => {
   const breaker: BreakerEntry = {
     hash: 'c'.repeat(64), preview: '共享指令块', bytes: 10, status: 'tripped', distinct_users: 2,
     tripped_at: '2026-09-06T00:00:00Z', tripped_job_id: 7, resolved_by: null, resolved_at: null,
+    user_ids: [3, 9], similar: 1,
   }
   mocks.breakerList.mockResolvedValue({ items: [breaker], total: 1, page: 1, page_size: 20 })
   mocks.confirmBreaker.mockResolvedValue({ hash: 'c'.repeat(64) })
@@ -102,6 +104,7 @@ beforeEach(() => {
     jobs: 12, orphan_jobs: 1, reaudit_jobs: 2, failed_jobs: 3, decisions: { pass: 8, review: 1, block: 3 },
     waiting_jobs: 2, waiting_since: '2026-09-06T00:00:00Z', action_pending: 1, action_by_state: { pending: 1 },
     blocking_jobs: 4, blocking_avg_ms: 120, blocking_max_ms: 400, blocking_p50_ms: 110, blocking_p95_ms: 380, job_p50_ms: 800, job_p95_ms: 2400,
+    queue_p50_ms: 200, queue_p95_ms: 900, processing_p50_ms: 600, processing_p95_ms: 1500,
     cache_miss: [{ client: 'codex', kind: 'instruction', targets: 4, model_calls: 1, miss_rate: 0.25 }],
   })
   mocks.runtime.mockResolvedValue({

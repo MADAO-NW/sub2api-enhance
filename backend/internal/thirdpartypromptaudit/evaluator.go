@@ -12,8 +12,23 @@ import (
 	"sub2api-enhance/internal/pkg/logger"
 )
 
-// blockingCapacityWait 是同步审核等待节点容量的上限（既定 5 秒边界）。
-const blockingCapacityWait = 5 * time.Second
+// nodeCapacityWait 给同步审核等待节点容量的时间：跟随最慢启用节点的预算，
+// 但不短于 5 秒、不超过 30 秒，避免单节点被占满时同步请求立刻 503。
+func nodeCapacityWait(models []ModelConfig) time.Duration {
+	wait := 5 * time.Second
+	for _, model := range models {
+		if !model.Enabled {
+			continue
+		}
+		if candidate := time.Duration(model.TimeoutMS) * time.Millisecond; candidate > wait {
+			wait = candidate
+		}
+	}
+	if wait > 30*time.Second {
+		wait = 30 * time.Second
+	}
+	return wait
+}
 
 // Evaluator 按“单个目标”调度审核节点：每个目标单独调用模型，投票结果按当前规则聚合。
 type Evaluator struct {
@@ -189,7 +204,7 @@ func (e *Evaluator) callNode(ctx context.Context, job *AuditJob, target *JobTarg
 	acquireCtx := ctx
 	var cancel context.CancelFunc
 	if waitForCapacity {
-		acquireCtx, cancel = context.WithTimeout(ctx, blockingCapacityWait)
+		acquireCtx, cancel = context.WithTimeout(ctx, nodeCapacityWait(job.Config.Models))
 	}
 	model, release, dispatch, acquireErr := e.node.acquireWithPolicy(acquireCtx, *remaining, waitForCapacity)
 	if cancel != nil {

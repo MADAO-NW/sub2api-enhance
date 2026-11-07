@@ -266,6 +266,9 @@ export interface JobDetail {
   actions: AuditAction[]
 }
 
+// ClientChurn 是某客户端指令块唯一哈希占比，用于判断是否需要补模板规则。
+export interface ClientChurn { client: string; jobs: number; distinct: number; churn_rate: number }
+
 export interface TrustEntry { hash: string; preview: string; bytes: number; trusted_by: number; reason: string; created_at: string }
 
 export interface BreakerEntry {
@@ -278,6 +281,8 @@ export interface BreakerEntry {
   tripped_job_id: number | null
   resolved_by: number | null
   resolved_at: string | null
+  user_ids: number[]
+  similar: number
 }
 
 export interface AuditUser {
@@ -381,6 +386,10 @@ export interface AuditStats extends StatsQuery {
   blocking_p95_ms: number | null
   job_p50_ms: number | null
   job_p95_ms: number | null
+  queue_p50_ms: number | null
+  queue_p95_ms: number | null
+  processing_p50_ms: number | null
+  processing_p95_ms: number | null
   cache_miss: ClientMissRate[]
 }
 
@@ -414,6 +423,7 @@ export const thirdPartyPromptAuditAPI = {
   async trustList(page = 1, pageSize = 20) { return (await apiClient.get<AuditPage<TrustEntry>>(`${base}/trust`, { params: { page, page_size: pageSize } })).data },
   async trust(hash: string, reason = '') { return (await apiClient.post(`${base}/trust`, { hash, reason })).data },
   async untrust(hash: string) { return (await apiClient.delete(`${base}/trust/${hash}`)).data },
+  async templateChurn() { return (await apiClient.get<{ items: ClientChurn[] }>(`${base}/templates/churn`)).data },
   async breakerList(status = '', page = 1, pageSize = 20) {
     return (await apiClient.get<AuditPage<BreakerEntry>>(`${base}/breakers`, { params: { status, page, page_size: pageSize } })).data
   },

@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"slices"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -31,6 +33,8 @@ type PromptText struct {
 	Kind string `json:"kind"`
 	Text string `json:"text"`
 	Hash string `json:"hash"`
+	// SimHash 用于识别"只改了几个字"的同族指令块，辅助熔断人工判断。
+	SimHash int64 `json:"-"`
 }
 
 // ParsedRequest 是入口一次解析得到的全部审核信息，不携带请求原文。
@@ -58,7 +62,7 @@ func (p *ParsedRequest) Targets() []PromptText {
 
 func newPromptText(kind, text string) PromptText {
 	digest := sha256.Sum256([]byte(kind + "\x00" + text))
-	return PromptText{Kind: kind, Text: text, Hash: hex.EncodeToString(digest[:])}
+	return PromptText{Kind: kind, Text: text, Hash: hex.EncodeToString(digest[:]), SimHash: simHash(text)}
 }
 
 // normalizePromptText 统一换行并去掉首尾空白，保证同一内容得到同一哈希；
@@ -68,6 +72,57 @@ func normalizePromptText(text string) string {
 	text = strings.ReplaceAll(text, "\r", "\n")
 	text = strings.ReplaceAll(text, "\x00", "\uFFFD")
 	return strings.TrimSpace(strings.ToValidUTF8(text, "\uFFFD"))
+}
+
+// simHash 对词与中文字符做 64 位指纹，用于估计两段文本的相似度（汉明距离）。
+func simHash(text string) int64 {
+	vector := [64]int{}
+	featurize(text, func(token string) {
+		digest := fnv.New64a()
+		_, _ = digest.Write([]byte(token))
+		value := digest.Sum64()
+		for bit := 0; bit < 64; bit++ {
+			if value&(1<<uint(bit)) != 0 {
+				vector[bit]++
+			} else {
+				vector[bit]--
+			}
+		}
+	})
+	var result uint64
+	for bit := 0; bit < 64; bit++ {
+		if vector[bit] > 0 {
+			result |= 1 << uint(bit)
+		}
+	}
+	return int64(result)
+}
+
+// featurize 把文本切成特征：英文/数字按词，CJK 按字符二元组。
+func featurize(text string, emit func(string)) {
+	runes := []rune(strings.ToLower(text))
+	word := make([]rune, 0, 16)
+	flush := func() {
+		if len(word) > 0 {
+			emit(string(word))
+			word = word[:0]
+		}
+	}
+	for index, char := range runes {
+		switch {
+		case unicode.IsLetter(char) && char < 0x2E80, unicode.IsDigit(char), char == '_', char == '-':
+			word = append(word, char)
+		case unicode.Is(unicode.Han, char) || unicode.Is(unicode.Hiragana, char) || unicode.Is(unicode.Katakana, char):
+			flush()
+			emit(string(char))
+			if index+1 < len(runes) && (unicode.Is(unicode.Han, runes[index+1]) || unicode.Is(unicode.Hiragana, runes[index+1]) || unicode.Is(unicode.Katakana, runes[index+1])) {
+				emit(string(runes[index : index+2]))
+			}
+		default:
+			flush()
+		}
+	}
+	flush()
 }
 
 // turnFingerprint 由有序指令块哈希和用户提示词哈希组成，回合键据此去重和绑定续跑。

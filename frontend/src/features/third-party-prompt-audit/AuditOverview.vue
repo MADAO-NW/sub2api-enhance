@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { thirdPartyPromptAuditAPI as api, type AuditFilter, type AuditRuntime, type AuditStats } from '@/api/admin/third-party-prompt-audit'
+import { thirdPartyPromptAuditAPI as api, type AuditFilter, type AuditRuntime, type AuditStats, type ClientChurn } from '@/api/admin/third-party-prompt-audit'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { formatMS, formatTime, timeRange, toLocalInput } from './viewModel'
 import { useAuditLabels } from './labels'
@@ -14,6 +14,7 @@ const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
 const mode = ref('')
 const loading = ref(false), error = ref('')
 const stats = ref<AuditStats | null>(null), runtime = ref<AuditRuntime | null>(null)
+const churn = ref<ClientChurn[]>([])
 const decisions = computed(() => ['pass', 'review', 'block'])
 const actionStates = computed(() => Object.entries(stats.value?.action_by_state ?? {}))
 
@@ -22,9 +23,10 @@ async function load() {
   if (!range) { error.value = label('invalidRange'); return }
   loading.value = true
   error.value = ''
-  const results = await Promise.allSettled([api.stats({ ...range, timezone, mode: mode.value || undefined }), api.runtime()])
+  const results = await Promise.allSettled([api.stats({ ...range, timezone, mode: mode.value || undefined }), api.runtime(), api.templateChurn()])
   if (results[0].status === 'fulfilled') stats.value = results[0].value
   if (results[1].status === 'fulfilled') runtime.value = results[1].value
+  if (results[2].status === 'fulfilled') churn.value = results[2].value.items
   error.value = results.filter(result => result.status === 'rejected').map(result => extractApiErrorMessage(result.reason, label('error'))).join(' · ')
   loading.value = false
 }
@@ -106,6 +108,7 @@ watch(() => props.refreshKey, () => { void refresh() })
           <p class="my-2 text-sm text-gray-500 dark:text-dark-400">{{ label('blockingWaitHint') }}</p>
           <p class="text-sm">{{ label('jobs') }}: {{ stats.blocking_jobs }} · {{ label('average') }}: {{ formatMS(stats.blocking_avg_ms) }} · P50: {{ formatMS(stats.blocking_p50_ms) }} · P95: {{ formatMS(stats.blocking_p95_ms) }} · {{ label('maximum') }}: {{ formatMS(stats.blocking_max_ms) }}</p>
           <p class="mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('jobDuration') }}: P50 {{ formatMS(stats.job_p50_ms) }} · P95 {{ formatMS(stats.job_p95_ms) }}</p>
+          <p class="mt-1 text-sm text-gray-500 dark:text-dark-400">{{ label('queueWait') }}: P50 {{ formatMS(stats.queue_p50_ms) }} · P95 {{ formatMS(stats.queue_p95_ms) }} · {{ label('processing') }}: P50 {{ formatMS(stats.processing_p50_ms) }} · P95 {{ formatMS(stats.processing_p95_ms) }}</p>
         </section>
         <section class="card p-5" data-test="cache-miss">
           <h2 class="text-lg font-semibold">{{ label('cacheMissRate') }}</h2>
@@ -125,6 +128,19 @@ watch(() => props.refreshKey, () => { void refresh() })
         </section>
       </div>
     </template>
+    <section v-if="churn.length" class="card space-y-3 p-5" data-test="template-churn">
+      <h2 class="text-lg font-semibold">{{ label('templateChurn') }}</h2>
+      <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('templateChurnHint') }}</p>
+      <table class="w-full text-left text-sm">
+        <thead class="text-gray-500 dark:text-dark-400"><tr><th class="p-2">{{ label('clientFingerprint') }}</th><th class="p-2">{{ label('jobs') }}</th><th class="p-2">{{ label('distinctBlocks') }}</th><th class="p-2">{{ label('churnRate') }}</th></tr></thead>
+        <tbody>
+          <tr v-for="item in churn" :key="item.client" class="border-t border-gray-100 dark:border-dark-700">
+            <td class="p-2">{{ label(item.client) }}</td><td class="p-2">{{ item.jobs }}</td><td class="p-2">{{ item.distinct }}</td>
+            <td class="p-2 font-semibold">{{ Math.round(item.churn_rate * 100) }}%</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
     <section v-if="runtime?.retention" class="card space-y-3 p-5" data-test="retention-card">
       <h2 class="text-lg font-semibold">{{ label('retentionRun') }}</h2>
       <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('retentionRunHint') }}</p>

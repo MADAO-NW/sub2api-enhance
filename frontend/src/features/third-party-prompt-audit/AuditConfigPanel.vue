@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import BaseDialog from '@/components/common/BaseDialog.vue'
+import ConfigPolicySection from './ConfigPolicySection.vue'
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { thirdPartyPromptAuditAPI as api, type AuditConfig, type AuditModel, type AuditUser, type ModelAttempt, type Contract, type KeyUpdate, type ProbeResult, type SavedConfig, type UserRuleConfig } from '@/api/admin/third-party-prompt-audit'
 import { getAll } from '@/api/admin/groups'
@@ -59,8 +60,6 @@ const probeInput = computed({
     else { probeScenario.value = 'custom'; customProbeInput.value = value }
   }
 })
-// 旧版政策仍含已下线的审核阶段名，给出提示并可一键换成新版默认政策。
-const deprecatedPolicy = computed(() => !!draft.value && /audit_stage|intent_binding|effective_behavior|current_user/.test(draft.value.audit_prompt))
 const dirty = computed(() => !!saved.value && !!draft.value && (JSON.stringify(draft.value) !== JSON.stringify(editableConfig(saved.value)) || Object.values(keys).some(key => key.action !== 'keep')))
 const resetUsers = computed(() => users.value.filter(user => user.role === 'user'))
 const ruleUsers = computed(() => users.value.filter(user => !(draft.value?.user_rules ?? []).some(rule => rule.user_id === user.id)))
@@ -292,7 +291,36 @@ async function testAdminEmail() {
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { testingAdminEmail.value = false }
 }
-async function save() {
+// 保存前列出将要变更的字段，避免误改政策或阈值。
+const showDiff = ref(false)
+const pendingChanges = ref<string[]>([])
+const diffLabels: Record<string, string> = {
+  mode: '运行模式', retention_days: '记录保留天数', audit_prompt: '审核政策', worker_count: 'Worker 数',
+  review_threshold: '复核阈值', block_threshold: '阻断阈值', aggregation: '聚合规则', admin_email: '管理员邮箱',
+  platforms: '平台范围', all_groups: '全部分组', group_ids: '分组', excluded_user_ids: '不审核用户',
+  models: '审核节点', user_rules: '用户规则', warning: '提醒规则', disable: '停用规则',
+}
+function describeDiff(): string[] {
+  if (!draft.value || !saved.value) return []
+  const before = editableConfig(saved.value) as unknown as Record<string, unknown>
+  const after = draft.value as unknown as Record<string, unknown>
+  const changes: string[] = []
+  for (const key of Object.keys(diffLabels)) {
+    if (JSON.stringify(before[key]) !== JSON.stringify(after[key])) changes.push(diffLabels[key])
+  }
+  for (const [id, update] of Object.entries(keys)) {
+    if (update.action !== 'keep') changes.push(`节点凭据 ${id}：${update.action === 'replace' ? '替换' : '清除'}`)
+  }
+  return changes
+}
+function save() {
+  if (!draft.value || !saved.value) return
+  pendingChanges.value = describeDiff()
+  if (pendingChanges.value.length === 0) return
+  showDiff.value = true
+}
+async function confirmSave() {
+  showDiff.value = false
   if (!draft.value || !saved.value) return
   saving.value = true
   try {
@@ -366,11 +394,7 @@ watch(() => props.refreshKey, () => { void load(true) })
         <section class="card p-5 sm:p-6">
           <div class="flex flex-wrap items-center justify-between gap-3"><h2 class="text-lg font-semibold">{{ label('policy') }}</h2><button v-if="contract" type="button" class="btn btn-secondary" @click="draft.audit_prompt = contract.default_policy">{{ label('defaultPolicy') }}</button></div><p class="mb-5 mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('promptHint') }}</p>
           <div class="grid gap-6 xl:grid-cols-2">
-            <p v-if="deprecatedPolicy" class="rounded-lg bg-amber-50 p-3 text-sm text-amber-800 dark:bg-amber-950/30 dark:text-amber-200" data-test="deprecated-policy">
-              {{ label('deprecatedPolicyHint') }}
-              <button type="button" class="btn btn-secondary btn-sm ml-2" @click="draft.audit_prompt = contract?.default_policy ?? draft.audit_prompt">{{ label('useDefaultPolicy') }}</button>
-            </p>
-            <label class="block space-y-2"><span class="text-sm font-medium">{{ label('policy') }}</span><textarea v-model="draft.audit_prompt" class="input min-h-96 font-mono text-sm" rows="18" required data-test="audit-policy" /></label>
+            <ConfigPolicySection v-model:prompt="draft.audit_prompt" :default-policy="contract?.default_policy" />
             <div v-if="contract" class="min-w-0 space-y-2"><h3 class="text-sm font-medium">{{ label('contract') }} · {{ contract.version }}</h3><pre class="max-h-96 overflow-auto whitespace-pre-wrap rounded-xl bg-gray-50 p-4 text-sm dark:bg-dark-900" data-test="fixed-contract">{{ contract.output_contract }}</pre></div>
           </div>
         </section>
@@ -461,6 +485,11 @@ watch(() => props.refreshKey, () => { void load(true) })
         <div class="flex gap-2"><button type="button" class="btn btn-secondary" :disabled="saving || !dirty" @click="restore">{{ label('reset') }}</button><button type="submit" class="btn btn-primary" :disabled="saving || !dirty" data-test="save-config">{{ label(saving ? 'loading' : 'save') }}</button></div>
       </div>
     </form>
+    <BaseDialog :show="showDiff" :title="label('confirmChanges')" :close-on-click-outside="true" @close="showDiff = false">
+      <p class="mb-3 text-sm text-gray-500 dark:text-dark-400">{{ label('confirmChangesHint') }}</p>
+      <ul class="list-disc space-y-1 pl-5 text-sm"><li v-for="item in pendingChanges" :key="item">{{ item }}</li></ul>
+      <template #footer><div class="flex gap-3"><button class="btn btn-primary" :disabled="saving" @click="confirmSave">{{ label('confirmSave') }}</button><button class="btn btn-secondary" @click="showDiff = false">{{ label('cancelChanges') }}</button></div></template>
+    </BaseDialog>
     <BaseDialog :show="attemptDetails !== null" :title="label('probeDetails')" :close-on-click-outside="true" @close="attemptDetails = null">
       <div v-for="attempt in attemptDetails" :key="attempt.id" class="mb-5 space-y-2">
         <h3 class="font-semibold">#{{ attempt.id }} · {{ label(attempt.stage) }} · HTTP {{ attempt.http_status ?? '—' }}</h3>

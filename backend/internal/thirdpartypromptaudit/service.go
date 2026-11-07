@@ -38,6 +38,8 @@ type Service struct {
 	foreground sync.WaitGroup
 	wake       chan struct{}
 	active     atomic.Int64
+	// syncActive 是同步审核的独立并发计数，不占用后台 Worker 槽位。
+	syncActive atomic.Int64
 	running    atomic.Bool
 	metrics    *RuntimeMetrics
 	redis      *RedisStore
@@ -50,6 +52,10 @@ type Service struct {
 	// blockedTurns 是 Redis 故障时仍能拦住已阻断回合的进程内兜底缓存。
 	blockedMu    sync.Mutex
 	blockedTurns map[string]time.Time
+	// metricsMu/metricsCache 缓存 Prometheus 文本，避免高频抓取压库。
+	metricsMu    sync.Mutex
+	metricsCache string
+	metricsAt    time.Time
 }
 
 // reviewFlight 合并同一 (内容哈希, 评估语义) 的并发审核：后到的任务等待并共享结论。
@@ -400,7 +406,7 @@ func (s *Service) processJob(parent context.Context, job *AuditJob, foreground b
 	if foreground {
 		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
-		for !s.tryAcquireSlot() {
+		for !s.tryAcquireSyncSlot() {
 			select {
 			case <-ctx.Done():
 				return nil, s.finishFailure(ctx, job, requestFailure(ctx.Err()))
@@ -410,7 +416,7 @@ func (s *Service) processJob(parent context.Context, job *AuditJob, foreground b
 				return nil, s.finishFailure(ctx, job, persistenceFailure(ErrAuditPaused, "audit_paused"))
 			}
 		}
-		defer s.releaseSlot()
+		defer s.releaseSyncSlot()
 		if err := s.repo.BeginForegroundAuditJob(ctx, job); err != nil {
 			return nil, s.finishFailure(ctx, job, persistenceFailure(err, "evaluation_start_failed"))
 		}
@@ -573,6 +579,28 @@ func (s *Service) tryAcquireSlot() bool {
 }
 
 func (s *Service) releaseSlot() { s.active.Add(-1); s.notify() }
+
+// syncCapacity 是同步审核的并发上限：按 Worker 数放大，避免与后台任务互锁。
+func (s *Service) syncCapacity() int64 {
+	if capacity := int64(s.config.WorkerCapacity()) * 4; capacity > 8 {
+		return capacity
+	}
+	return 8
+}
+
+func (s *Service) tryAcquireSyncSlot() bool {
+	for {
+		active := s.syncActive.Load()
+		if active >= s.syncCapacity() {
+			return false
+		}
+		if s.syncActive.CompareAndSwap(active, active+1) {
+			return true
+		}
+	}
+}
+
+func (s *Service) releaseSyncSlot() { s.syncActive.Add(-1) }
 
 // refreshNodeLimits 将最新已应用节点容量发布给进程内调度器。
 func (s *Service) refreshNodeLimits() {

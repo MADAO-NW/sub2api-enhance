@@ -110,12 +110,14 @@ func (r *Repository) CreateAuditJob(ctx context.Context, job *AuditJob, targets 
 	}
 	defer func() { _ = tx.Rollback() }()
 	hashes, kinds, texts, sizes := make([]string, 0, len(targets)), make([]string, 0, len(targets)), make([]string, 0, len(targets)), make([]int64, 0, len(targets))
+	simhashes := make([]int64, 0, len(targets))
 	for _, target := range targets {
 		hashes, kinds, texts, sizes = append(hashes, target.Hash), append(kinds, target.Kind), append(texts, target.Text), append(sizes, int64(len(target.Text)))
+		simhashes = append(simhashes, target.SimHash)
 	}
 	// 内容寻址文本只插入、不更新，避免共享指令块形成热点行。
-	if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.prompt_texts(hash,kind,text,bytes)
- SELECT * FROM unnest($1::text[],$2::text[],$3::text[],$4::int[]) ON CONFLICT (hash) DO NOTHING`, pq.Array(hashes), pq.Array(kinds), pq.Array(texts), pq.Array(sizes)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.prompt_texts(hash,kind,text,bytes,simhash)
+ SELECT * FROM unnest($1::text[],$2::text[],$3::text[],$4::int[],$5::bigint[]) ON CONFLICT (hash) DO NOTHING`, pq.Array(hashes), pq.Array(kinds), pq.Array(texts), pq.Array(sizes), pq.Array(simhashes)); err != nil {
 		return err
 	}
 	err = tx.QueryRowContext(ctx, `INSERT INTO sub2api_enhance.audit_jobs

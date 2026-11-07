@@ -23,6 +23,11 @@ var retentionStatements = []struct {
  WHERE created_at<clock_timestamp()-make_interval(days=>$1) AND status NOT IN ('queued','processing','retry') ORDER BY id LIMIT $2)`},
 	{"probe_attempts", `DELETE FROM sub2api_enhance.model_attempts WHERE id IN (SELECT id FROM sub2api_enhance.model_attempts
  WHERE job_id IS NULL AND created_at<clock_timestamp()-make_interval(days=>$1) ORDER BY id LIMIT $2)`},
+	{"review_duplicates", `DELETE FROM sub2api_enhance.prompt_reviews WHERE id IN (
+ SELECT id FROM (SELECT r.id, row_number() OVER (PARTITION BY r.hash,r.eval_hash ORDER BY r.created_at DESC,r.id DESC) AS rn
+  FROM sub2api_enhance.prompt_reviews r
+  WHERE NOT EXISTS (SELECT 1 FROM sub2api_enhance.audit_job_targets t WHERE t.review_id=r.id)) ranked
+ WHERE ranked.rn>5 LIMIT $2)`},
 	{"reviews", `DELETE FROM sub2api_enhance.prompt_reviews WHERE id IN (SELECT r.id FROM sub2api_enhance.prompt_reviews r
  WHERE r.created_at<clock_timestamp()-make_interval(days=>$1)
  AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.audit_job_targets t WHERE t.review_id=r.id) ORDER BY r.id LIMIT $2)`},
@@ -38,7 +43,7 @@ var retentionStatements = []struct {
 // RunRetention 按保留天数分批清理过期审计记录，每批独立提交；ctx 取消时停止。
 func (r *Repository) RunRetention(ctx context.Context, days int) (RetentionResult, error) {
 	var result RetentionResult
-	counters := map[string]*int64{"jobs": &result.Jobs, "probe_attempts": &result.ProbeAttempts, "reviews": &result.Reviews, "texts": &result.Texts}
+	counters := map[string]*int64{"jobs": &result.Jobs, "probe_attempts": &result.ProbeAttempts, "review_duplicates": &result.ReviewDuplicates, "reviews": &result.Reviews, "texts": &result.Texts}
 	for _, statement := range retentionStatements {
 		for {
 			if err := ctx.Err(); err != nil {

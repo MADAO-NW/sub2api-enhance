@@ -178,12 +178,18 @@ type BreakerEntry struct {
 	TrippedJobID  *int64     `json:"tripped_job_id"`
 	ResolvedBy    *int64     `json:"resolved_by"`
 	ResolvedAt    *time.Time `json:"resolved_at"`
+	// UserIDs 是触发过该指令块违规的用户，最多 20 个，供人工判断。
+	UserIDs []int64 `json:"user_ids"`
+	// Similar 是相似度接近（汉明距离 ≤3）的其它熔断块数量。
+	Similar int `json:"similar"`
 }
 
 // RetentionResult 记录一次保留期清理删除的数量，用于运行日志。
 type RetentionResult struct {
 	Jobs          int64 `json:"jobs"`
 	ProbeAttempts int64 `json:"probe_attempts"`
-	Reviews       int64 `json:"reviews"`
-	Texts         int64 `json:"texts"`
+	// ReviewDuplicates 是同内容同语义只保留最近 5 条时删除的条数。
+	ReviewDuplicates int64 `json:"review_duplicates"`
+	Reviews          int64 `json:"reviews"`
+	Texts            int64 `json:"texts"`
 }

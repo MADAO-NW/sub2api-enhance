@@ -10,6 +10,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/lib/pq"
 	infraerrors "sub2api-enhance/internal/pkg/errors"
 	"sub2api-enhance/internal/pkg/logger"
 )
@@ -361,7 +362,11 @@ func (r *Repository) ListBreakers(ctx context.Context, status string, page, size
 	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM sub2api_enhance.instruction_breakers WHERE ($1='' OR status=$1)`, status).Scan(&result.Total); err != nil {
 		return nil, err
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT b.hash,COALESCE(left(p.text,500),''),COALESCE(p.bytes,0),b.status,b.distinct_users,b.tripped_at,b.tripped_job_id,b.resolved_by,b.resolved_at
+	rows, err := r.db.QueryContext(ctx, `SELECT b.hash,COALESCE(left(p.text,500),''),COALESCE(p.bytes,0),b.status,b.distinct_users,b.tripped_at,b.tripped_job_id,b.resolved_by,b.resolved_at,
+ COALESCE((SELECT array_agg(m.user_id ORDER BY m.user_id) FROM (SELECT user_id FROM sub2api_enhance.instruction_violation_marks WHERE hash=b.hash ORDER BY user_id LIMIT 20) m),'{}'),
+ COALESCE((SELECT count(*) FROM sub2api_enhance.instruction_breakers b2 JOIN sub2api_enhance.prompt_texts p2 ON p2.hash=b2.hash
+   WHERE p.simhash IS NOT NULL AND p2.simhash IS NOT NULL AND b2.hash<>b.hash
+   AND bit_count((p2.simhash # p.simhash)::bit(64))<=3),0)
  FROM sub2api_enhance.instruction_breakers b LEFT JOIN sub2api_enhance.prompt_texts p ON p.hash=b.hash
  WHERE ($1='' OR b.status=$1) ORDER BY b.tripped_at DESC,b.hash LIMIT $2 OFFSET $3`, status, size, (page-1)*size)
 	if err != nil {
@@ -370,7 +375,8 @@ func (r *Repository) ListBreakers(ctx context.Context, status string, page, size
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var item BreakerEntry
-		if err := rows.Scan(&item.Hash, &item.Preview, &item.Bytes, &item.Status, &item.DistinctUsers, &item.TrippedAt, &item.TrippedJobID, &item.ResolvedBy, &item.ResolvedAt); err != nil {
+		if err := rows.Scan(&item.Hash, &item.Preview, &item.Bytes, &item.Status, &item.DistinctUsers, &item.TrippedAt, &item.TrippedJobID, &item.ResolvedBy, &item.ResolvedAt,
+			pq.Array(&item.UserIDs), &item.Similar); err != nil {
 			return nil, err
 		}
 		result.Items = append(result.Items, item)

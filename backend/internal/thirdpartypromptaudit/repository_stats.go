@@ -45,7 +45,44 @@ type Stats struct {
 	BlockingP95MS *float64         `json:"blocking_p95_ms"`
 	JobP50MS      *float64         `json:"job_p50_ms"`
 	JobP95MS      *float64         `json:"job_p95_ms"`
-	CacheMiss     []ClientMissRate `json:"cache_miss"`
+	// QueueP50/P95 是建任务到开始处理的等待时间，ProcessingP50/P95 是处理本身耗时。
+	QueueP50MS      *float64         `json:"queue_p50_ms"`
+	QueueP95MS      *float64         `json:"queue_p95_ms"`
+	ProcessingP50MS *float64         `json:"processing_p50_ms"`
+	ProcessingP95MS *float64         `json:"processing_p95_ms"`
+	CacheMiss       []ClientMissRate `json:"cache_miss"`
+}
+
+// ClientChurn 是某客户端指令块的变更情况：请求越多、唯一哈希越多，说明内容越不稳定。
+type ClientChurn struct {
+	Client    string  `json:"client"`
+	Jobs      int64   `json:"jobs"`
+	Distinct  int64   `json:"distinct"`
+	ChurnRate float64 `json:"churn_rate"`
+}
+
+// TemplateChurn 统计近 7 天各客户端指令块的唯一哈希占比，用于判断是否需要补模板规则。
+func (r *Repository) TemplateChurn(ctx context.Context) ([]ClientChurn, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT j.client_fingerprint,count(DISTINCT j.id),count(DISTINCT t.hash)
+ FROM sub2api_enhance.audit_job_targets t JOIN sub2api_enhance.audit_jobs j ON j.id=t.job_id
+ WHERE t.kind='instruction' AND j.created_at>=clock_timestamp()-interval '7 days'
+ GROUP BY j.client_fingerprint ORDER BY count(DISTINCT t.hash) DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	items := make([]ClientChurn, 0)
+	for rows.Next() {
+		var item ClientChurn
+		if err := rows.Scan(&item.Client, &item.Jobs, &item.Distinct); err != nil {
+			return nil, err
+		}
+		if item.Jobs > 0 {
+			item.ChurnRate = float64(item.Distinct) / float64(item.Jobs)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 // Stats 汇总时间范围内的任务、等待、处置库存、同步等待耗时和缓存未命中率。
@@ -107,6 +144,21 @@ func (r *Repository) Stats(ctx context.Context, query StatsQuery) (*Stats, error
  percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (finished_at-created_at))*1000)
  FROM sub2api_enhance.audit_jobs WHERE finished_at IS NOT NULL AND created_at>=$1 AND created_at<$2`, query.From, query.To).
 		Scan(&stats.JobP50MS, &stats.JobP95MS); err != nil {
+		return nil, err
+	}
+	// 排队与处理分开统计：总耗时会被长时间排队放大，单独看更有意义。
+	if err := r.db.QueryRowContext(ctx, `SELECT
+ percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (started_at-created_at))*1000),
+ percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (started_at-created_at))*1000)
+ FROM sub2api_enhance.audit_jobs WHERE started_at IS NOT NULL AND created_at>=$1 AND created_at<$2`, query.From, query.To).
+		Scan(&stats.QueueP50MS, &stats.QueueP95MS); err != nil {
+		return nil, err
+	}
+	if err := r.db.QueryRowContext(ctx, `SELECT
+ percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (finished_at-started_at))*1000),
+ percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (finished_at-started_at))*1000)
+ FROM sub2api_enhance.audit_jobs WHERE finished_at IS NOT NULL AND started_at IS NOT NULL AND created_at>=$1 AND created_at<$2`, query.From, query.To).
+		Scan(&stats.ProcessingP50MS, &stats.ProcessingP95MS); err != nil {
 		return nil, err
 	}
 	missRows, err := r.db.QueryContext(ctx, `SELECT j.client_fingerprint,t.kind,count(*),count(*) FILTER (WHERE t.resolution='model')

@@ -2,6 +2,7 @@ package thirdpartypromptaudit
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -65,6 +66,11 @@ func respondError(c *gin.Context, err error) {
 		err = infraerrors.Conflict("third_party_audit_state_conflict", "记录正在处理或状态已经改变，请刷新后重试")
 	}
 	response.ErrorFrom(c, err)
+}
+
+// PrometheusMetrics 输出 Prometheus 文本指标。
+func (h *AdminHandler) PrometheusMetrics(ctx context.Context) string {
+	return h.service.PrometheusMetrics(ctx)
 }
 
 func (h *AdminHandler) GetConfig(c *gin.Context) {
@@ -458,6 +464,9 @@ func (h *AdminHandler) ExportJobs(c *gin.Context) {
 		respondError(c, err)
 		return
 	}
+	if len(rows) >= exportLimit {
+		c.Header("X-Export-Truncated", "true")
+	}
 	c.Header("Content-Type", "text/csv; charset=utf-8")
 	c.Header("Content-Disposition", "attachment; filename=third-party-prompt-audit.csv")
 	_, _ = c.Writer.WriteString("\ufeff")
@@ -477,8 +486,29 @@ func (h *AdminHandler) ExportJobs(c *gin.Context) {
 		}
 		_ = writer.Write([]string{strconv.FormatInt(row.JobID, 10), row.CreatedAt.UTC().Format(time.RFC3339), strconv.FormatInt(row.UserID, 10),
 			strconv.FormatInt(row.APIKeyID, 10), row.Platform, row.Protocol, row.Mode, row.Status, row.Decision, row.Trigger, row.RequestID,
-			order, kind, row.Resolution, row.TargetDecision, score, row.Reason, strconv.Itoa(row.Bytes), row.Text})
+			order, kind, row.Resolution, row.TargetDecision, score, row.Reason, strconv.Itoa(row.Bytes), csvSafe(row.Text)})
 	}
+}
+
+// TemplateChurn 展示近 7 天各客户端指令块的唯一哈希占比，用于决定是否补模板规则。
+func (h *AdminHandler) TemplateChurn(c *gin.Context) {
+	items, err := h.repo.TemplateChurn(c.Request.Context())
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, gin.H{"items": items})
+}
+
+// csvSafe 防止单元格被表格软件当作公式执行。
+func csvSafe(value string) string {
+	if value == "" {
+		return value
+	}
+	if strings.ContainsRune("=+-@\t\r", rune(value[0])) {
+		return "'" + value
+	}
+	return value
 }
 
 func (h *AdminHandler) ConfirmBreaker(c *gin.Context) {

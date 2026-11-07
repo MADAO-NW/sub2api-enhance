@@ -29,6 +29,23 @@ const promptTargets = ref<JobPrompt[]>([])
 const promptLoading = ref(false)
 // 正文按任务缓存，重复打开同一行不再请求。
 const promptCache = new Map<number, JobPrompt[]>()
+// 快捷筛选：裁决与失败状态一键过滤。
+const quickFilters = [
+  { value: 'decision:block', label: 'block' },
+  { value: 'decision:review', label: 'review' },
+  { value: 'status:failed', label: 'failed' },
+  { value: 'run_kind:reaudit', label: 'reaudit' },
+]
+function applyQuick(value: string) {
+  const [field, target] = value.split(':')
+  const next: AuditFilter = { ...(applied.value ?? {}) }
+  if (field === 'decision') { next.decision = target; delete next.status }
+  else if (field === 'status') { next.status = target; delete next.decision }
+  else if (field === 'run_kind') next.run_kind = target
+  applied.value = next
+  page.value = 1
+  void load()
+}
 let generation = 0
 // 自适应轮询：有待办变化时 5 秒一次，连续两次无变化后退避到 15 秒；弹窗或加载中跳过。
 let autoDelay = 5000
@@ -128,6 +145,19 @@ async function togglePromptTrust(target: JobPrompt) {
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { promptTrusting.value = false }
 }
+async function copyPrompt(target: JobPrompt) {
+  try { await navigator.clipboard.writeText(target.text ?? ''); app.showSuccess(label('copied')) }
+  catch { app.showError(label('error')) }
+}
+function downloadPrompt(target: JobPrompt, jobID: number | null) {
+  const blob = new Blob([target.text ?? ''], { type: 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `prompt-${jobID ?? 0}-${target.order}-${target.kind}.txt`
+  link.click()
+  URL.revokeObjectURL(url)
+}
 async function exportCSV() {
   exporting.value = true
   try {
@@ -199,6 +229,10 @@ onUnmounted(() => {
         <label class="space-y-1 text-sm"><span>{{ label('to') }}</span><input v-model="to" type="datetime-local" class="input" /></label>
         <label class="space-y-1 text-sm"><span>{{ label('userID') }}</span><input v-model.number="filters.user_id" type="number" min="1" class="input" /></label>
         <label class="space-y-1 text-sm"><span>{{ label('source') }}</span><select v-model="filters.run_kind" class="input"><option value="">{{ label('all') }}</option><option value="request">{{ label('request') }}</option><option value="reaudit">{{ label('reaudit') }}</option></select></label>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="text-xs text-gray-500 dark:text-dark-400">{{ label('quickFilter') }}</span>
+        <button v-for="quick in quickFilters" :key="quick.value" type="button" class="btn btn-secondary btn-sm" data-test="quick-filter" @click="applyQuick(quick.value)">{{ label(quick.label) }}</button>
       </div>
       <div class="flex flex-wrap gap-3">
         <button class="btn btn-primary" :disabled="loading">{{ label(loading ? 'loading' : 'apply') }}</button>
@@ -276,6 +310,8 @@ onUnmounted(() => {
             <span v-if="target.resolution">{{ label('resolution') }}: {{ label(target.resolution) }}</span>
             <span v-if="target.decision">{{ label(target.decision) }}<template v-if="target.score !== null"> · {{ target.score }}</template></span>
             <button v-if="target.kind === 'instruction'" class="btn btn-secondary btn-sm" :disabled="promptTrusting" data-test="trust-target" @click="togglePromptTrust(target)">{{ label(target.trusted ? 'untrust' : 'trust') }}</button>
+            <button class="btn btn-secondary btn-sm" data-test="copy-prompt" @click="copyPrompt(target)">{{ label('copyText') }}</button>
+            <button class="btn btn-secondary btn-sm" data-test="download-prompt" @click="downloadPrompt(target, promptJobID)">{{ label('downloadText') }}</button>
           </div>
           <pre class="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white p-3 text-xs dark:bg-dark-950">{{ target.text || '—' }}</pre>
           <p v-if="target.reason" class="text-xs text-gray-500 dark:text-dark-400">{{ target.reason }}</p>
