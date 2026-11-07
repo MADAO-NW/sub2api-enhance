@@ -1,5 +1,9 @@
 export default {
   "thirdPartyPromptAudit": {
+    "resolution_model": "Model call",
+    "resolution_cache": "Global cache",
+    "resolution_inflight": "In-flight reuse",
+    "resolution_trust": "Trusted block",
     "totalDuration": "Total",
     "search": "Search",
     "searchHint": "Hash prefix or text keyword",

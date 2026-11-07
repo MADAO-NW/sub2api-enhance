@@ -1,5 +1,9 @@
 export default {
   "thirdPartyPromptAudit": {
+    "resolution_model": "模型调用",
+    "resolution_cache": "全库缓存",
+    "resolution_inflight": "并发复用",
+    "resolution_trust": "信任指令块",
     "totalDuration": "总耗时",
     "search": "搜索",
     "searchHint": "哈希前缀或正文关键词",

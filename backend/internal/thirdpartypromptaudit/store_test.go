@@ -300,6 +300,7 @@ func TestCreateAuditJobStoresTextsJobAndTargetsInOneTransaction(t *testing.T) {
 	mock.ExpectCommit()
 	job := &AuditJob{UserID: 1, APIKeyID: 2, RequestID: "r", Protocol: "chat_completions", Mode: "async", TurnFingerprint: "f", Model: "m\x00"}
 	require.NoError(t, NewRepository(db).CreateAuditJob(context.Background(), job, targets))
+	// 相同内容只插入一次：冲突时不更新已有行，避免共享指令块形成热点写入。
 	require.Equal(t, int64(11), job.ID)
 	require.Equal(t, 2, job.TargetCount)
 	require.Equal(t, "queued", job.Status)

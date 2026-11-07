@@ -307,7 +307,7 @@ onUnmounted(() => {
           <div class="flex flex-wrap items-center gap-3 text-sm">
             <strong>#{{ target.order }} · {{ label(target.kind) }}</strong>
             <span>{{ target.bytes }} B</span>
-            <span v-if="target.resolution">{{ label('resolution') }}: {{ label(target.resolution) }}</span>
+            <span v-if="target.resolution">{{ label('resolution') }}: {{ label('resolution_' + target.resolution) }}</span>
             <span v-if="target.decision">{{ label(target.decision) }}<template v-if="target.score !== null"> · {{ target.score }}</template></span>
             <button v-if="target.kind === 'instruction'" class="btn btn-secondary btn-sm" :disabled="promptTrusting" data-test="trust-target" @click="togglePromptTrust(target)">{{ label(target.trusted ? 'untrust' : 'trust') }}</button>
             <button class="btn btn-secondary btn-sm" data-test="copy-prompt" @click="copyPrompt(target)">{{ label('copyText') }}</button>

@@ -588,15 +588,7 @@ func (s *Service) releaseSlot() { s.active.Add(-1); s.notify() }
 // syncCapacity 是同步审核的并发上限：按启用节点的总并发推导（2 倍），
 // 既不会超过节点真实处理能力，也不会与后台 Worker 互锁。
 func (s *Service) syncCapacity() int64 {
-	nodes := 0
-	if snapshot, err := s.config.Active(); err == nil {
-		for _, model := range snapshot.Models {
-			if model.Enabled {
-				nodes += max(model.MaxConcurrency, 1)
-			}
-		}
-	}
-	capacity := int64(nodes * 2)
+	capacity := int64(s.config.NodeConcurrencySum() * 2)
 	if capacity < 8 {
 		capacity = 8
 	}

@@ -889,6 +889,23 @@ func (m *ConfigManager) ReadSaved(ctx context.Context) (PublicConfig, error) {
 }
 
 // WorkerCapacity 返回当前已应用的并发上限，配置读取失败时仍使用最后成功值。
+// NodeConcurrencySum 汇总启用节点的并发上限；读取时不复制配置快照，
+// 供高频的同步槽位计算使用，避免反复序列化整份政策文本。
+func (m *ConfigManager) NodeConcurrencySum() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.active == nil || m.loadError != nil {
+		return 0
+	}
+	total := 0
+	for _, model := range m.active.Stored.Models {
+		if model.Enabled {
+			total += max(model.MaxConcurrency, 1)
+		}
+	}
+	return total
+}
+
 func (m *ConfigManager) WorkerCapacity() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

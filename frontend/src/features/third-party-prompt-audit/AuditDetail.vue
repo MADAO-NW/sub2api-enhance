@@ -120,7 +120,7 @@ watch(() => [props.id, props.refreshKey], load, { immediate: true })
             <strong>#{{ target.order }} · {{ label(target.kind) }}</strong>
             <span>{{ target.bytes }} B</span>
             <span class="break-all font-mono text-xs text-gray-500">{{ target.hash }}</span>
-            <span v-if="target.resolution">{{ label('resolution') }}: {{ label(target.resolution) }}</span>
+            <span v-if="target.resolution">{{ label('resolution') }}: {{ label('resolution_' + target.resolution) }}</span>
             <strong v-if="target.decision" :class="target.decision === 'block' ? 'text-red-600 dark:text-red-400' : target.decision === 'review' ? 'text-amber-700 dark:text-amber-400' : ''">{{ label(target.decision) }}</strong>
             <button v-if="target.kind === 'instruction'" class="btn btn-secondary btn-sm" :disabled="pending" @click="toggleTrust(target)">{{ label(target.trusted ? 'untrust' : 'trust') }}</button>
           </div>

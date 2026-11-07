@@ -59,9 +59,6 @@ watch(() => props.refreshKey, () => { void refresh() })
       <span class="py-2 text-xs text-gray-500 dark:text-dark-400">{{ label('timezone') }}: {{ timezone }}</span>
     </form>
     <p v-if="error" class="rounded-xl bg-red-50 p-4 text-red-700 dark:bg-red-950/30 dark:text-red-300" role="alert">{{ error }}</p>
-    <p v-if="runtime?.self_audit_nodes?.length" class="rounded-xl bg-amber-50 p-4 text-sm text-amber-800 dark:bg-amber-950/30 dark:text-amber-200" data-test="self-audit-warning">
-      {{ label('selfAuditWarning') }}: {{ runtime.self_audit_nodes.join('、') }}
-    </p>
     <p v-if="runtime?.redis?.check_error" class="rounded-xl bg-red-50 p-4 text-sm text-red-700 dark:bg-red-950/30 dark:text-red-300" data-test="redis-check-error">
       {{ label('redisCheckFailed') }}: {{ runtime.redis.check_error }}
     </p>

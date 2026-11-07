@@ -325,3 +325,17 @@ func TestConfigKeepsEnforcementValidationIndependent(t *testing.T) {
 	config.Disable = DisableConfig{Enabled: true}
 	require.Error(t, validateConfig(config, true))
 }
+
+// 同步槽位只汇总启用节点，且不复制整份配置快照。
+func TestNodeConcurrencySumCountsEnabledNodes(t *testing.T) {
+	config := testConfig()
+	config.Models = []ModelConfig{
+		{ID: "a", Enabled: true, MaxConcurrency: 4},
+		{ID: "b", Enabled: false, MaxConcurrency: 8},
+		{ID: "c", Enabled: true, MaxConcurrency: 0},
+	}
+	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config}}}
+	require.Equal(t, 5, manager.NodeConcurrencySum())
+	empty := &ConfigManager{}
+	require.Zero(t, empty.NodeConcurrencySum())
+}
