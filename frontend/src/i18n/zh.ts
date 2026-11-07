@@ -1,5 +1,9 @@
 export default {
   "thirdPartyPromptAudit": {
+    "generic": "通用客户端",
+    "claude_code": "Claude Code",
+    "codex": "Codex CLI",
+    "gemini_cli": "Gemini CLI",
     "resolution_model": "模型调用",
     "resolution_cache": "全库缓存",
     "resolution_inflight": "并发复用",
