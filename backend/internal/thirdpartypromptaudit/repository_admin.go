@@ -328,6 +328,15 @@ func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest,
 	if err != nil {
 		return nil, err
 	}
+	if result.Ready == 0 {
+		return result, nil
+	}
+	// 整批共用一个发起时间：逐个追加轮次期间，先被 Worker 审完的任务产生的结论晚于该时间，
+	// 同批其余任务都能复用，保证批量重审同一目标只真实调用一次。
+	var requestedAt time.Time
+	if err := r.db.QueryRowContext(ctx, `SELECT clock_timestamp()`).Scan(&requestedAt); err != nil {
+		return nil, err
+	}
 	requeued := 0
 	for i := range result.Items {
 		item := &result.Items[i]
@@ -347,7 +356,7 @@ func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest,
 			item.Status, item.Reason = "failed", err.Error()
 			continue
 		}
-		err = r.appendRound(ctx, item.JobID, actorID, snapshot.Revision, string(encoded))
+		err = r.appendRound(ctx, item.JobID, actorID, snapshot.Revision, string(encoded), requestedAt)
 		switch {
 		case err == nil:
 			item.Status = "requeued"
@@ -363,8 +372,8 @@ func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest,
 }
 
 // appendRound 追加一轮目标并让任务重新排队；任务状态不是已结束时报 ErrLeaseLost。
-// 重新审核统一使用 fresh 语义，reuse_after 记录本次发起时间。
-func (r *Repository) appendRound(ctx context.Context, jobID, actorID int64, revision int64, configSnapshot string) error {
+// 重新审核统一使用 fresh 语义，reuse_after 记录本批重审的发起时间。
+func (r *Repository) appendRound(ctx context.Context, jobID, actorID int64, revision int64, configSnapshot string, reuseAfter time.Time) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -389,9 +398,9 @@ func (r *Repository) appendRound(ctx context.Context, jobID, actorID int64, revi
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.audit_jobs SET current_round=$2,current_run_kind='reaudit',current_requested_by=$3,
- reuse_mode='fresh',reuse_after=clock_timestamp(),config_revision=$4,config_snapshot=$5,status='queued',attempts=0,max_attempts=$6,next_attempt_at=clock_timestamp(),
+ reuse_mode='fresh',reuse_after=$7,config_revision=$4,config_snapshot=$5,status='queued',attempts=0,max_attempts=$6,next_attempt_at=clock_timestamp(),
  lease_until=NULL,failure_stage=NULL,last_error_code=NULL,last_error_message=NULL,started_at=NULL,finished_at=NULL,updated_at=clock_timestamp()
- WHERE id=$1`, jobID, next, actorID, revision, configSnapshot, MaxEvaluationAttempts); err != nil {
+ WHERE id=$1`, jobID, next, actorID, revision, configSnapshot, MaxEvaluationAttempts, reuseAfter); err != nil {
 		return err
 	}
 	return tx.Commit()

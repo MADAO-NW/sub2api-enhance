@@ -224,6 +224,7 @@ export interface AuditAction {
 // ActionRecord 是 GET /actions 的一行：动作全字段加用户显示名。
 export interface ActionRecord extends AuditAction { username: string }
 export interface ActionFilter {
+  // execution_status 可用逗号分隔多个状态，如 failed,unknown。
   execution_status?: string
   notification_status?: string
   action_type?: string
@@ -338,6 +339,15 @@ export interface SimilarBlock {
   distinct_users: number
 }
 
+// SimilarPair 是指令块与所选相似块的全文；预览只有前 500 字，差异对比必须使用全文。
+export interface SimilarPair {
+  hash: string
+  text: string
+  candidate: string
+  candidate_text: string
+  distance: number
+}
+
 export interface AuditUser {
   id: number
   username: string
@@ -404,6 +414,8 @@ export interface Inbox {
   node_unhealthy: number
   failure_rate?: FailureRateSnapshot
   categories: InboxCategory[]
+  // notification_window_days 是通知投递失败的统计窗口天数，下钻列表按同一窗口筛选。
+  notification_window_days: number
 }
 
 export interface CostBucket {
@@ -576,9 +588,13 @@ export interface AuditStats extends StatsQuery {
   cache_miss: ClientMissRate[]
   // category_recognition 按节点模型统计 block/review 目标的类别识别率。
   category_recognition: CategoryRecognition[]
+  // category_distribution 是时间范围内阻断任务的完整类别分布，由后端聚合。
+  category_distribution: CategoryCount[]
 }
 
 export interface CategoryRecognition { model_id: string; total: number; recognized: number; rate: number }
+// CategoryCount 是阻断任务按触发类别的计数；category 为空表示未分类，多类别任务在每个类别下各计一次。
+export interface CategoryCount { category: string; count: number }
 
 const base = '/admin/third-party-prompt-audit'
 
@@ -630,6 +646,7 @@ export const thirdPartyPromptAuditAPI = {
     return (await apiClient.get<AuditPage<BreakerEntry>>(`${base}/breakers`, { params: { status, page, page_size: pageSize, q } })).data
   },
   async similarBlocks(hash: string) { return (await apiClient.get<{ items: SimilarBlock[] }>(`${base}/breakers/${hash}/similar`)).data },
+  async similarPair(hash: string, candidate: string) { return (await apiClient.get<SimilarPair>(`${base}/breakers/${hash}/similar/${candidate}`)).data },
   async confirmBreaker(hash: string) { return (await apiClient.post(`${base}/breakers/${hash}/confirm`)).data },
   async trustBatch(hashes: string[], reason = '') { return (await apiClient.post<{ trusted: string[] }>(`${base}/trust/batch`, { hashes, reason })).data },
   async exportJobs(filter: AuditFilter, limit = 1000, offset = 0) {

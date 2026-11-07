@@ -135,25 +135,66 @@ export function costSummary(report: CostReport | null): CostSummary {
 
 export interface DiffRow { left: string | null; right: string | null; changed: boolean }
 
+// lineDiffLCSLimit 是中段 LCS 表格的最大单元数，超过后退化为逐行对照，避免二次方开销拖垮浏览器。
+const lineDiffLCSLimit = 250000
+
 // lineDiff 用行级 LCS 对齐两段文本；差异行两侧都保留原行，供界面并排高亮。
+// 先裁掉相同的首尾行，只对中间不同的部分做 LCS：相似指令块通常只在局部插入或改动，
+// 这样几十 KB 的全文也能精确对齐，不会因为总行数大而整体退化。
 export function lineDiff(left: string, right: string): DiffRow[] {
   const a = (left ?? '').split('\n'), b = (right ?? '').split('\n')
-  // 超长文本退化为逐行对照，避免 LCS 的二次方开销拖垮浏览器。
-  if (a.length * b.length > 250000) return a.map((line, index) => ({ left: line, right: b[index] ?? null, changed: (b[index] ?? '') !== line }))
-  const table: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0))
-  for (let i = a.length - 1; i >= 0; i--) {
-    for (let j = b.length - 1; j >= 0; j--) {
-      table[i]![j] = a[i] === b[j] ? table[i + 1]![j + 1]! + 1 : Math.max(table[i + 1]![j]!, table[i]![j + 1]!)
+  let start = 0
+  while (start < a.length && start < b.length && a[start] === b[start]) start++
+  let endA = a.length, endB = b.length
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) { endA--; endB-- }
+  const same = (line: string): DiffRow => ({ left: line, right: line, changed: false })
+  const rows: DiffRow[] = a.slice(0, start).map(same)
+  const midA = a.slice(start, endA), midB = b.slice(start, endB)
+  if (midA.length * midB.length > lineDiffLCSLimit) {
+    const length = Math.max(midA.length, midB.length)
+    for (let index = 0; index < length; index++) {
+      const l = midA[index] ?? null, r = midB[index] ?? null
+      rows.push({ left: l, right: r, changed: l !== r })
     }
+  } else {
+    const table: number[][] = Array.from({ length: midA.length + 1 }, () => new Array<number>(midB.length + 1).fill(0))
+    for (let i = midA.length - 1; i >= 0; i--) {
+      for (let j = midB.length - 1; j >= 0; j--) {
+        table[i]![j] = midA[i] === midB[j] ? table[i + 1]![j + 1]! + 1 : Math.max(table[i + 1]![j]!, table[i]![j + 1]!)
+      }
+    }
+    let i = 0, j = 0
+    while (i < midA.length && j < midB.length) {
+      if (midA[i] === midB[j]) { rows.push(same(midA[i]!)); i++; j++ }
+      else if (table[i + 1]![j]! >= table[i]![j + 1]!) { rows.push({ left: midA[i]!, right: null, changed: true }); i++ }
+      else { rows.push({ left: null, right: midB[j]!, changed: true }); j++ }
+    }
+    while (i < midA.length) { rows.push({ left: midA[i]!, right: null, changed: true }); i++ }
+    while (j < midB.length) { rows.push({ left: null, right: midB[j]!, changed: true }); j++ }
   }
-  const rows: DiffRow[] = []
-  let i = 0, j = 0
-  while (i < a.length && j < b.length) {
-    if (a[i] === b[j]) { rows.push({ left: a[i]!, right: b[j]!, changed: false }); i++; j++ }
-    else if (table[i + 1]![j]! >= table[i]![j + 1]!) { rows.push({ left: a[i]!, right: null, changed: true }); i++ }
-    else { rows.push({ left: null, right: b[j]!, changed: true }); j++ }
-  }
-  while (i < a.length) { rows.push({ left: a[i]!, right: null, changed: true }); i++ }
-  while (j < b.length) { rows.push({ left: null, right: b[j]!, changed: true }); j++ }
-  return rows
+  return rows.concat(a.slice(endA).map(same))
+}
+
+export type DiffDisplayRow = DiffRow | { skipped: number }
+
+// collapseDiff 把连续的相同行折叠成一行“N 行相同”，差异行前后各保留 context 行上下文，
+// 让长指令块里的少量差异不被淹没在上千行相同内容里。
+export function collapseDiff(rows: DiffRow[], context = 3): DiffDisplayRow[] {
+  const keep = rows.map(row => row.changed)
+  rows.forEach((row, index) => {
+    if (!row.changed) return
+    for (let offset = Math.max(0, index - context); offset <= Math.min(rows.length - 1, index + context); offset++) keep[offset] = true
+  })
+  const result: DiffDisplayRow[] = []
+  let skipped = 0
+  rows.forEach((row, index) => {
+    if (keep[index]) {
+      if (skipped) { result.push({ skipped }); skipped = 0 }
+      result.push(row)
+      return
+    }
+    skipped++
+  })
+  if (skipped) result.push({ skipped })
+  return result
 }

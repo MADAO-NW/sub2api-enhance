@@ -2,7 +2,7 @@
 import { onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import Pagination from '@/components/common/Pagination.vue'
 import {
-  thirdPartyPromptAuditAPI as api, type BreakerEntry, type SimilarBlock, type TrustEntry,
+  thirdPartyPromptAuditAPI as api, type BreakerEntry, type SimilarBlock, type SimilarPair, type TrustEntry,
 } from '@/api/admin/third-party-prompt-audit'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
@@ -25,6 +25,9 @@ const similar = reactive<Record<string, SimilarBlock[]>>({})
 const similarOpen = ref<string[]>([])
 const similarSelected = reactive<Record<string, string>>({})
 const similarLoading = ref('')
+// 对比使用两侧全文（预览只有前 500 字）；按“熔断块:候选块”缓存，选中时才加载。
+const similarPairs = reactive<Record<string, SimilarPair>>({})
+const pairLoading = ref('')
 
 async function loadBreakers(silent = false) {
   if (!silent) { loading.value = true; error.value = '' }
@@ -54,12 +57,19 @@ async function toggleSimilar(item: BreakerEntry) {
   similarOpen.value = [...similarOpen.value, item.hash]
   if (!similar[item.hash]) await loadSimilar(item.hash)
 }
-function selectSimilar(hash: string, target: string) {
+async function selectSimilar(hash: string, target: string) {
   similarSelected[hash] = similarSelected[hash] === target ? '' : target
+  const key = `${hash}:${target}`
+  if (!similarSelected[hash] || similarPairs[key]) return
+  pairLoading.value = key
+  try { similarPairs[key] = await api.similarPair(hash, target) }
+  catch (err) {
+    similarSelected[hash] = ''
+    app.showError(extractApiErrorMessage(err, label('error')))
+  } finally { pairLoading.value = '' }
 }
-function comparePreview(hash: string): SimilarBlock | null {
-  const selected = similarSelected[hash]
-  return selected ? (similar[hash] ?? []).find(item => item.hash === selected) ?? null : null
+function comparePair(hash: string, target: string): SimilarPair | null {
+  return similarSelected[hash] === target ? similarPairs[`${hash}:${target}`] ?? null : null
 }
 async function act(kind: 'trust' | 'confirm' | 'untrust', hash: string) {
   pending.value = hash + kind
@@ -175,8 +185,9 @@ onMounted(() => { void loadBreakers(); void loadTrust() })
                           :disabled="pending === candidate.hash + 'confirm'" data-test="similar-confirm" @click="act('confirm', candidate.hash)">{{ label('confirmViolation') }}</button>
                       </div>
                       <pre class="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words text-xs" data-test="similar-preview">{{ candidate.preview }}</pre>
-                      <div v-if="comparePreview(item.hash)?.hash === candidate.hash" class="mt-3" data-test="similar-diff">
-                        <TextDiff :left="item.preview" :right="candidate.preview" />
+                      <p v-if="pairLoading === `${item.hash}:${candidate.hash}`" class="mt-3 text-sm" role="status">{{ label('loading') }}</p>
+                      <div v-else-if="comparePair(item.hash, candidate.hash)" class="mt-3" data-test="similar-diff">
+                        <TextDiff :left="comparePair(item.hash, candidate.hash)!.text" :right="comparePair(item.hash, candidate.hash)!.candidate_text" />
                       </div>
                     </div>
                   </template>

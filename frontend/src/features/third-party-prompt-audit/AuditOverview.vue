@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
-  thirdPartyPromptAuditAPI as api, type AuditFilter, type AuditJob, type AuditRuntime, type AuditStats, type ClientChurn,
+  thirdPartyPromptAuditAPI as api, type AuditFilter, type AuditRuntime, type AuditStats, type ClientChurn,
   type CostReport, type Inbox, type InboxCategoryKey, type MetricsHour, type RiskUser,
 } from '@/api/admin/third-party-prompt-audit'
 import { extractApiErrorMessage } from '@/utils/apiError'
@@ -13,6 +13,7 @@ const emit = defineEmits<{
   (event: 'inspect-jobs', filter: AuditFilter): void
   (event: 'open-inbox', category: InboxCategoryKey | ''): void
   (event: 'open-users', range: { from: string; to: string }): void
+  (event: 'inbox-loaded', total: number): void
 }>()
 const props = withDefaults(defineProps<{ refreshKey?: number; active?: boolean }>(), { refreshKey: 0, active: true })
 const label = useAuditLabels()
@@ -20,6 +21,9 @@ const from = ref(toLocalInput(new Date(Date.now() - 86400000)))
 const to = ref(toLocalInput(new Date()))
 const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
 const mode = ref('')
+// inboxRefreshInterval 是待处理摘要的静默刷新间隔：/inbox 每次都要统计处置动作表，不跟随 5 秒核心指标刷新。
+const inboxRefreshInterval = 30000
+let inboxLoadedAt = 0
 const loading = ref(false), error = ref('')
 const stats = ref<AuditStats | null>(null), runtime = ref<AuditRuntime | null>(null)
 const churn = ref<ClientChurn[]>([])
@@ -27,7 +31,6 @@ const history = ref<MetricsHour[]>([])
 const inbox = ref<Inbox | null>(null)
 const cost = ref<CostReport | null>(null)
 const topUsers = ref<RiskUser[]>([])
-const blockedJobs = ref<AuditJob[]>([])
 const decisions = computed(() => ['pass', 'review', 'block'])
 const actionStates = computed(() => Object.entries(stats.value?.action_by_state ?? {}))
 const costTotals = computed(() => costSummary(cost.value))
@@ -38,16 +41,8 @@ const trendPoints = computed(() => history.value.slice(-48).map(item => ({
   label: new Date(item.hour).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit' }),
   values: { jobs: item.jobs, blocked: item.blocked, failed: item.failed },
 })))
-// 类别分布来自最近 200 条阻断任务的 trigger_categories 聚合。
-const categoryCounts = computed(() => {
-  const counts = new Map<string, number>()
-  for (const job of blockedJobs.value) {
-    const categories = categoryList(job.trigger_categories)
-    if (!categories.length) counts.set('', (counts.get('') ?? 0) + 1)
-    for (const category of categories) counts.set(category, (counts.get(category) ?? 0) + 1)
-  }
-  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([category, count]) => ({ category, count }))
-})
+// 类别分布由后端在整个时间范围内聚合（与裁决分布同一筛选），空类别表示未分类。
+const categoryCounts = computed(() => stats.value?.category_distribution ?? [])
 // 客户端规则集健康度：未命中率与指令块变更率按客户端合并。
 const rulesetHealth = computed(() => (stats.value?.cache_miss ?? []).map(item => ({
   ...item,
@@ -65,26 +60,30 @@ async function load(silent = false) {
   if (!range) { error.value = label('invalidRange'); return }
   if (!silent) loading.value = true
   error.value = ''
-  const core = Promise.allSettled([api.stats({ ...range, timezone, mode: mode.value || undefined }), api.runtime(), api.inbox()])
+  const withInbox = !silent || Date.now() - inboxLoadedAt >= inboxRefreshInterval
+  const core = Promise.allSettled([api.stats({ ...range, timezone, mode: mode.value || undefined }), api.runtime(),
+    withInbox ? api.inbox() : Promise.resolve(null)])
   const extra = silent ? null : Promise.allSettled([api.templateChurn(), api.metricsHistory(7), api.cost({ ...range, timezone, bucket: 'day' }),
-    api.riskUsers({ ...range, sort: 'blocks' }, 1, 5), api.jobs({ ...range, decision: 'block' }, 1, 200)])
+    api.riskUsers({ ...range, sort: 'blocks' }, 1, 5)])
   const failures: string[] = []
   const [statsResult, runtimeResult, inboxResult] = await core
   if (statsResult.status === 'fulfilled') stats.value = statsResult.value
   else failures.push(extractApiErrorMessage(statsResult.reason, label('error')))
   if (runtimeResult.status === 'fulfilled') runtime.value = runtimeResult.value
   else failures.push(extractApiErrorMessage(runtimeResult.reason, label('error')))
-  if (inboxResult.status === 'fulfilled') inbox.value = inboxResult.value
-  else failures.push(extractApiErrorMessage(inboxResult.reason, label('error')))
+  if (inboxResult.status === 'fulfilled' && inboxResult.value) {
+    inbox.value = inboxResult.value
+    inboxLoadedAt = Date.now()
+    emit('inbox-loaded', inboxResult.value.total)
+  } else if (inboxResult.status === 'rejected') failures.push(extractApiErrorMessage(inboxResult.reason, label('error')))
   if (extra) {
-    const [churnResult, historyResult, costResult, usersResult, blockedResult] = await extra
+    const [churnResult, historyResult, costResult, usersResult] = await extra
     if (churnResult.status === 'fulfilled') churn.value = churnResult.value.items
     else failures.push(extractApiErrorMessage(churnResult.reason, label('error')))
     if (historyResult.status === 'fulfilled') history.value = historyResult.value.items
     if (costResult.status === 'fulfilled') cost.value = costResult.value
     else failures.push(extractApiErrorMessage(costResult.reason, label('error')))
     if (usersResult.status === 'fulfilled') topUsers.value = usersResult.value.items
-    if (blockedResult.status === 'fulfilled') blockedJobs.value = blockedResult.value.items
   }
   error.value = failures.join(' · ')
   if (!silent) loading.value = false

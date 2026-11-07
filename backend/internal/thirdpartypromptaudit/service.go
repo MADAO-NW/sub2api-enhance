@@ -160,6 +160,8 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 			return nil
 		}
 		snapshot.Config = effectiveConfigForUser(snapshot.Config, request.UserID)
+		// 已自动加严的异步用户在入口按同步审核，任务冻结的处理方式随之为 blocking。
+		snapshot.Mode = s.config.escalatedMode(snapshot.Mode, request.UserID)
 		mode = snapshot.Mode
 	}
 	if request.Background && mode == "blocking" {

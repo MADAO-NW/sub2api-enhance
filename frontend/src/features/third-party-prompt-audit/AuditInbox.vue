@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import Pagination from '@/components/common/Pagination.vue'
 import {
   thirdPartyPromptAuditAPI as api, type ActionFilter, type ActionRecord, type Inbox, type InboxCategoryKey,
@@ -15,8 +16,12 @@ const emit = defineEmits<{
   (event: 'open-trust', hash: string): void
   (event: 'open-config', nodeID: string): void
   (event: 'changed'): void
+  (event: 'loaded', total: number): void
 }>()
 const label = useAuditLabels(), app = useAppStore()
+const { t } = useI18n()
+// inboxRefreshInterval 是工作台静默刷新间隔；页签角标直接使用本页加载到的总数，不再重复请求。
+const inboxRefreshInterval = 30000
 const inbox = ref<Inbox | null>(null)
 const loading = ref(false), error = ref(''), pending = ref('')
 const selected = ref<InboxCategoryKey | ''>(props.initialCategory)
@@ -31,7 +36,12 @@ const categories = computed(() => inbox.value?.categories ?? [])
 async function load(silent = false) {
   if (!silent) loading.value = true
   const results = await Promise.allSettled([api.inbox()])
-  if (results[0].status === 'fulfilled') inbox.value = results[0].value
+  if (results[0].status === 'fulfilled') {
+    inbox.value = results[0].value
+    emit('loaded', results[0].value.total)
+    // 首次进入时窗口天数尚未加载，拿到 /inbox 后再补上通知失败的时间窗口。
+    if (selected.value === 'notification_failed' && actionFilter.from === undefined) applyCategoryFilter()
+  }
   if (results[0].status === 'rejected' && !silent) error.value = extractApiErrorMessage(results[0].reason, label('error'))
   if (!silent) loading.value = false
   await loadActions(silent)
@@ -46,12 +56,22 @@ async function loadActions(silent = false) {
   } catch (err) { if (!silent) error.value = extractApiErrorMessage(err, label('error')) }
   finally { if (!silent) actionLoading.value = false }
 }
-function selectCategory(key: InboxCategoryKey) {
-  selected.value = selected.value === key ? '' : key
+// applyCategoryFilter 让下钻列表与分类计数口径一致：待核对同时列出 failed 与 unknown，
+// 通知失败只看后端下发的统计窗口。
+function applyCategoryFilter() {
   delete actionFilter.execution_status
   delete actionFilter.notification_status
-  if (selected.value === 'action_failed') actionFilter.execution_status = 'failed'
-  if (selected.value === 'notification_failed') actionFilter.notification_status = 'failed'
+  delete actionFilter.from
+  if (selected.value === 'action_failed') actionFilter.execution_status = 'failed,unknown'
+  if (selected.value === 'notification_failed') {
+    actionFilter.notification_status = 'failed'
+    const days = inbox.value?.notification_window_days
+    if (days) actionFilter.from = new Date(Date.now() - days * 86400000).toISOString()
+  }
+}
+function selectCategory(key: InboxCategoryKey) {
+  selected.value = selected.value === key ? '' : key
+  applyCategoryFilter()
   actionPage.value = 1
   void loadActions()
 }
@@ -85,11 +105,11 @@ watch(() => props.initialCategory, value => {
   selected.value = ''
   selectCategory(value)
 }, { immediate: true })
-// 沿用概览的 5 秒静默刷新；页面不可见、正在加载或有待完成操作时跳过。
+// 静默刷新；页面不可见、正在加载或有待完成操作时跳过。
 const autoTimer = window.setInterval(() => {
   if (!props.active || document.visibilityState !== 'visible' || loading.value || pending.value) return
   void load(true)
-}, 5000)
+}, inboxRefreshInterval)
 onUnmounted(() => window.clearInterval(autoTimer))
 onMounted(() => { void load() })
 </script>
@@ -112,6 +132,8 @@ onMounted(() => { void load() })
           :data-test="`inbox-category-${category.key}`" @click="selectCategory(category.key)">
           <span class="block text-sm" :class="selected === category.key ? '' : 'text-gray-500 dark:text-dark-400'">{{ label(category.key) }}</span>
           <strong class="mt-2 block text-2xl tabular-nums">{{ category.count.toLocaleString() }}</strong>
+          <span v-if="category.key === 'notification_failed' && inbox?.notification_window_days" class="mt-1 block text-xs"
+            :class="selected === category.key ? '' : 'text-gray-500 dark:text-dark-400'" data-test="inbox-notification-window">{{ t('admin.thirdPartyPromptAudit.notificationWindowHint', { days: inbox.notification_window_days }) }}</span>
         </button>
       </div>
       <div v-if="inbox?.failure_rate" class="rounded-xl bg-amber-50 p-4 text-sm text-amber-800 dark:bg-amber-950/30 dark:text-amber-200" data-test="inbox-failure-rate">
@@ -147,7 +169,8 @@ onMounted(() => { void load() })
         <label class="space-y-1 text-sm"><span>{{ label('executionStatus') }}</span>
           <select v-model="actionFilter.execution_status" class="input">
             <option value="">{{ label('all') }}</option>
-            <option v-for="status in ['pending', 'running', 'succeeded', 'failed', 'unknown']" :key="status" :value="status">{{ label(status) }}</option>
+            <option value="failed,unknown">{{ label('needsReview') }}</option>
+            <option v-for="status in ['pending', 'processing', 'succeeded', 'failed', 'unknown']" :key="status" :value="status">{{ label(status) }}</option>
           </select>
         </label>
         <label class="space-y-1 text-sm"><span>{{ label('notificationStatus') }}</span>

@@ -27,6 +27,25 @@ func TestEscalationPromotesAsyncUserToBlocking(t *testing.T) {
 	require.Equal(t, "off", manager.EffectiveModeForUser(7))
 }
 
+// 审核入口同样读取加严集合：加严的异步用户按同步审核，后台请求仍降回异步，解除后恢复异步。
+func TestCheckUsesEscalationForAsyncUser(t *testing.T) {
+	config := testConfig()
+	config.Mode = "async"
+	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config}}}
+	service := &Service{config: manager, closing: true, metrics: NewRuntimeMetrics()}
+	parsed := &ParsedRequest{TurnFingerprint: "turn"}
+	request := IntakeRequest{Parsed: parsed, UserID: 7, Provider: "openai"}
+	require.Equal(t, "async", service.Check(context.Background(), request).Mode)
+	manager.SetEscalation(7, true)
+	require.Equal(t, "blocking", service.Check(context.Background(), request).Mode)
+	require.Equal(t, "async", service.Check(context.Background(), IntakeRequest{Parsed: parsed, UserID: 8, Provider: "openai"}).Mode)
+	background := request
+	background.Background = true
+	require.Equal(t, "async", service.Check(context.Background(), background).Mode)
+	manager.SetEscalation(7, false)
+	require.Equal(t, "async", service.Check(context.Background(), request).Mode)
+}
+
 // 解除加严清空状态并记录本地动作，不发通知；未加严时返回 ErrNotFound。
 func TestClearEscalationRecordsAction(t *testing.T) {
 	db, mock, err := sqlmock.New()

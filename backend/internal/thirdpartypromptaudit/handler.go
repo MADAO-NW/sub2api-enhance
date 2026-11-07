@@ -625,7 +625,11 @@ func (h *AdminHandler) ConfigImpact(c *gin.Context) {
 
 // actionFilterFromQuery 解析处置动作列表的筛选条件。
 func actionFilterFromQuery(c *gin.Context) (ActionFilter, error) {
-	filter := ActionFilter{ExecutionStatus: c.Query("execution_status"), NotificationStatus: c.Query("notification_status"), ActionType: c.Query("action_type")}
+	filter := ActionFilter{NotificationStatus: c.Query("notification_status"), ActionType: c.Query("action_type")}
+	// execution_status 支持逗号分隔的多个状态，如 failed,unknown。
+	if value := c.Query("execution_status"); value != "" {
+		filter.ExecutionStatuses = strings.Split(value, ",")
+	}
 	if value := c.Query("user_id"); value != "" {
 		id, err := strconv.ParseInt(value, 10, 64)
 		if err != nil || id <= 0 {
@@ -762,6 +766,21 @@ func (h *AdminHandler) ListSimilarBlocks(c *gin.Context) {
 		return
 	}
 	response.Success(c, gin.H{"items": result})
+}
+
+// GetSimilarPair 返回指令块与一个相似候选块的全文，供逐行差异对比。
+func (h *AdminHandler) GetSimilarPair(c *gin.Context) {
+	hash, candidate := c.Param("hash"), c.Param("candidate")
+	if len(hash) != 64 || len(candidate) != 64 {
+		response.BadRequest(c, "指令块哈希无效")
+		return
+	}
+	result, err := h.repo.SimilarPair(c.Request.Context(), hash, candidate)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, result)
 }
 
 // CreateSample 把一个任务目标加入误判样本集；hash 由后端从任务目标读取。

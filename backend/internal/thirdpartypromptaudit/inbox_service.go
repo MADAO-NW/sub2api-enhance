@@ -47,7 +47,7 @@ func (s *Service) Inbox(ctx context.Context) (*Inbox, error) {
 	}
 	inbox := &Inbox{ActionFailed: counts.ActionFailed, NotificationFailed: counts.NotificationFailed,
 		BreakerPending: counts.BreakerPending, NodeUnhealthy: int64(len(nodeItems)),
-		Categories: categories}
+		Categories: categories, NotificationWindowDays: int(inboxNotificationWindow / (24 * time.Hour))}
 	if failure.Exceeded {
 		// 失败率异常只在超过阈值时作为待处理事项出现。
 		inbox.FailureRate = failure

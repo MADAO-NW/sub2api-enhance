@@ -13,7 +13,8 @@ import (
 
 // ActionFilter 是处置动作列表的筛选条件，对应 enforcement_actions 的真实列。
 type ActionFilter struct {
-	ExecutionStatus    string     `json:"execution_status,omitempty"`
+	// ExecutionStatuses 可同时选多个执行状态，工作台“账号动作待核对”需要 failed 与 unknown 一起列出。
+	ExecutionStatuses  []string   `json:"execution_status,omitempty"`
 	NotificationStatus string     `json:"notification_status,omitempty"`
 	ActionType         string     `json:"action_type,omitempty"`
 	UserID             *int64     `json:"user_id,omitempty"`
@@ -31,8 +32,10 @@ type ActionRecord struct {
 }
 
 func validateActionFilter(filter ActionFilter) error {
-	if filter.ExecutionStatus != "" && !slices.Contains([]string{"pending", "processing", "succeeded", "failed", "unknown", "cancelled"}, filter.ExecutionStatus) {
-		return fmt.Errorf("执行状态筛选无效")
+	for _, status := range filter.ExecutionStatuses {
+		if !slices.Contains([]string{"pending", "processing", "succeeded", "failed", "unknown", "cancelled"}, status) {
+			return fmt.Errorf("执行状态筛选无效")
+		}
 	}
 	if filter.NotificationStatus != "" && !slices.Contains([]string{"pending", "processing", "retry", "sent", "failed", "not_required"}, filter.NotificationStatus) {
 		return fmt.Errorf("通知状态筛选无效")
@@ -53,8 +56,9 @@ func actionFilterSQL(filter ActionFilter) (string, []any) {
 		args = append(args, value)
 		clauses = append(clauses, column+"=$"+itoa(len(args)))
 	}
-	if filter.ExecutionStatus != "" {
-		appendValue("execution_status", filter.ExecutionStatus)
+	if len(filter.ExecutionStatuses) > 0 {
+		args = append(args, pq.Array(filter.ExecutionStatuses))
+		clauses = append(clauses, "execution_status=ANY($"+itoa(len(args))+")")
 	}
 	if filter.NotificationStatus != "" {
 		appendValue("notification_status", filter.NotificationStatus)
@@ -145,6 +149,8 @@ type Inbox struct {
 	NodeUnhealthy      int64                `json:"node_unhealthy"`
 	FailureRate        *FailureRateSnapshot `json:"failure_rate,omitempty"`
 	Categories         []InboxCategory      `json:"categories"`
+	// NotificationWindowDays 是通知投递失败的统计窗口天数，前端下钻列表按同一窗口筛选。
+	NotificationWindowDays int `json:"notification_window_days"`
 }
 
 // InboxCounts 是动作与熔断的待处理计数和最近条目。
@@ -159,13 +165,20 @@ type InboxCounts struct {
 // inboxRecentLimit 每类事项在工作台展示的最近条数。
 const inboxRecentLimit = 5
 
+// inboxNotificationWindow 是工作台统计通知投递失败的时间窗口：更早的失败（如长期退信的邮箱）
+// 不再常驻待处理，仍可在动作列表按时间查询。账号动作待核对不设窗口，直到源状态改变。
+const inboxNotificationWindow = 7 * 24 * time.Hour
+
 // LoadInboxCounts 汇总动作与熔断的待处理计数和最近条目。
+// 两类动作条件分别由迁移 020 的部分索引 tppa_actions_attention_idx、tppa_actions_notification_failed_idx 支撑，
+// 改动这里的谓词时必须同步索引，否则会退回全表扫描。
 func (r *Repository) LoadInboxCounts(ctx context.Context) (InboxCounts, error) {
 	result := InboxCounts{ActionItems: []InboxEntry{}, BreakerItems: []InboxEntry{}}
 	if err := r.db.QueryRowContext(ctx, `SELECT
  count(*) FILTER (WHERE execution_status IN ('failed','unknown')),
- count(*) FILTER (WHERE notification_status='failed')
- FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions`).Scan(&result.ActionFailed, &result.NotificationFailed); err != nil {
+ count(*) FILTER (WHERE notification_status='failed' AND requested_at>=clock_timestamp()-$1::interval)
+ FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions
+ WHERE execution_status IN ('failed','unknown') OR notification_status='failed'`, interval(inboxNotificationWindow)).Scan(&result.ActionFailed, &result.NotificationFailed); err != nil {
 		return result, err
 	}
 	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM sub2api_enhance.instruction_breakers WHERE status='tripped'`).Scan(&result.BreakerPending); err != nil {
@@ -206,10 +219,11 @@ func (r *Repository) LoadInboxCounts(ctx context.Context) (InboxCounts, error) {
 	return result, breakerRows.Err()
 }
 
-// NotificationFailedItems 返回投递失败的动作条目。
+// NotificationFailedItems 返回统计窗口内投递失败的动作条目。
 func (r *Repository) NotificationFailedItems(ctx context.Context, limit int) ([]InboxEntry, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT id,action_type,user_id,job_id,notification_status,requested_at,COALESCE(business_snapshot::jsonb->'user'->>'username','')
- FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions WHERE notification_status='failed' ORDER BY id DESC LIMIT $1`, limit)
+ FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions
+ WHERE notification_status='failed' AND requested_at>=clock_timestamp()-$2::interval ORDER BY id DESC LIMIT $1`, limit, interval(inboxNotificationWindow))
 	if err != nil {
 		return nil, err
 	}

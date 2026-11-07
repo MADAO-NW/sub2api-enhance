@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  categoryFilter, categoryList, configUpdate, costSummary, editableConfig, jobQueryFilter, lineDiff, parseParameters, timeRange,
+  categoryFilter, categoryList, collapseDiff, configUpdate, costSummary, editableConfig, jobQueryFilter, lineDiff, parseParameters, timeRange,
 } from '../viewModel'
 import type { CostReport, SavedConfig } from '@/api/admin/third-party-prompt-audit'
 
@@ -132,5 +132,22 @@ describe('line diff', () => {
   })
   it('treats identical texts as fully unchanged', () => {
     expect(lineDiff('x\ny', 'x\ny').every(row => !row.changed)).toBe(true)
+  })
+  it('aligns a small change inside a long text instead of degrading to line-by-line', () => {
+    const body = Array.from({ length: 800 }, (_, index) => `line ${index}`)
+    const changedBody = [...body.slice(0, 10), 'injected', ...body.slice(10)]
+    const rows = lineDiff(body.join('\n'), changedBody.join('\n'))
+    expect(rows.filter(row => row.changed)).toEqual([{ left: null, right: 'injected', changed: true }])
+    expect(rows).toHaveLength(801)
+  })
+  it('collapses long unchanged runs and keeps context around changes', () => {
+    const rows = lineDiff(Array.from({ length: 20 }, (_, index) => `l${index}`).join('\n'),
+      [...Array.from({ length: 20 }, (_, index) => `l${index}`), 'tail'].join('\n'))
+    const display = collapseDiff(rows, 2)
+    expect(display[0]).toEqual({ skipped: 18 })
+    expect(display.slice(1)).toEqual([
+      { left: 'l18', right: 'l18', changed: false }, { left: 'l19', right: 'l19', changed: false },
+      { left: null, right: 'tail', changed: true },
+    ])
   })
 })

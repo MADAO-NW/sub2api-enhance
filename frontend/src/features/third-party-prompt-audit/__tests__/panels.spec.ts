@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(), saveConfig: vi.fn(), testAdminEmail: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(),
   listModels: vi.fn(), enableAndReset: vi.fn(), probeDetails: vi.fn(), probe: vi.fn(), configImpact: vi.fn(),
   jobs: vi.fn(), job: vi.fn(), jobPrompts: vi.fn(), templateChurn: vi.fn(), metricsHistory: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), trustList: vi.fn(), trust: vi.fn(), untrust: vi.fn(),
-  breakerList: vi.fn(), similarBlocks: vi.fn(), confirmBreaker: vi.fn(), retryAction: vi.fn(), stats: vi.fn(), runtime: vi.fn(), exportJobs: vi.fn(), exportUserData: vi.fn(), deleteUserData: vi.fn(),
+  breakerList: vi.fn(), similarBlocks: vi.fn(), similarPair: vi.fn(), confirmBreaker: vi.fn(), retryAction: vi.fn(), stats: vi.fn(), runtime: vi.fn(), exportJobs: vi.fn(), exportUserData: vi.fn(), deleteUserData: vi.fn(),
   inbox: vi.fn(), actions: vi.fn(), riskUsers: vi.fn(), cost: vi.fn(), clearEscalation: vi.fn(),
   samples: vi.fn(), createSample: vi.fn(), updateSample: vi.fn(), deleteSample: vi.fn(),
   replays: vi.fn(), replay: vi.fn(), startReplay: vi.fn(),
@@ -135,6 +135,9 @@ beforeEach(() => {
   mocks.similarBlocks.mockResolvedValue({ items: [
     { hash: 'd'.repeat(64), preview: '共享指令块\n新增一行', bytes: 18, distance: 2, breaker_status: '', trusted: false, distinct_users: 1 },
   ] })
+  // 全文的差异在第 500 字之后，预览里看不出来；对比必须读取全文。
+  mocks.similarPair.mockResolvedValue({ hash: 'c'.repeat(64), text: '共享指令块\n' + '相同内容\n'.repeat(120) + '结尾',
+    candidate: 'd'.repeat(64), candidate_text: '共享指令块\n' + '相同内容\n'.repeat(120) + '结尾\n夹带的新指令', distance: 2 })
   mocks.confirmBreaker.mockResolvedValue({ hash: 'c'.repeat(64) })
   mocks.retryAction.mockResolvedValue({})
   mocks.stats.mockResolvedValue({
@@ -144,6 +147,7 @@ beforeEach(() => {
     blocking_jobs: 4, blocking_avg_ms: 120, blocking_max_ms: 400, blocking_p50_ms: 110, blocking_p95_ms: 380, job_p50_ms: 800, job_p95_ms: 2400,
     queue_p50_ms: 200, queue_p95_ms: 900, processing_p50_ms: 600, processing_p95_ms: 1500,
     cache_miss: [{ client: 'codex', kind: 'instruction', targets: 4, model_calls: 1, miss_rate: 0.25 }],
+    category_distribution: [{ category: 'R07', count: 260 }, { category: '', count: 12 }],
   })
   mocks.runtime.mockResolvedValue({
     warning_enabled: true, disable_enabled: true, instance_id: 'i', started_at: '2026-09-06T00:00:00Z', as_of: '2026-09-06T00:00:01Z',
@@ -167,6 +171,7 @@ beforeEach(() => {
       { key: 'node_unhealthy', count: 0, items: [] },
       { key: 'failure_rate', count: 1, items: [] },
     ],
+    notification_window_days: 7,
   })
   mocks.actions.mockResolvedValue({ items: [
     { id: 5, user_id: 3, actor_user_id: null, job_id: 7, action_type: 'disable', execution_status: 'failed', notification_status: 'failed', applied_at: null, auth_cache_status: 'ok', auth_cache_error: '', deliveries: [], rule_snapshot: {}, business_snapshot: {}, requested_at: '2026-09-06T00:00:00Z', username: 'alice' },
@@ -255,6 +260,18 @@ describe('third-party prompt audit panels', () => {
     await flushPromises()
     expect(mocks.startReplay).toHaveBeenCalledWith(expect.objectContaining({ mode: 'async' }), [])
     expect(mocks.replay).toHaveBeenCalledWith(1)
+    // 结论为 review 的样本单独成组，不能因为期望只有通过/阻断而从结果里消失。
+    mocks.replay.mockResolvedValueOnce({ id: 1, status: 'done', config_snapshot: '{}', sample_ids: [1, 2], error_message: '', created_by: 1,
+      created_at: '2026-09-06T00:00:00Z', finished_at: '2026-09-06T00:00:01Z', results: [
+        { sample_id: 1, expected: 'pass', actual: 'review', score: 0.6, categories: [], nodes: [] },
+        { sample_id: 2, expected: 'block', actual: 'block', score: 0.9, categories: [], nodes: [] },
+      ] })
+    await wrapper.get('[data-test="start-replay"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-test="confirm-replay"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-test="replay-group-replayReview"]').text()).toContain('(1)')
+    expect(wrapper.get('[data-test="replay-group-replayConsistent"]').text()).toContain('(1)')
     await wrapper.get('[data-test="sample-delete"]').trigger('click')
     await flushPromises()
     expect(mocks.deleteSample).not.toHaveBeenCalled()
@@ -375,7 +392,11 @@ describe('third-party prompt audit panels', () => {
     expect(wrapper.find('[data-test="similar-preview"]').text()).toContain('新增一行')
     await wrapper.get('[data-test="similar-compare"]').trigger('click')
     await flushPromises()
-    expect(wrapper.get('[data-test="similar-diff"]').text()).toContain('diffChanged')
+    expect(mocks.similarPair).toHaveBeenCalledWith('c'.repeat(64), 'd'.repeat(64))
+    const diff = wrapper.get('[data-test="similar-diff"]')
+    expect(diff.text()).toContain('diffChanged')
+    expect(diff.text()).toContain('夹带的新指令')
+    expect(diff.find('[data-test="diff-skipped"]').exists()).toBe(true)
     await wrapper.get('[data-test="similar-trust"]').trigger('click')
     await flushPromises()
     expect(mocks.trust).toHaveBeenCalledWith('d'.repeat(64), expect.any(String))
@@ -405,6 +426,12 @@ describe('third-party prompt audit panels', () => {
     expect(text).toContain('riskOverview')
     expect(text).toContain('costCard')
     expect(wrapper.find('[data-test="pending-summary"]').exists()).toBe(true)
+    // 类别分布直接使用后端聚合结果，不再从前 200 条阻断任务推算。
+    const distribution = wrapper.get('[data-test="category-distribution"]').text()
+    expect(distribution).toContain('R07')
+    expect(distribution).toContain('260')
+    expect(distribution).toContain('uncategorized')
+    expect(mocks.jobs).not.toHaveBeenCalledWith(expect.objectContaining({ decision: 'block' }), 1, 200)
     // 运行诊断默认折叠，展开后才显示缓存未命中与同步等待。
     expect(wrapper.find('[data-test="cache-miss"]').exists()).toBe(false)
     await wrapper.get('[data-test="toggle-diagnostics"]').trigger('click')
@@ -414,6 +441,22 @@ describe('third-party prompt audit panels', () => {
     expect(wrapper.text()).toContain('120 ms')
     expect(window.localStorage.getItem('enhance.third-party-prompt-audit.diagnostics')).toBe('1')
     wrapper.unmount()
+  })
+
+  it('refreshes the pending summary every 30 seconds instead of with the 5-second core refresh', async () => {
+    vi.useFakeTimers()
+    try {
+      const wrapper = mount(AuditOverview, { global: { stubs } })
+      await flushPromises()
+      expect(wrapper.emitted('inbox-loaded')?.[0]).toEqual([3])
+      const inboxCalls = mocks.inbox.mock.calls.length, statsCalls = mocks.stats.mock.calls.length
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(mocks.stats.mock.calls.length).toBeGreaterThan(statsCalls)
+      expect(mocks.inbox.mock.calls.length).toBe(inboxCalls)
+      await vi.advanceTimersByTimeAsync(30000)
+      expect(mocks.inbox.mock.calls.length).toBeGreaterThan(inboxCalls)
+      wrapper.unmount()
+    } finally { vi.useRealTimers() }
   })
 
   it('jumps from the pending summary to the inbox filter', async () => {
@@ -436,9 +479,18 @@ describe('third-party prompt audit panels', () => {
     await wrapper.get('[data-test="inbox-retry"]').trigger('click')
     await flushPromises()
     expect(mocks.retryAction).toHaveBeenCalledWith(5)
+    expect(wrapper.emitted('loaded')?.[0]).toEqual([3])
+    expect(wrapper.get('[data-test="inbox-notification-window"]').text()).toContain('notificationWindowHint')
+    // 下钻列表与分类计数同口径：通知失败只看下发的 7 天窗口，待核对同时列出 failed 与 unknown。
+    const before = Date.now()
     await wrapper.get('[data-test="inbox-category-notification_failed"]').trigger('click')
     await flushPromises()
-    expect(mocks.actions).toHaveBeenLastCalledWith({ notification_status: 'failed' }, 1, 20)
+    const notificationFilter = mocks.actions.mock.lastCall![0] as { notification_status: string; from: string }
+    expect(notificationFilter.notification_status).toBe('failed')
+    expect(Math.abs(before - 7 * 86400000 - new Date(notificationFilter.from).getTime())).toBeLessThan(60000)
+    await wrapper.get('[data-test="inbox-category-action_failed"]').trigger('click')
+    await flushPromises()
+    expect(mocks.actions).toHaveBeenLastCalledWith({ execution_status: 'failed,unknown' }, 1, 20)
     wrapper.unmount()
   })
 

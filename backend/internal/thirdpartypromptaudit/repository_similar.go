@@ -1,6 +1,10 @@
 package thirdpartypromptaudit
 
-import "context"
+import (
+	"context"
+	"database/sql"
+	"errors"
+)
 
 // similarSimhashDistance 是判定指令块相似的最大汉明距离。
 const similarSimhashDistance = 3
@@ -14,6 +18,37 @@ type SimilarBlock struct {
 	BreakerStatus string `json:"breaker_status"`
 	Trusted       bool   `json:"trusted"`
 	DistinctUsers int    `json:"distinct_users"`
+}
+
+// SimilarPair 是一对相似指令块的全文，供逐行查看差异。
+type SimilarPair struct {
+	Hash          string `json:"hash"`
+	Text          string `json:"text"`
+	Candidate     string `json:"candidate"`
+	CandidateText string `json:"candidate_text"`
+	Distance      int    `json:"distance"`
+}
+
+// SimilarPair 返回指定指令块与一个相似候选块的全文。候选必须落在 SimilarBlocks 的同一范围内
+// （有熔断记录或已信任、距离不超过阈值），避免把接口变成任意正文读取入口。
+// 预览只截取前 500 字，长指令块的差异常在后段，因此对比必须使用全文。
+func (r *Repository) SimilarPair(ctx context.Context, hash, candidate string) (*SimilarPair, error) {
+	var pair SimilarPair
+	err := r.db.QueryRowContext(ctx, `SELECT p.hash,p.text,p2.hash,p2.text,bit_count((p2.simhash # p.simhash)::bit(64))
+ FROM sub2api_enhance.prompt_texts p
+ JOIN sub2api_enhance.prompt_texts p2 ON p2.hash=$2 AND p2.hash<>p.hash AND p2.kind='instruction' AND p2.simhash IS NOT NULL
+ WHERE p.hash=$1 AND p.simhash IS NOT NULL
+   AND (EXISTS (SELECT 1 FROM sub2api_enhance.instruction_breakers b WHERE b.hash=p2.hash)
+        OR EXISTS (SELECT 1 FROM sub2api_enhance.prompt_trust pt WHERE pt.hash=p2.hash))
+   AND bit_count((p2.simhash # p.simhash)::bit(64))<=$3`, hash, candidate, similarSimhashDistance).Scan(
+		&pair.Hash, &pair.Text, &pair.Candidate, &pair.CandidateText, &pair.Distance)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &pair, nil
 }
 
 // SimilarBlocks 返回与指定指令块 simhash 距离不超过阈值的指令块，供逐块查看差异。

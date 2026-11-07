@@ -87,17 +87,9 @@ async function trackReaudits(ids: number[]) {
     refreshKey.value++
   } finally { tracking = false }
 }
-// 角标轮询与页面其他数据共用 5 秒节奏；只在概览/待处理页签且页面可见时请求。
-async function pollInbox() {
-  if (document.visibilityState !== 'visible' || !['overview', 'inbox'].includes(active.value)) return
-  try { inboxTotal.value = (await api.inbox()).total }
-  catch { /* 角标失败不打扰当前操作 */ }
-}
-void pollInbox()
-const badgeTimer = window.setInterval(() => { void pollInbox() }, 5000)
+// 待处理角标不单独轮询：概览与待处理页签各自按 30 秒节奏加载 /inbox，并把总数交给角标。
 onUnmounted(() => {
   disposed = true
-  window.clearInterval(badgeTimer)
 })
 </script>
 
@@ -117,9 +109,9 @@ onUnmounted(() => {
         </button>
       </nav>
       <AuditOverview v-show="active === 'overview'" :active="active === 'overview'" :refresh-key="tabRefresh.overview + refreshKey"
-        @inspect-jobs="inspectJobs" @open-inbox="openInbox" @open-users="openUsers" />
+        @inspect-jobs="inspectJobs" @open-inbox="openInbox" @open-users="openUsers" @inbox-loaded="inboxTotal = $event" />
       <AuditInbox v-if="visited.includes('inbox')" v-show="active === 'inbox'" :active="active === 'inbox'" :initial-category="inboxCategory"
-        :refresh-key="tabRefresh.inbox + refreshKey" @inspect-jobs="inspectJobs" @open-trust="openTrust" @open-config="openConfigNode" @changed="refreshAll" />
+        :refresh-key="tabRefresh.inbox + refreshKey" @inspect-jobs="inspectJobs" @open-trust="openTrust" @open-config="openConfigNode" @changed="refreshAll" @loaded="inboxTotal = $event" />
       <AuditRecords v-if="visited.includes('jobs')" v-show="active === 'jobs'" :initial-filter="jobFilter" :initial-job-id="jobDetailID"
         :active="active === 'jobs'" :refresh-key="tabRefresh.jobs + refreshKey" @reaudit-created="trackReaudits" />
       <AuditUsers v-if="visited.includes('users')" v-show="active === 'users'" :active="active === 'users'" :initial-range="usersRange"

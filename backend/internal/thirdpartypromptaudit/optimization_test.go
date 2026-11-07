@@ -2,10 +2,12 @@ package thirdpartypromptaudit
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -115,17 +117,27 @@ func TestFindReusableReviewFiltersByReuseAfter(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// 重审轮次写入 fresh 与 reuse_after，并复制当前轮目标。
-func TestAppendRoundWritesFreshReuseAfter(t *testing.T) {
+// 批量重审整批共用一个发起时间：每个追加的 fresh 轮次写入同一个 reuse_after。
+func TestCreateReauditsSharesOneReuseAfterAcrossBatch(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
-	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT status,current_round`).WithArgs(int64(11)).WillReturnRows(sqlmock.NewRows([]string{"status", "current_round"}).AddRow("done", 1))
-	mock.ExpectExec(`INSERT INTO sub2api_enhance.audit_job_targets`).WithArgs(int64(11), 1, 2).WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(`reuse_mode='fresh',reuse_after=clock_timestamp\(\)`).WithArgs(int64(11), 2, int64(99), int64(4), "{}", MaxEvaluationAttempts).WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-	require.NoError(t, NewRepository(db).appendRound(context.Background(), 11, 99, 4, "{}"))
+	requestedAt := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`SELECT j.id,j.user_id,j.status IN`).WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "ready"}).AddRow(11, 7, true).AddRow(12, 8, true))
+	mock.ExpectQuery(`SELECT count\(DISTINCT t.hash\)`).WithArgs(sqlmock.AnyArg()).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT clock_timestamp\(\)`).WillReturnRows(sqlmock.NewRows([]string{"now"}).AddRow(requestedAt))
+	for _, jobID := range []int64{11, 12} {
+		mock.ExpectBegin()
+		mock.ExpectQuery(`SELECT status,current_round`).WithArgs(jobID).WillReturnRows(sqlmock.NewRows([]string{"status", "current_round"}).AddRow("done", 1))
+		mock.ExpectExec(`INSERT INTO sub2api_enhance.audit_job_targets`).WithArgs(jobID, 1, 2).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(`reuse_mode='fresh',reuse_after=\$7`).WithArgs(jobID, 2, int64(99), int64(4), sqlmock.AnyArg(), MaxEvaluationAttempts, requestedAt).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectCommit()
+	}
+	snapshot := ConfigSnapshot{Config: testConfig(), Revision: 4}
+	result, err := NewRepository(db).CreateReaudits(context.Background(), ReauditRequest{}, snapshot, 99)
+	require.NoError(t, err)
+	require.Equal(t, []string{"requeued", "requeued"}, []string{result.Items[0].Status, result.Items[1].Status})
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -157,6 +169,87 @@ func TestSimilarBlocksUsesDistanceConstant(t *testing.T) {
 	require.Len(t, items, 1)
 	require.Equal(t, "hash-2", items[0].Hash)
 	require.True(t, items[0].Trusted)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// 相似块对比读取两侧全文，候选必须仍在相似范围内；不在范围内返回 ErrNotFound。
+func TestSimilarPairReturnsFullTextsWithinSimilarRange(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	long := strings.Repeat("相同的前缀\n", 200) + "新增的一段指令"
+	mock.ExpectQuery(`SELECT p.hash,p.text,p2.hash,p2.text`).WithArgs("hash-1", "hash-2", similarSimhashDistance).
+		WillReturnRows(sqlmock.NewRows([]string{"hash", "text", "candidate", "candidate_text", "distance"}).
+			AddRow("hash-1", strings.Repeat("相同的前缀\n", 200), "hash-2", long, 2))
+	pair, err := NewRepository(db).SimilarPair(context.Background(), "hash-1", "hash-2")
+	require.NoError(t, err)
+	require.Equal(t, long, pair.CandidateText)
+	require.Equal(t, 2, pair.Distance)
+	mock.ExpectQuery(`SELECT p.hash,p.text,p2.hash,p2.text`).WithArgs("hash-1", "hash-9", similarSimhashDistance).
+		WillReturnRows(sqlmock.NewRows([]string{"hash", "text", "candidate", "candidate_text", "distance"}))
+	_, err = NewRepository(db).SimilarPair(context.Background(), "hash-1", "hash-9")
+	require.ErrorIs(t, err, ErrNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// 工作台计数：账号动作待核对含 failed 与 unknown 且不设窗口；通知投递失败只统计 7 天窗口。
+func TestInboxCountsLimitNotificationFailuresToWindow(t *testing.T) {
+	require.Equal(t, 7*24*time.Hour, inboxNotificationWindow)
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	mock.ExpectQuery(`execution_status IN \('failed','unknown'\)\),\s+count\(\*\) FILTER \(WHERE notification_status='failed' AND requested_at>=clock_timestamp\(\)-\$1::interval\)`).
+		WithArgs(interval(inboxNotificationWindow)).WillReturnRows(sqlmock.NewRows([]string{"actions", "notifications"}).AddRow(3, 1))
+	mock.ExpectQuery(`SELECT count\(\*\) FROM sub2api_enhance.instruction_breakers`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery(`WHERE execution_status IN \('failed','unknown'\) ORDER BY id DESC`).WithArgs(inboxRecentLimit).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "type", "user", "job", "status", "at", "username"}))
+	mock.ExpectQuery(`FROM sub2api_enhance.instruction_breakers b`).WithArgs(inboxRecentLimit).
+		WillReturnRows(sqlmock.NewRows([]string{"hash", "preview", "users", "at"}))
+	counts, err := NewRepository(db).LoadInboxCounts(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int64(3), counts.ActionFailed)
+	require.Equal(t, int64(1), counts.NotificationFailed)
+	mock.ExpectQuery(`notification_status='failed' AND requested_at>=clock_timestamp\(\)-\$2::interval`).WithArgs(inboxRecentLimit, interval(inboxNotificationWindow)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "type", "user", "job", "status", "at", "username"}))
+	_, err = NewRepository(db).NotificationFailedItems(context.Background(), inboxRecentLimit)
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// 动作列表可同时按多个执行状态筛选，工作台下钻与计数口径一致；非法状态直接拒绝。
+func TestListActionRecordsAcceptsMultipleExecutionStatuses(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	statuses := []string{"failed", "unknown"}
+	mock.ExpectQuery(`SELECT count\(\*\) FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions WHERE 1=1 AND execution_status=ANY\(\$1\)`).
+		WithArgs(pq.Array(statuses)).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery(`WHERE 1=1 AND execution_status=ANY\(\$1\) ORDER BY requested_at DESC,id DESC LIMIT \$2 OFFSET \$3`).
+		WithArgs(pq.Array(statuses), 20, 0).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	page, err := NewRepository(db).ListActionRecords(context.Background(), ActionFilter{ExecutionStatuses: statuses}, 1, 20)
+	require.NoError(t, err)
+	require.Empty(t, page.Items)
+	_, err = NewRepository(db).ListActionRecords(context.Background(), ActionFilter{ExecutionStatuses: []string{"failed", "running"}}, 1, 20)
+	require.Error(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// 类别分布在数据库内聚合整个时间范围的阻断任务，未分类单独成行，并沿用统计接口的模式筛选。
+func TestCategoryDistributionAggregatesWholeRange(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	from, to := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 8, 0, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`LEFT JOIN LATERAL unnest\(j.trigger_categories\) AS c\(code\) ON true\s+WHERE j.created_at>=\$1 AND j.created_at<\$2 AND j.decision='block'\s+GROUP BY 1`).
+		WithArgs(from, to).WillReturnRows(sqlmock.NewRows([]string{"category", "count"}).AddRow("R07", 260).AddRow("", 12))
+	items, err := NewRepository(db).categoryDistribution(context.Background(), StatsQuery{From: from, To: to})
+	require.NoError(t, err)
+	require.Equal(t, []CategoryCount{{Category: "R07", Count: 260}, {Category: "", Count: 12}}, items)
+	mock.ExpectQuery(`AND j.decision='block' AND j.mode=\$3`).WithArgs(from, to, "blocking").
+		WillReturnRows(sqlmock.NewRows([]string{"category", "count"}))
+	items, err = NewRepository(db).categoryDistribution(context.Background(), StatsQuery{From: from, To: to, Mode: "blocking"})
+	require.NoError(t, err)
+	require.Empty(t, items)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

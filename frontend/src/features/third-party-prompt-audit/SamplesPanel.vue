@@ -109,6 +109,8 @@ const groups = computed(() => {
   return {
     newMisjudge: results.filter(item => !item.error && item.expected === 'pass' && item.actual === 'block'),
     newMissed: results.filter(item => !item.error && item.expected === 'block' && item.actual === 'pass'),
+    // 期望只有通过/阻断，结论为 review 的样本单独成组，不能从结果里消失。
+    review: results.filter(item => !item.error && item.actual === 'review'),
     consistent: results.filter(item => !item.error && item.actual === item.expected),
     failed: results.filter(item => !!item.error),
   }
@@ -253,6 +255,7 @@ onMounted(() => { void loadSamples(); void loadReplays() })
         <p v-if="replayDetail.error_message" class="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950/30 dark:text-red-300" role="alert">{{ replayDetail.error_message }}</p>
         <section v-for="group in [
           { key: 'replayNewMisjudge', items: groups.newMisjudge }, { key: 'replayNewMissed', items: groups.newMissed },
+          { key: 'replayReview', items: groups.review },
           { key: 'replayConsistent', items: groups.consistent }, { key: 'replayErrors', items: groups.failed },
         ]" :key="group.key" class="space-y-2" :data-test="`replay-group-${group.key}`">
           <h3 class="text-sm font-medium">{{ label(group.key) }} ({{ group.items.length }})</h3>

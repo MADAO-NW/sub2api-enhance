@@ -56,6 +56,15 @@ type Stats struct {
 	CacheMiss       []ClientMissRate `json:"cache_miss"`
 	// CategoryRecognition 是 block/review 目标中 reason 能解析出类别的比例，按节点模型分组。
 	CategoryRecognition []CategoryRecognition `json:"category_recognition"`
+	// CategoryDistribution 是时间范围内阻断任务按触发类别的完整计数，与裁决分布同一筛选口径。
+	CategoryDistribution []CategoryCount `json:"category_distribution"`
+}
+
+// CategoryCount 是一个触发类别的阻断任务数；Category 为空表示未分类（含升级前的任务）。
+// 同时涉及多个类别的任务在每个类别下各计一次。
+type CategoryCount struct {
+	Category string `json:"category"`
+	Count    int64  `json:"count"`
 }
 
 // ClientChurn 是某客户端指令块的变更情况：请求越多、唯一哈希越多，说明内容越不稳定。
@@ -192,7 +201,39 @@ func (r *Repository) Stats(ctx context.Context, query StatsQuery) (*Stats, error
 		return nil, err
 	}
 	stats.CategoryRecognition = recognition
+	distribution, err := r.categoryDistribution(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	stats.CategoryDistribution = distribution
 	return stats, nil
+}
+
+// categoryDistribution 在数据库内按触发类别聚合阻断任务，覆盖整个时间范围，不受分页条数限制。
+func (r *Repository) categoryDistribution(ctx context.Context, query StatsQuery) ([]CategoryCount, error) {
+	args := []any{query.From, query.To}
+	modeClause := ""
+	if query.Mode != "" {
+		args = append(args, query.Mode)
+		modeClause = " AND j.mode=$3"
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT COALESCE(c.code,''),count(*)
+ FROM sub2api_enhance.audit_jobs j LEFT JOIN LATERAL unnest(j.trigger_categories) AS c(code) ON true
+ WHERE j.created_at>=$1 AND j.created_at<$2 AND j.decision='block'`+modeClause+`
+ GROUP BY 1 ORDER BY 2 DESC,1`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	items := make([]CategoryCount, 0)
+	for rows.Next() {
+		var item CategoryCount
+		if err := rows.Scan(&item.Category, &item.Count); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 // CategoryRecognition 是某个节点模型的类别识别率。

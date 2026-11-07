@@ -645,11 +645,16 @@ func (m *ConfigManager) EffectiveModeForUser(userID int64) string {
 	if slices.Contains(m.active.Stored.ExcludedUserIDs, userID) {
 		return "off"
 	}
-	if effectiveConfigForUser(m.active.Stored.Config, userID).Mode == "async" && m.isEscalated(userID) {
-		// 自动加严只把异步审核提升为同步，不修改配置与修订号。
+	return m.escalatedMode(effectiveConfigForUser(m.active.Stored.Config, userID).Mode, userID)
+}
+
+// escalatedMode 把已自动加严用户的异步审核提升为同步，其余处理方式原样返回。
+// 审核入口与代理失败分支共用这一判定；加严不修改配置与修订号。
+func (m *ConfigManager) escalatedMode(mode string, userID int64) string {
+	if mode == "async" && m.isEscalated(userID) {
 		return "blocking"
 	}
-	return effectiveConfigForUser(m.active.Stored.Config, userID).Mode
+	return mode
 }
 
 // PublicOrigin 返回增强服务对外地址，用于管理员通知中的后台直达链接。
