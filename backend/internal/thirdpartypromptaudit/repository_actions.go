@@ -7,6 +7,8 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 // actionColumns 完整保留远端执行和邮件投递的独立状态。
@@ -150,6 +152,82 @@ func (r *Repository) SkipNotification(ctx context.Context, id, actorID int64) er
 		return ErrLeaseLost
 	}
 	return nil
+}
+
+// SkipNotificationsResult 是批量跳过通知的逐项结果：按请求顺序归类成功、状态冲突与不存在。
+type SkipNotificationsResult struct {
+	Skipped   []int64 `json:"skipped"`
+	Conflicts []int64 `json:"conflicts"`
+	Missing   []int64 `json:"missing"`
+}
+
+// SkipNotifications 批量跳过投递失败的通知。先读取当前状态归类，
+// 再用一条 UPDATE ... RETURNING 只改仍为 failed 的行，避免逐条往返或把刚处理完的通知再改一次。
+func (r *Repository) SkipNotifications(ctx context.Context, ids []int64, actorID int64) (*SkipNotificationsResult, error) {
+	result := &SkipNotificationsResult{Skipped: []int64{}, Conflicts: []int64{}, Missing: []int64{}}
+	if len(ids) == 0 {
+		return result, nil
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT id,notification_status FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions WHERE id=ANY($1)`, pq.Array(ids))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	statuses := make(map[int64]string, len(ids))
+	for rows.Next() {
+		var id int64
+		var status string
+		if err := rows.Scan(&id, &status); err != nil {
+			return nil, err
+		}
+		statuses[id] = status
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	failed := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if statuses[id] == "failed" {
+			failed = append(failed, id)
+		}
+	}
+	skipped := make(map[int64]bool, len(failed))
+	if len(failed) > 0 {
+		updated, err := r.db.QueryContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_enforcement_actions
+ SET notification_status='not_required',
+  business_snapshot=(business_snapshot::jsonb || jsonb_build_object('notification_skipped', jsonb_build_object('by',$2::bigint,'at',to_jsonb(clock_timestamp()))))::text,
+  updated_at=clock_timestamp()
+ WHERE id=ANY($1) AND notification_status='failed' RETURNING id`, pq.Array(failed), actorID)
+		if err != nil {
+			return nil, err
+		}
+		for updated.Next() {
+			var id int64
+			if err := updated.Scan(&id); err != nil {
+				_ = updated.Close()
+				return nil, err
+			}
+			skipped[id] = true
+		}
+		if err := updated.Err(); err != nil {
+			_ = updated.Close()
+			return nil, err
+		}
+		if err := updated.Close(); err != nil {
+			return nil, err
+		}
+	}
+	for _, id := range ids {
+		switch {
+		case skipped[id]:
+			result.Skipped = append(result.Skipped, id)
+		case statuses[id] == "":
+			result.Missing = append(result.Missing, id)
+		default:
+			result.Conflicts = append(result.Conflicts, id)
+		}
+	}
+	return result, nil
 }
 func (r *Repository) ListActions(ctx context.Context, userID, rootID int64) ([]Action, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT `+actionColumns+` FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions WHERE user_id=$1 AND

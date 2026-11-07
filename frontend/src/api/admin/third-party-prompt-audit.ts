@@ -223,6 +223,8 @@ export interface AuditAction {
 
 // ActionRecord 是 GET /actions 的一行：动作全字段加用户显示名。
 export interface ActionRecord extends AuditAction { username: string }
+// SkipNotificationsResult 是批量跳过通知的逐项结果：按请求顺序归类成功、状态冲突与不存在。
+export interface SkipNotificationsResult { skipped: number[]; conflicts: number[]; missing: number[] }
 export interface ActionFilter {
   // execution_status 可用逗号分隔多个状态，如 failed,unknown。
   execution_status?: string
@@ -666,6 +668,8 @@ export const thirdPartyPromptAuditAPI = {
   async retryAction(id: number) { return (await apiClient.post(`${base}/actions/${id}/retry`)).data },
   // skipNotification 跳过一条投递失败的通知，不再重试发送。
   async skipNotification(id: number) { return (await apiClient.post(`${base}/actions/${id}/skip-notification`)).data },
+  // skipNotifications 批量跳过投递失败的通知，返回成功、冲突与不存在的逐项结果。
+  async skipNotifications(ids: number[]) { return (await apiClient.post<SkipNotificationsResult>(`${base}/actions/skip-notifications`, { ids })).data },
   async samples(params: { kind?: string; expected?: string }, page = 1, pageSize = 20) {
     return (await apiClient.get<AuditPage<Sample>>(`${base}/samples`, { params: { ...params, page, page_size: pageSize } })).data
   },

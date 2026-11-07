@@ -148,6 +148,7 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	a.POST("/breakers/:hash/confirm", handler.ConfirmBreaker)
 	a.POST("/actions/:id/retry", handler.RetryAction)
 	a.POST("/actions/:id/skip-notification", handler.SkipActionNotification)
+	a.POST("/actions/skip-notifications", handler.SkipActionNotifications)
 	a.GET("/actions", handler.ListActions)
 	a.GET("/inbox", handler.GetInbox)
 	a.GET("/users/risk", handler.ListRiskUsers)

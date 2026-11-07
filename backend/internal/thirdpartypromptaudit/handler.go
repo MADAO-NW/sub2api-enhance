@@ -379,6 +379,28 @@ func (h *AdminHandler) SkipActionNotification(c *gin.Context) {
 	response.Success(c, gin.H{"id": id})
 }
 
+// SkipActionNotificationsInput 是批量跳过通知的请求体：最多 200 条，避免一次锁住过多行。
+type SkipActionNotificationsInput struct {
+	IDs []int64 `json:"ids" binding:"required,min=1,max=200,dive,gt=0"`
+}
+
+// SkipActionNotifications 批量跳过投递失败的通知，返回成功、状态冲突与不存在的逐项结果。
+func (h *AdminHandler) SkipActionNotifications(c *gin.Context) {
+	var input SkipActionNotificationsInput
+	if err := bindStrict(c, &input); err != nil {
+		response.BadRequest(c, "跳过通知请求无效："+err.Error())
+		return
+	}
+	result, err := h.repo.SkipNotifications(c.Request.Context(), input.IDs, adminActor(c))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	middleware.SetAuditExtra(c, map[string]any{"result": "success", "operation": "skip_notifications",
+		"skipped": len(result.Skipped), "conflicts": len(result.Conflicts), "missing": len(result.Missing)})
+	response.Success(c, result)
+}
+
 func (h *AdminHandler) PreviewReaudits(c *gin.Context) {
 	var input ReauditRequest
 	if err := bindStrict(c, &input); err != nil {

@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(), saveConfig: vi.fn(), testAdminEmail: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(),
   listModels: vi.fn(), enableAndReset: vi.fn(), probeDetails: vi.fn(), probe: vi.fn(), configImpact: vi.fn(),
   jobs: vi.fn(), job: vi.fn(), jobPrompts: vi.fn(), templateChurn: vi.fn(), metricsHistory: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), trustList: vi.fn(), trust: vi.fn(), untrust: vi.fn(),
-  breakerList: vi.fn(), similarBlocks: vi.fn(), similarPair: vi.fn(), confirmBreaker: vi.fn(), retryAction: vi.fn(), skipNotification: vi.fn(), stats: vi.fn(), runtime: vi.fn(), exportJobs: vi.fn(), exportUserData: vi.fn(), deleteUserData: vi.fn(),
+  breakerList: vi.fn(), similarBlocks: vi.fn(), similarPair: vi.fn(), confirmBreaker: vi.fn(), retryAction: vi.fn(), skipNotification: vi.fn(), skipNotifications: vi.fn(), stats: vi.fn(), runtime: vi.fn(), exportJobs: vi.fn(), exportUserData: vi.fn(), deleteUserData: vi.fn(),
   inbox: vi.fn(), actions: vi.fn(), riskUsers: vi.fn(), cost: vi.fn(), clearEscalation: vi.fn(),
   samples: vi.fn(), createSample: vi.fn(), updateSample: vi.fn(), deleteSample: vi.fn(),
   replays: vi.fn(), replay: vi.fn(), startReplay: vi.fn(),
@@ -143,6 +143,7 @@ beforeEach(() => {
   mocks.confirmBreaker.mockResolvedValue({ hash: 'c'.repeat(64) })
   mocks.retryAction.mockResolvedValue({})
   mocks.skipNotification.mockResolvedValue({})
+  mocks.skipNotifications.mockResolvedValue({ skipped: [5], conflicts: [], missing: [] })
   mocks.stats.mockResolvedValue({
     from: '2026-09-05T00:00:00Z', to: '2026-09-06T00:00:00Z', timezone: 'Asia/Shanghai', mode: '',
     jobs: 12, orphan_jobs: 1, reaudit_jobs: 2, failed_jobs: 3, decisions: { pass: 8, review: 1, block: 3 },
@@ -537,6 +538,20 @@ describe('third-party prompt audit panels', () => {
     await flushPromises()
     expect(mocks.skipNotification).toHaveBeenCalledWith(6)
     expect(mocks.inbox.mock.calls.length).toBeGreaterThan(calls)
+    wrapper.unmount()
+  })
+
+  // 批量跳过：勾选本页投递失败的动作后一次提交，确认后调用批量接口。
+  it('skips the selected failed notifications in one request', async () => {
+    const wrapper = mount(AuditInbox, { global: { stubs } })
+    await flushPromises()
+    await wrapper.get('[data-test="inbox-select-failed"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-test="inbox-skip-selected"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-test="confirm-skip-selected"]').trigger('click')
+    await flushPromises()
+    expect(mocks.skipNotifications).toHaveBeenCalledWith([5])
     wrapper.unmount()
   })
 

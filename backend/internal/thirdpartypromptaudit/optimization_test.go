@@ -236,6 +236,27 @@ func TestSkipNotificationOnlySkipsFailedDeliveries(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+// 批量跳过通知按请求顺序给出成功、状态冲突与不存在；只更新仍为 failed 的行。
+func TestSkipNotificationsClassifiesEachID(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	repo := NewRepository(db)
+	ids := []int64{11, 12, 13, 14}
+	mock.ExpectQuery(`SELECT id,notification_status FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions WHERE id=ANY\(\$1\)`).
+		WithArgs(pq.Array(ids)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(11, "failed").AddRow(12, "sent").AddRow(14, "failed"))
+	mock.ExpectQuery(`UPDATE sub2api_enhance.third_party_prompt_audit_enforcement_actions`).
+		WithArgs(pq.Array([]int64{11, 14}), int64(9)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(11).AddRow(14))
+	result, err := repo.SkipNotifications(context.Background(), ids, 9)
+	require.NoError(t, err)
+	require.Equal(t, []int64{11, 14}, result.Skipped)
+	require.Equal(t, []int64{12}, result.Conflicts)
+	require.Equal(t, []int64{13}, result.Missing)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 // 待处理工作台只报真正的节点异常：未验证与未启用不算异常，时间取最近一次观测。
 func TestUnhealthyNodeEntriesSkipsUnverifiedNodes(t *testing.T) {
 	observed := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)

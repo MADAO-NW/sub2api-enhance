@@ -109,6 +109,32 @@ async function skipNotification() {
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { pending.value = '' }
 }
+
+// selectedIDs 是勾选的投递失败动作；批量跳过只对这些 id 生效，最多 200 条。
+const selectedIDs = ref<number[]>([])
+const confirmSkipBatch = ref<number[] | null>(null)
+const batchPending = ref(false)
+const failedOnPage = computed(() => actions.value.filter(action => action.notification_status === 'failed').map(action => action.id))
+function toggleSelect(id: number) {
+  selectedIDs.value = selectedIDs.value.includes(id) ? selectedIDs.value.filter(item => item !== id) : [...selectedIDs.value, id]
+}
+function selectFailedOnPage() {
+  selectedIDs.value = failedOnPage.value
+}
+async function skipSelected() {
+  const ids = confirmSkipBatch.value ?? []
+  if (!ids.length) return
+  batchPending.value = true
+  try {
+    const result = await api.skipNotifications(ids)
+    confirmSkipBatch.value = null
+    selectedIDs.value = []
+    app.showSuccess(t('admin.thirdPartyPromptAudit.skippedCount', { count: result.skipped.length }))
+    emit('changed')
+    await load()
+  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { batchPending.value = false }
+}
 function openJob(jobID: number | null | undefined) {
   if (!jobID) return
   emit('inspect-jobs', { ids: [jobID] })
@@ -211,10 +237,16 @@ onMounted(() => { void load() })
         <button class="btn btn-primary" :disabled="actionLoading">{{ label(actionLoading ? 'loading' : 'apply') }}</button>
         <button type="button" class="btn btn-secondary" data-test="inbox-reset" @click="resetFilter">{{ label('resetFilters') }}</button>
       </form>
+      <div class="flex flex-wrap items-center gap-3 text-sm">
+        <button type="button" class="btn btn-secondary btn-sm" :disabled="!failedOnPage.length" data-test="inbox-select-failed" @click="selectFailedOnPage">{{ label('selectFailedOnPage') }}</button>
+        <button type="button" class="btn btn-primary btn-sm" :disabled="!selectedIDs.length || batchPending" data-test="inbox-skip-selected" @click="confirmSkipBatch = [...selectedIDs]">{{ label('skipSelected') }} ({{ selectedIDs.length }})</button>
+        <span v-if="batchPending" class="text-gray-500" role="status">{{ label('loading') }}</span>
+      </div>
       <div class="overflow-x-auto">
         <table class="w-full text-left text-sm">
           <thead class="text-gray-500 dark:text-dark-400"><tr>
             <th class="p-2">{{ label('created') }}</th>
+            <th class="p-2"></th>
             <th class="p-2">{{ label('userColumn') }}</th>
             <th class="p-2">{{ label('actionType') }}</th>
             <th class="p-2">{{ label('executionStatus') }} / {{ label('notificationStatus') }}</th>
@@ -222,6 +254,7 @@ onMounted(() => { void load() })
           </tr></thead>
           <tbody>
             <tr v-for="action in actions" :key="action.id" class="border-t border-gray-100 align-top dark:border-dark-700">
+              <td class="p-2"><input v-if="action.notification_status === 'failed'" type="checkbox" :checked="selectedIDs.includes(action.id)" data-test="inbox-skip-select" @change="toggleSelect(action.id)" /></td>
               <td class="whitespace-nowrap p-2">{{ formatTime(action.requested_at) }}<span class="mt-1 block text-xs text-gray-500">#{{ action.id }}</span></td>
               <td class="p-2">{{ action.username || `#${action.user_id}` }}<span class="mt-1 block text-xs text-gray-500">#{{ action.user_id }}</span></td>
               <td class="p-2">{{ label(action.action_type) }}</td>
@@ -231,7 +264,7 @@ onMounted(() => { void load() })
                 <button v-if="action.job_id" class="btn btn-secondary btn-sm" @click="openJob(action.job_id)">{{ label('viewJob') }}</button>
               </td>
             </tr>
-            <tr v-if="!actionLoading && !actions.length"><td colspan="5" class="p-8 text-center text-gray-500">{{ label('empty') }}</td></tr>
+            <tr v-if="!actionLoading && !actions.length"><td colspan="6" class="p-8 text-center text-gray-500">{{ label('empty') }}</td></tr>
           </tbody>
         </table>
       </div>
@@ -242,6 +275,10 @@ onMounted(() => { void load() })
       <p class="text-sm">{{ label('skipNotificationHint') }}</p>
       <p v-if="confirmSkip" class="mt-2 text-sm text-gray-500 dark:text-dark-400">#{{ confirmSkip.id }} · {{ confirmSkip.username || '—' }}</p>
       <template #footer><div class="flex gap-3"><button class="btn btn-primary" :disabled="pending !== ''" data-test="confirm-skip-notification" @click="skipNotification">{{ label('confirmSave') }}</button><button class="btn btn-secondary" @click="confirmSkip = null">{{ label('cancelChanges') }}</button></div></template>
+    </BaseDialog>
+    <BaseDialog :show="confirmSkipBatch !== null" :title="label('skipSelected')" :close-on-click-outside="true" @close="confirmSkipBatch = null">
+      <p class="text-sm">{{ t('admin.thirdPartyPromptAudit.skipBatchHint', { count: confirmSkipBatch?.length ?? 0 }) }}</p>
+      <template #footer><div class="flex gap-3"><button class="btn btn-primary" :disabled="batchPending" data-test="confirm-skip-selected" @click="skipSelected">{{ label('confirmSave') }}</button><button class="btn btn-secondary" @click="confirmSkipBatch = null">{{ label('cancelChanges') }}</button></div></template>
     </BaseDialog>
   </div>
 </template>
