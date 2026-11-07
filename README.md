@@ -66,7 +66,8 @@ sudoedit /etc/sub2api-enhance/sub2api-enhance.env
 | `ENHANCE_ENCRYPTION_KEY` | 独立的 32 字节随机密钥，经 Base64 编码，用于保存审核节点凭据 |
 | `ENHANCE_TRUSTED_PROXIES` | 实际反向代理的地址段；同机 Nginx 可使用 `127.0.0.1/32,::1/128` |
 | `ENHANCE_DB_CONNECTIONS` / `ENHANCE_INGRESS_CONNECTIONS` | 后台与入口连接池大小，示例各为 `8`；额度模块另占最多三条锁连接 |
-| `ENHANCE_REDIS_URL` | 审计回合键与 `previous_response_id` 映射使用的 Redis 连接；必须使用独立 ACL、逻辑库及 `sub2api_enhance:` 键前缀权限。有效期固定 30 分钟，不再通过环境变量配置 |
+| `ENHANCE_READONLY_TOKEN` | 可选。为监控系统提供只读通道 `/enhance/api/v1/admin/third-party-prompt-audit/readonly/{stats,runtime}`，请求头 `X-Enhance-Readonly-Token`，每分钟 60 次；为空时不开放 |
+| `ENHANCE_REDIS_URL` | 审计回合键与 `previous_response_id` 映射使用的 Redis 连接。ACL 只需 `~sub2api_enhance:tppa:v1:*` 与 `+get +set`（服务用带 TTL 的 SET 续期，不依赖 `EXPIRE`）；启动时会自检这两个权限，失败原因显示在运行概览。有效期固定 30 分钟 |
 
 可用下面的命令生成加密密钥，将输出填入环境文件并妥善备份；更新版本时保持不变，否则已有审核节点凭据将无法解密：
 
