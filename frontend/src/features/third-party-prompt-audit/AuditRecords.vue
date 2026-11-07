@@ -158,7 +158,7 @@ function downloadPrompt(target: JobPrompt, jobID: number | null) {
   link.click()
   URL.revokeObjectURL(url)
 }
-// 导出全部：按 1000 行一页循环拉取并合并，去掉后续页的表头与 BOM。
+// 导出全部：按 1000 行一页循环拉取并合并，去掉后续页的表头，合并后统一补回一个 BOM。
 async function exportCSV() {
   exporting.value = true
   try {
@@ -167,12 +167,13 @@ async function exportCSV() {
     let merged = ''
     for (let page = 0; page < 20; page++) {
       const { blob, hasMore } = await api.exportJobs(applied.value, pageSize, offset)
-      const text = await blob.text()
-      merged += page === 0 ? text : text.replace(/^\ufeff/, '').replace(/^[^\n]*\n/, '')
+      // Blob.text() 会吃掉页首 BOM，逐页剥掉后由最终文件补一个，避免表头重复。
+      const text = (await blob.text()).replace(/^\ufeff/, '')
+      merged += page === 0 ? text : text.replace(/^[^\n]*\n/, '')
       if (!hasMore) break
       offset += pageSize
     }
-    const url = URL.createObjectURL(new Blob([merged], { type: 'text/csv;charset=utf-8' }))
+    const url = URL.createObjectURL(new Blob(['\ufeff' + merged], { type: 'text/csv;charset=utf-8' }))
     const link = document.createElement('a')
     link.href = url
     link.download = `third-party-prompt-audit-${new Date().toISOString().slice(0, 10)}.csv`

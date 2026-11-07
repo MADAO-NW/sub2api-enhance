@@ -13,7 +13,7 @@ const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(), saveConfig: vi.fn(), testAdminEmail: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(),
   listModels: vi.fn(), enableAndReset: vi.fn(), probeDetails: vi.fn(), probe: vi.fn(), userKeys: vi.fn(),
   jobs: vi.fn(), job: vi.fn(), jobPrompts: vi.fn(), templateChurn: vi.fn(), metricsHistory: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), trustList: vi.fn(), trust: vi.fn(), untrust: vi.fn(),
-  breakerList: vi.fn(), confirmBreaker: vi.fn(), retryAction: vi.fn(), stats: vi.fn(), runtime: vi.fn(),
+  breakerList: vi.fn(), confirmBreaker: vi.fn(), retryAction: vi.fn(), stats: vi.fn(), runtime: vi.fn(), exportJobs: vi.fn(), exportUserData: vi.fn(), deleteUserData: vi.fn(),
   showError: vi.fn(), showSuccess: vi.fn(),
 }))
 vi.mock('@/api/admin/third-party-prompt-audit', () => ({ thirdPartyPromptAuditAPI: mocks }))
@@ -65,7 +65,26 @@ function detail(): JobDetail {
     actions: [],
   }
 }
-const stubs = { BaseDialog: { props: ['show'], template: '<div v-if="show"><slot /></div>' }, Pagination: true, SystemUpdatePanel: true }
+const stubs = { BaseDialog: { props: ['show'], template: '<div v-if="show"><slot /><slot name="footer" /></div>' }, Pagination: true, SystemUpdatePanel: true }
+// jsdom 的 Blob 没有 text()，而导出流程依赖它，这里补一个等价的 FileReader 实现。
+function readBlob(blob: Blob): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsText(blob)
+  })
+}
+const blobProto = Blob.prototype as unknown as { text?: () => Promise<string> }
+function readBytes(blob: Blob): Promise<Uint8Array> {
+  return new Promise<Uint8Array>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsArrayBuffer(blob)
+  })
+}
+if (typeof blobProto.text !== 'function') blobProto.text = function (this: Blob) { return readBlob(this) }
 
 beforeEach(() => {
   vi.resetAllMocks()
@@ -117,6 +136,9 @@ beforeEach(() => {
     redis: { ok: true, status: 'ok', error: '', ttl_seconds: 1800, check_error: '', last_success: null },
   })
   mocks.probeDetails.mockResolvedValue([])
+  mocks.exportJobs.mockResolvedValue({ blob: new Blob(['\ufeffid,user\n'], { type: 'text/csv' }), hasMore: false })
+  mocks.exportUserData.mockResolvedValue(new Blob(['\ufeffjob_id\n'], { type: 'text/csv' }))
+  mocks.deleteUserData.mockResolvedValue({ deleted_jobs: 0 })
 })
 
 describe('third-party prompt audit panels', () => {
@@ -230,6 +252,61 @@ describe('third-party prompt audit panels', () => {
     await trustTab!.trigger('click')
     await flushPromises()
     expect(mocks.breakerList).toHaveBeenCalled()
+    wrapper.unmount()
+  })
+  it('merges every export page into one CSV with a single header', async () => {
+    const pages = [
+      { blob: new Blob(['\ufeffid,user\n1,a\n'], { type: 'text/csv' }), hasMore: true },
+      { blob: new Blob(['\ufeffid,user\n2,b\n'], { type: 'text/csv' }), hasMore: false },
+    ]
+    mocks.exportJobs.mockImplementation(async (_filter: unknown, _limit: number, offset: number) => pages[offset / 1000] ?? { blob: new Blob(['']), hasMore: false })
+    const written: Blob[] = []
+    Object.assign(URL, { createObjectURL: vi.fn((blob: Blob) => { written.push(blob); return 'blob:audit' }), revokeObjectURL: vi.fn() })
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    const wrapper = mount(AuditRecords, { global: { stubs } })
+    await flushPromises()
+    await wrapper.get('[data-test="export-jobs"]').trigger('click')
+    await flushPromises()
+    // 第一页有后续页时必须再拉一次，并且只保留一份表头与 BOM。
+    await vi.waitFor(() => expect(mocks.exportJobs).toHaveBeenCalledTimes(2))
+    expect(mocks.exportJobs).toHaveBeenLastCalledWith(expect.anything(), 1000, 1000)
+    // Blob.text() 按规范会吃掉页首 BOM，导出文件必须自己补回一个，且表头只能出现一次。
+    const bytes = await readBytes(written[0])
+    expect(Array.from(bytes.slice(0, 3))).toEqual([0xef, 0xbb, 0xbf])
+    const text = new TextDecoder().decode(bytes.slice(3))
+    expect(text).toBe('id,user\n1,a\n2,b\n')
+    expect(text.match(/id,user/g)).toHaveLength(1)
+    click.mockRestore()
+    wrapper.unmount()
+  })
+
+  it('offers per-user export and only deletes audit data after confirmation', async () => {
+    mocks.users.mockResolvedValue([{ id: 3, username: 'alice', email: 'alice@example.invalid', role: 'user', status: 'active', disable_violation_count: 2, disable_reset_at: null, action_pending: false }])
+    mocks.deleteUserData.mockResolvedValue({ deleted_jobs: 4 })
+    Object.assign(URL, { createObjectURL: vi.fn(() => 'blob:user'), revokeObjectURL: vi.fn() })
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    const wrapper = mount(AuditConfigPanel, { global: { stubs } })
+    await flushPromises()
+    const button = (text: string) => wrapper.findAll('button').find(item => item.text() === text)
+    const exportButton = button('exportUserData'), deleteButton = button('deleteUserData')
+    expect(exportButton?.attributes('disabled')).toBeDefined()
+    expect(deleteButton?.attributes('disabled')).toBeDefined()
+    // 页面里还有“用户规则”的用户下拉框，这里定位到计数组件旁边那个 select。
+    const selectElement = exportButton!.element.parentElement?.parentElement?.querySelector('select') ?? null
+    expect(selectElement).toBeTruthy()
+    const userSelect = wrapper.findAll('select').find(item => item.element === selectElement)
+    await userSelect!.setValue('3')
+    await exportButton!.trigger('click')
+    await flushPromises()
+    expect(mocks.exportUserData).toHaveBeenCalledWith(3)
+    await deleteButton!.trigger('click')
+    await flushPromises()
+    expect(mocks.deleteUserData).not.toHaveBeenCalled()
+    await wrapper.get('[data-test="confirm-delete-user"]').trigger('click')
+    await flushPromises()
+    expect(mocks.deleteUserData).toHaveBeenCalledWith(3)
+    expect(mocks.showSuccess).toHaveBeenCalledWith(expect.stringContaining('4'))
+    click.mockRestore()
     wrapper.unmount()
   })
 })
