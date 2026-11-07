@@ -1,5 +1,13 @@
 export default {
   "thirdPartyPromptAudit": {
+    "totalDuration": "Total",
+    "search": "Search",
+    "searchHint": "Hash prefix or text keyword",
+    "legacyPolicyConfirm": "I confirm keeping a policy that still mentions retired stages (auditing still uses target_kind)",
+    "metricsHistory": "Metrics trend (7d)",
+    "metricsHistoryHint": "Hourly snapshots, unaffected by job retention cleanup.",
+    "hour": "Hour",
+    "blocked": "Blocked",
     "queueWait": "Queue wait",
     "templateChurn": "Instruction block churn (7d)",
     "templateChurnHint": "Distinct hashes divided by requests. A ratio near 1 means the client rewrites blocks every turn and needs template rules.",

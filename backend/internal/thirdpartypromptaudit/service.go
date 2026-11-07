@@ -49,9 +49,9 @@ type Service struct {
 	// retention 保存最近一次清理结果，供运行概览展示。
 	retentionMu sync.Mutex
 	retention   *RetentionRecord
-	// blockedTurns 是 Redis 故障时仍能拦住已阻断回合的进程内兜底缓存。
-	blockedMu    sync.Mutex
-	blockedTurns map[string]time.Time
+	// turnStates 是 Redis 故障时使用的进程内回合裁决缓存（30 分钟）。
+	turnMu     sync.Mutex
+	turnStates map[string]cachedTurn
 	// metricsMu/metricsCache 缓存 Prometheus 文本，避免高频抓取压库。
 	metricsMu    sync.Mutex
 	metricsCache string
@@ -247,9 +247,7 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		return result
 	}
 	s.rememberTurn(ctx, turnKey, job.ID, "done", string(completion.Decision))
-	if completion.Decision == DecisionBlock {
-		s.rememberBlockedTurn(turnKey)
-	}
+	s.rememberTurnState(turnKey, string(completion.Decision))
 	result.Kind = gatewayKind(completion.Decision)
 	if result.Kind == IngressDecisionBlock {
 		result.ErrorCode = "third_party_audit_blocked"
@@ -282,9 +280,14 @@ func excludedByScope(snapshot ConfigSnapshot, request IntakeRequest) bool {
 // redisFailure 处理回合键读写失败：async 放行并记运行日志，blocking 沿用不可用语义（决策 11）。
 func (s *Service) redisFailure(mode, code, turnKey string, err error) *IntakeDecision {
 	s.noteError(code, err)
-	// Redis 不可用时用进程内兜底缓存仍然拦住已阻断回合，避免降级放行已判定违规的对话。
-	if s.isBlockedTurn(turnKey) {
+	// Redis 不可用时按进程内缓存沿用真实裁决，避免降级放行已判定违规的对话。
+	switch s.cachedTurnDecision(turnKey) {
+	case string(DecisionBlock):
 		return &IntakeDecision{Mode: mode, Kind: IngressDecisionBlock, ErrorCode: "third_party_audit_blocked", TurnKey: turnKey}
+	case string(DecisionReview):
+		return &IntakeDecision{Mode: mode, Kind: IngressDecisionFlag, TurnKey: turnKey}
+	case string(DecisionPass):
+		return &IntakeDecision{Mode: mode, Kind: IngressDecisionAllow, TurnKey: turnKey}
 	}
 	if mode == "async" {
 		return &IntakeDecision{Mode: mode, Kind: IngressDecisionAllow, ErrorCode: code}
@@ -580,12 +583,25 @@ func (s *Service) tryAcquireSlot() bool {
 
 func (s *Service) releaseSlot() { s.active.Add(-1); s.notify() }
 
-// syncCapacity 是同步审核的并发上限：按 Worker 数放大，避免与后台任务互锁。
+// syncCapacity 是同步审核的并发上限：按启用节点的总并发推导（2 倍），
+// 既不会超过节点真实处理能力，也不会与后台 Worker 互锁。
 func (s *Service) syncCapacity() int64 {
-	if capacity := int64(s.config.WorkerCapacity()) * 4; capacity > 8 {
-		return capacity
+	nodes := 0
+	if snapshot, err := s.config.Active(); err == nil {
+		for _, model := range snapshot.Models {
+			if model.Enabled {
+				nodes += max(model.MaxConcurrency, 1)
+			}
+		}
 	}
-	return 8
+	capacity := int64(nodes * 2)
+	if capacity < 8 {
+		capacity = 8
+	}
+	if capacity > 128 {
+		capacity = 128
+	}
+	return capacity
 }
 
 func (s *Service) tryAcquireSyncSlot() bool {
@@ -748,46 +764,52 @@ func (s *Service) retentionSnapshot() *RetentionRecord {
 	return &copied
 }
 
-// rememberBlockedTurn 在内存里记录已阻断回合，Redis 不可用时作为降级兜底。
-func (s *Service) rememberBlockedTurn(turnKey string) {
+// cachedTurn 是进程内的回合裁决快照。
+type cachedTurn struct {
+	Decision string
+	At       time.Time
+}
+
+// rememberTurnState 在内存里记录回合裁决，Redis 不可用时作为降级兜底。
+func (s *Service) rememberTurnState(turnKey, decision string) {
 	if turnKey == "" {
 		return
 	}
-	s.blockedMu.Lock()
-	defer s.blockedMu.Unlock()
-	if s.blockedTurns == nil {
-		s.blockedTurns = make(map[string]time.Time)
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if s.turnStates == nil {
+		s.turnStates = make(map[string]cachedTurn)
 	}
 	now := time.Now()
-	for key, at := range s.blockedTurns {
-		if now.Sub(at) > turnKeyTTL {
-			delete(s.blockedTurns, key)
+	for key, item := range s.turnStates {
+		if now.Sub(item.At) > turnKeyTTL {
+			delete(s.turnStates, key)
 		}
 	}
-	if len(s.blockedTurns) > 8192 {
-		for key := range s.blockedTurns {
-			delete(s.blockedTurns, key)
-			if len(s.blockedTurns) <= 4096 {
+	if len(s.turnStates) > 8192 {
+		for key := range s.turnStates {
+			delete(s.turnStates, key)
+			if len(s.turnStates) <= 4096 {
 				break
 			}
 		}
 	}
-	s.blockedTurns[turnKey] = now
+	s.turnStates[turnKey] = cachedTurn{Decision: decision, At: now}
 }
 
-// isBlockedTurn 判断回合是否在本地兜底缓存中被标记为阻断。
-func (s *Service) isBlockedTurn(turnKey string) bool {
-	s.blockedMu.Lock()
-	defer s.blockedMu.Unlock()
-	at, ok := s.blockedTurns[turnKey]
+// cachedTurnDecision 读取本地缓存的回合裁决；过期视为未命中。
+func (s *Service) cachedTurnDecision(turnKey string) string {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	item, ok := s.turnStates[turnKey]
 	if !ok {
-		return false
+		return ""
 	}
-	if time.Since(at) > turnKeyTTL {
-		delete(s.blockedTurns, turnKey)
-		return false
+	if time.Since(item.At) > turnKeyTTL {
+		delete(s.turnStates, turnKey)
+		return ""
 	}
-	return true
+	return item.Decision
 }
 
 func (s *Service) notify() {

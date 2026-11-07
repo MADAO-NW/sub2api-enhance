@@ -268,13 +268,15 @@ func (r *Repository) TrustInstructions(ctx context.Context, hashes []string, act
 }
 
 // ListTrust 返回管理员信任的指令块及内容预览。
-func (r *Repository) ListTrust(ctx context.Context, page, size int) (*Page[TrustEntry], error) {
+func (r *Repository) ListTrust(ctx context.Context, query string, page, size int) (*Page[TrustEntry], error) {
 	result := &Page[TrustEntry]{Items: []TrustEntry{}, Page: page, PageSize: size}
-	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM sub2api_enhance.prompt_trust`).Scan(&result.Total); err != nil {
+	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM sub2api_enhance.prompt_trust t JOIN sub2api_enhance.prompt_texts p ON p.hash=t.hash
+ WHERE ($1='' OR t.hash LIKE $1||'%' OR p.text ILIKE '%'||$1||'%')`, query).Scan(&result.Total); err != nil {
 		return nil, err
 	}
 	rows, err := r.db.QueryContext(ctx, `SELECT t.hash,left(p.text,500),p.bytes,t.trusted_by,t.reason,t.created_at
- FROM sub2api_enhance.prompt_trust t JOIN sub2api_enhance.prompt_texts p ON p.hash=t.hash ORDER BY t.created_at DESC,t.hash LIMIT $1 OFFSET $2`, size, (page-1)*size)
+ FROM sub2api_enhance.prompt_trust t JOIN sub2api_enhance.prompt_texts p ON p.hash=t.hash
+ WHERE ($3='' OR t.hash LIKE $3||'%' OR p.text ILIKE '%'||$3||'%') ORDER BY t.created_at DESC,t.hash LIMIT $1 OFFSET $2`, size, (page-1)*size, query)
 	if err != nil {
 		return nil, err
 	}
@@ -357,9 +359,10 @@ func (r *Repository) UntrustInstruction(ctx context.Context, hash string, actorI
 }
 
 // ListBreakers 返回熔断记录；status 为空时返回全部。
-func (r *Repository) ListBreakers(ctx context.Context, status string, page, size int) (*Page[BreakerEntry], error) {
+func (r *Repository) ListBreakers(ctx context.Context, status, query string, page, size int) (*Page[BreakerEntry], error) {
 	result := &Page[BreakerEntry]{Items: []BreakerEntry{}, Page: page, PageSize: size}
-	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM sub2api_enhance.instruction_breakers WHERE ($1='' OR status=$1)`, status).Scan(&result.Total); err != nil {
+	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM sub2api_enhance.instruction_breakers b JOIN sub2api_enhance.prompt_texts p ON p.hash=b.hash
+ WHERE ($1='' OR b.status=$1) AND ($2='' OR b.hash LIKE $2||'%' OR p.text ILIKE '%'||$2||'%')`, status, query).Scan(&result.Total); err != nil {
 		return nil, err
 	}
 	rows, err := r.db.QueryContext(ctx, `SELECT b.hash,COALESCE(left(p.text,500),''),COALESCE(p.bytes,0),b.status,b.distinct_users,b.tripped_at,b.tripped_job_id,b.resolved_by,b.resolved_at,
@@ -368,7 +371,8 @@ func (r *Repository) ListBreakers(ctx context.Context, status string, page, size
    WHERE p.simhash IS NOT NULL AND p2.simhash IS NOT NULL AND b2.hash<>b.hash
    AND bit_count((p2.simhash # p.simhash)::bit(64))<=3),0)
  FROM sub2api_enhance.instruction_breakers b LEFT JOIN sub2api_enhance.prompt_texts p ON p.hash=b.hash
- WHERE ($1='' OR b.status=$1) ORDER BY b.tripped_at DESC,b.hash LIMIT $2 OFFSET $3`, status, size, (page-1)*size)
+ WHERE ($1='' OR b.status=$1) AND ($4='' OR b.hash LIKE $4||'%' OR COALESCE(p.text,'') ILIKE '%'||$4||'%')
+ ORDER BY b.tripped_at DESC,b.hash LIMIT $2 OFFSET $3`, status, size, (page-1)*size, query)
 	if err != nil {
 		return nil, err
 	}

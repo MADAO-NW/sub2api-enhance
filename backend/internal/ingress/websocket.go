@@ -112,11 +112,23 @@ func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *request
 		defer writes.Unlock()
 		_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]string{"type": "enhance_error", "code": code, "message": message}})
 	}
+	// 每连接令牌桶：上限 40，按每秒 20 条回填，防止单连接把审核放大成风暴。
+	const wsBurst, wsRatePerSecond = 40.0, 20.0
+	tokens, lastRefill := wsBurst, time.Now()
 	for {
 		kind, raw, err := client.ReadMessage()
 		if err != nil {
 			return
 		}
+		if elapsed := time.Since(lastRefill).Seconds(); elapsed > 0 {
+			tokens = min(wsBurst, tokens+elapsed*wsRatePerSecond)
+			lastRefill = time.Now()
+		}
+		if tokens < 1 {
+			sendError("rate_limited", "WebSocket 消息过于频繁，请降低频率后重试")
+			continue
+		}
+		tokens--
 		if kind != websocket.TextMessage {
 			sendError("unsupported_input", "Responses WebSocket 仅支持文本业务消息")
 			return

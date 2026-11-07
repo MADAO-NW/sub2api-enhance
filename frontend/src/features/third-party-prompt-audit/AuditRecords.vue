@@ -161,7 +161,7 @@ function downloadPrompt(target: JobPrompt, jobID: number | null) {
 async function exportCSV() {
   exporting.value = true
   try {
-    const blob = await api.exportJobs(applied.value)
+    const { blob } = await api.exportJobs(applied.value, 1000, 0)
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
@@ -289,7 +289,7 @@ onUnmounted(() => {
                 <p v-if="row.disable_counted">{{ label('disableCounted') }}</p>
               </td>
               <td class="p-3"><button class="btn btn-secondary btn-sm whitespace-nowrap" data-test="view-prompt" @click="openPrompts(row.id)">{{ label('viewPrompt') }}</button></td>
-              <td class="whitespace-nowrap p-3">{{ formatMS(row.duration_ms) }}<span v-if="row.blocking_wait_ms !== null" class="mt-1 block text-xs text-gray-500">{{ label('blockingWait') }} {{ formatMS(row.blocking_wait_ms) }}</span></td>
+              <td class="whitespace-nowrap p-3">{{ formatMS(row.processing_ms) }}<span class="mt-1 block text-xs text-gray-500">{{ label('totalDuration') }} {{ formatMS(row.duration_ms) }}</span><span v-if="row.blocking_wait_ms !== null" class="mt-1 block text-xs text-gray-500">{{ label('blockingWait') }} {{ formatMS(row.blocking_wait_ms) }}</span></td>
               <td class="p-3"><button class="btn btn-secondary btn-sm whitespace-nowrap" @click="detailID = row.id">{{ label('detail') }}</button></td>
             </tr>
             <tr v-if="!loading && !rows.length"><td colspan="9" class="p-10 text-center text-gray-500">{{ label('empty') }}</td></tr>

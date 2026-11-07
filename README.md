@@ -66,7 +66,7 @@ sudoedit /etc/sub2api-enhance/sub2api-enhance.env
 | `ENHANCE_ENCRYPTION_KEY` | 独立的 32 字节随机密钥，经 Base64 编码，用于保存审核节点凭据 |
 | `ENHANCE_TRUSTED_PROXIES` | 实际反向代理的地址段；同机 Nginx 可使用 `127.0.0.1/32,::1/128` |
 | `ENHANCE_DB_CONNECTIONS` / `ENHANCE_INGRESS_CONNECTIONS` | 后台与入口连接池大小，示例各为 `8`；额度模块另占最多三条锁连接 |
-| `ENHANCE_READONLY_TOKEN` | 可选。为监控系统提供只读通道 `/enhance/api/v1/admin/third-party-prompt-audit/readonly/{stats,runtime}`，请求头 `X-Enhance-Readonly-Token`，每分钟 60 次；为空时不开放 |
+| `ENHANCE_READONLY_TOKEN` | 可选。为监控系统提供只读通道 `/enhance/api/v1/admin/third-party-prompt-audit/readonly/{stats,runtime,jobs,trust,breakers}` 与 `/enhance/api/v1/metrics`，请求头 `X-Enhance-Readonly-Token`，每分钟 60 次；为空时只读通道关闭，指标仅允许本机抓取 |
 | `ENHANCE_REDIS_URL` | 审计回合键与 `previous_response_id` 映射使用的 Redis 连接。ACL 只需 `~sub2api_enhance:tppa:v1:*` 与 `+get +set`（服务用带 TTL 的 SET 续期，不依赖 `EXPIRE`）；启动时会自检这两个权限，失败原因显示在运行概览。有效期固定 30 分钟 |
 
 可用下面的命令生成加密密钥，将输出填入环境文件并妥善备份；更新版本时保持不变，否则已有审核节点凭据将无法解密：
@@ -220,6 +220,8 @@ v0.3.0 起不再保存请求原文：服务只保存去重后的稳定指令块�
 原版审计不包含批量响应正文，外部批量操作即使 HTTP 200 也只能展示为逐项结果未知；增强自身调用以完整逐项响应为准。自然窗口变化保留为观测证据，不猜测来源。
 
 ## 更新与日常维护
+
+升级到 v0.4.x：会依次执行 `016_prompt_audit_optimize.sql`（相似块指纹与统计索引）与 `017_prompt_audit_metrics.sql`（小时指标快照、失败率通知类型），两者都可重复执行；升级后确认服务正常启动，并在概览页看到“指标趋势”逐小时累积。
 
 升级到 v0.3.0 前先确认两件事：环境文件中的 `ENHANCE_REDIS_URL` 已配置且独立 ACL/逻辑库可连接（缺少或不可达时新进程拒绝启动，`ENHANCE_AUDIT_CACHE_TTL` 已下线，可从环境文件删除）；审计处置动作里没有未完成的执行或通知。v0.3.0 是不兼容版本：迁移 `013` 会删除旧采集表（`captures`）、旧任务与 Outcome 表、批次表和旧 `model_attempts`，并把处置表的来源列改为新任务、提醒窗口游标置 0。
 

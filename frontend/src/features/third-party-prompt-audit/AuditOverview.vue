@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { thirdPartyPromptAuditAPI as api, type AuditFilter, type AuditRuntime, type AuditStats, type ClientChurn } from '@/api/admin/third-party-prompt-audit'
+import { thirdPartyPromptAuditAPI as api, type AuditFilter, type AuditRuntime, type AuditStats, type ClientChurn, type MetricsHour } from '@/api/admin/third-party-prompt-audit'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { formatMS, formatTime, timeRange, toLocalInput } from './viewModel'
 import { useAuditLabels } from './labels'
@@ -15,6 +15,7 @@ const mode = ref('')
 const loading = ref(false), error = ref('')
 const stats = ref<AuditStats | null>(null), runtime = ref<AuditRuntime | null>(null)
 const churn = ref<ClientChurn[]>([])
+const history = ref<MetricsHour[]>([])
 const decisions = computed(() => ['pass', 'review', 'block'])
 const actionStates = computed(() => Object.entries(stats.value?.action_by_state ?? {}))
 
@@ -27,6 +28,8 @@ async function load() {
   if (results[0].status === 'fulfilled') stats.value = results[0].value
   if (results[1].status === 'fulfilled') runtime.value = results[1].value
   if (results[2].status === 'fulfilled') churn.value = results[2].value.items
+  const historyResult = await Promise.allSettled([api.metricsHistory(7)])
+  if (historyResult[0].status === 'fulfilled') history.value = historyResult[0].value.items
   error.value = results.filter(result => result.status === 'rejected').map(result => extractApiErrorMessage(result.reason, label('error'))).join(' · ')
   loading.value = false
 }
@@ -128,6 +131,21 @@ watch(() => props.refreshKey, () => { void refresh() })
         </section>
       </div>
     </template>
+    <section v-if="history.length" class="card space-y-3 p-5" data-test="metrics-history">
+      <h2 class="text-lg font-semibold">{{ label('metricsHistory') }}</h2>
+      <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('metricsHistoryHint') }}</p>
+      <div class="max-h-72 overflow-auto">
+        <table class="w-full text-left text-sm">
+          <thead class="text-gray-500 dark:text-dark-400"><tr><th class="p-2">{{ label('hour') }}</th><th class="p-2">{{ label('jobs') }}</th><th class="p-2">{{ label('blocked') }}</th><th class="p-2">{{ label('failed') }}</th><th class="p-2">{{ label('average') }}</th></tr></thead>
+          <tbody>
+            <tr v-for="item in history.slice(-48).reverse()" :key="item.hour" class="border-t border-gray-100 dark:border-dark-700">
+              <td class="p-2">{{ formatTime(item.hour) }}</td><td class="p-2">{{ item.jobs }}</td><td class="p-2">{{ item.blocked }}</td>
+              <td class="p-2">{{ item.failed }}</td><td class="p-2">{{ formatMS(item.avg_blocking_ms) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
     <section v-if="churn.length" class="card space-y-3 p-5" data-test="template-churn">
       <h2 class="text-lg font-semibold">{{ label('templateChurn') }}</h2>
       <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('templateChurnHint') }}</p>

@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/subtle"
+	"net"
 	"sync"
 	"time"
 
@@ -16,6 +17,19 @@ import (
 	"sub2api-enhance/internal/systemupdate"
 	audit "sub2api-enhance/internal/thirdpartypromptaudit"
 )
+
+// metricsAllowed 限定指标只对携带只读令牌或来自本机的抓取开放。
+func metricsAllowed(c *gin.Context, r *http.Request) bool {
+	if token := c.GetString("readonly_token"); token != "" {
+		return subtle.ConstantTimeCompare([]byte(c.GetHeader("X-Enhance-Readonly-Token")), []byte(token)) == 1
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
 
 // readonlyLimiter 是只读通道的每分钟请求上限，按令牌全局计数。
 const readonlyLimiterLimit = 60
@@ -49,6 +63,9 @@ func readonlyGuard(token string) gin.HandlerFunc {
 func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy, client *sub2api.Client, assets fs.FS, quota *quotafollow.Handler, updates *systemupdate.Handler) (*gin.Engine, error) {
 	r := gin.New()
 	r.Use(gin.Recovery())
+	if c.ReadonlyToken != "" {
+		r.Use(func(ctx *gin.Context) { ctx.Set("readonly_token", c.ReadonlyToken) })
+	}
 	if err := r.SetTrustedProxies(c.TrustedProxies); err != nil {
 		return nil, err
 	}
@@ -102,6 +119,8 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	a.GET("/models/probes/:id", handler.ProbeDetails)
 	a.GET("/users/:id/api-keys", handler.UserKeys)
 	a.GET("/users", handler.ListAuditUsers)
+	a.DELETE("/users/:id/data", handler.DeleteUserData)
+	a.GET("/users/:id/export", handler.ExportUserData)
 	a.GET("/groups", handler.ListGroups)
 	a.GET("/runtime", handler.GetRuntime)
 	a.GET("/stats", handler.GetStats)
@@ -112,6 +131,7 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	a.POST("/reaudits/preview", handler.PreviewReaudits)
 	a.POST("/reaudits", handler.CreateReaudits)
 	a.GET("/templates/churn", handler.TemplateChurn)
+	a.GET("/stats/history", handler.MetricsHistory)
 	a.GET("/trust", handler.ListTrust)
 	a.POST("/trust", handler.TrustInstruction)
 	a.POST("/trust/batch", handler.TrustBatch)
@@ -122,6 +142,10 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	a.POST("/actions/:id/retry", handler.RetryAction)
 	a.POST("/users/:id/enable-and-reset", handler.EnableAndReset)
 	metricsHandler := func(c *gin.Context) {
+		if !metricsAllowed(c, c.Request) {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": "enhance_metrics_denied", "message": "指标接口需要只读令牌或本机访问"})
+			return
+		}
 		c.Header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		c.String(200, handler.PrometheusMetrics(c.Request.Context()))
 	}

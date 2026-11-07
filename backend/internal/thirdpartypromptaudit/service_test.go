@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -44,8 +43,8 @@ func TestTurnLookupWithoutRedisFails(t *testing.T) {
 
 // Redis 故障时本地兜底仍拦得住已阻断回合。
 func TestRedisFailureFallsBackToLocalBlockedTurn(t *testing.T) {
-	service := &Service{metrics: NewRuntimeMetrics(), blockedTurns: map[string]time.Time{}}
-	service.rememberBlockedTurn("turn-1")
+	service := &Service{metrics: NewRuntimeMetrics(), turnStates: map[string]cachedTurn{}}
+	service.rememberTurnState("turn-1", string(DecisionBlock))
 	decision := service.redisFailure("async", "turn_key_unavailable", "turn-1", errors.New("NOPERM"))
 	require.Equal(t, IngressDecisionBlock, decision.Kind)
 	other := service.redisFailure("async", "turn_key_unavailable", "turn-2", errors.New("NOPERM"))

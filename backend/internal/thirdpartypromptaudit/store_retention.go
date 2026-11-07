@@ -78,6 +78,25 @@ type RetentionRecord struct {
 	Error         string    `json:"error"`
 }
 
+// collectHourlyMetrics 每小时写一次指标快照并检查失败率。
+func (s *Service) collectHourlyMetrics() {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(s.ctx), persistenceTimeout)
+	defer cancel()
+	if err := s.repo.SnapshotMetrics(ctx); err != nil {
+		if s.ctx.Err() == nil {
+			s.noteError("metrics_snapshot_failed", err)
+		}
+		return
+	}
+	adminEmail := ""
+	if snapshot, err := s.config.Active(); err == nil {
+		adminEmail = snapshot.AdminEmail
+	}
+	if err := s.repo.CheckFailureRate(ctx, adminEmail); err != nil && s.ctx.Err() == nil {
+		s.noteError("failure_alert_failed", err)
+	}
+}
+
 // runRetention 每小时按最新已应用的保留天数清理一次；保存配置后的下一轮立即使用新值。
 func (s *Service) runRetention() {
 	defer s.wg.Done()
@@ -98,12 +117,14 @@ func (s *Service) runRetention() {
 		if err != nil {
 			record.Error = err.Error()
 			s.recordRetention(record)
+			s.collectHourlyMetrics()
 			if s.ctx.Err() == nil {
 				s.noteError("retention_cleanup_failed", err)
 			}
 			continue
 		}
 		s.recordRetention(record)
+		s.collectHourlyMetrics()
 		logger.LegacyPrintf("third_party_prompt_audit", "审计记录保留期清理完成 retention_days=%d jobs=%d probe_attempts=%d reviews=%d texts=%d",
 			days, result.Jobs, result.ProbeAttempts, result.Reviews, result.Texts)
 	}

@@ -227,10 +227,11 @@ func TestEmptyDatabaseRunsAuditThenSubscriptionMigrations(t *testing.T) {
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	names, contents := embeddedMigrations(t)
-	require.Equal(t, "013_prompt_audit_v3.sql", names[len(names)-4])
-	require.Equal(t, "014_subscription_quota_follow.sql", names[len(names)-3])
-	require.Equal(t, "015_prompt_audit_node_auth.sql", names[len(names)-2])
-	require.Equal(t, "016_prompt_audit_optimize.sql", names[len(names)-1])
+	require.Equal(t, "013_prompt_audit_v3.sql", names[len(names)-5])
+	require.Equal(t, "014_subscription_quota_follow.sql", names[len(names)-4])
+	require.Equal(t, "015_prompt_audit_node_auth.sql", names[len(names)-3])
+	require.Equal(t, "016_prompt_audit_optimize.sql", names[len(names)-2])
+	require.Equal(t, "017_prompt_audit_metrics.sql", names[len(names)-1])
 	expectSchemaReady(mock)
 	for _, name := range names {
 		expectMigrationFile(mock, name, contents[name])
@@ -247,8 +248,8 @@ func TestUpgradeFromV026RunsAuditThenSubscriptionMigrations(t *testing.T) {
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	names, contents := embeddedMigrations(t)
-	applied, pending := names[:len(names)-4], names[len(names)-4:]
-	require.Equal(t, []string{"013_prompt_audit_v3.sql", "014_subscription_quota_follow.sql", "015_prompt_audit_node_auth.sql", "016_prompt_audit_optimize.sql"}, pending)
+	applied, pending := names[:len(names)-5], names[len(names)-5:]
+	require.Equal(t, []string{"013_prompt_audit_v3.sql", "014_subscription_quota_follow.sql", "015_prompt_audit_node_auth.sql", "016_prompt_audit_optimize.sql", "017_prompt_audit_metrics.sql"}, pending)
 	expectSchemaReady(mock)
 	for _, name := range applied {
 		checksum := fmt.Sprintf("%x", sha256.Sum256([]byte(contents[name])))
@@ -270,11 +271,11 @@ func TestPromptAuditV3MigrationFailureRollsBackWholeFile(t *testing.T) {
 	db.SetMaxOpenConns(1)
 	names, contents := embeddedMigrations(t)
 	expectSchemaReady(mock)
-	for _, name := range names[:len(names)-4] {
+	for _, name := range names[:len(names)-5] {
 		checksum := fmt.Sprintf("%x", sha256.Sum256([]byte(contents[name])))
 		mock.ExpectQuery("SELECT checksum FROM sub2api_enhance.schema_migrations WHERE filename=$1").WithArgs(name).WillReturnRows(sqlmock.NewRows([]string{"checksum"}).AddRow(checksum))
 	}
-	last := names[len(names)-4]
+	last := names[len(names)-5]
 	// 前置检查发现未完成处置动作时 RAISE EXCEPTION：整个文件回滚，不登记台账。
 	mock.ExpectQuery("SELECT checksum FROM sub2api_enhance.schema_migrations WHERE filename=$1").WithArgs(last).WillReturnRows(sqlmock.NewRows([]string{"checksum"}))
 	mock.ExpectBegin()

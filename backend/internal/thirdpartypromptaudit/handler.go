@@ -363,7 +363,7 @@ func (h *AdminHandler) ListTrust(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	result, err := h.repo.ListTrust(c.Request.Context(), page, size)
+	result, err := h.repo.ListTrust(c.Request.Context(), c.Query("q"), page, size)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -410,7 +410,7 @@ func (h *AdminHandler) ListBreakers(c *gin.Context) {
 		response.BadRequest(c, "熔断状态筛选无效")
 		return
 	}
-	result, err := h.repo.ListBreakers(c.Request.Context(), status, page, size)
+	result, err := h.repo.ListBreakers(c.Request.Context(), status, c.Query("q"), page, size)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -459,16 +459,31 @@ func (h *AdminHandler) ExportJobs(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	rows, err := h.repo.ExportJobs(c.Request.Context(), filter, exportLimit)
+	limit, err := strconv.Atoi(c.DefaultQuery("limit", "1000"))
+	if err != nil || limit <= 0 || limit > exportLimit {
+		response.BadRequest(c, "limit 必须为 1 至 5000 的整数")
+		return
+	}
+	offset, err := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	if err != nil || offset < 0 {
+		response.BadRequest(c, "offset 必须为非负整数")
+		return
+	}
+	rows, err := h.repo.ExportJobs(c.Request.Context(), filter, limit, offset)
 	if err != nil {
 		respondError(c, err)
 		return
 	}
-	if len(rows) >= exportLimit {
-		c.Header("X-Export-Truncated", "true")
+	if len(rows) == limit {
+		c.Header("X-Export-Has-More", "true")
 	}
+	writeExportCSV(c, rows, "third-party-prompt-audit.csv")
+}
+
+// writeExportCSV 输出 UTF-8 CSV，并对公式注入做转义。
+func writeExportCSV(c *gin.Context, rows []ExportRow, filename string) {
 	c.Header("Content-Type", "text/csv; charset=utf-8")
-	c.Header("Content-Disposition", "attachment; filename=third-party-prompt-audit.csv")
+	c.Header("Content-Disposition", "attachment; filename="+filename)
 	_, _ = c.Writer.WriteString("\ufeff")
 	writer := csv.NewWriter(c.Writer)
 	defer writer.Flush()
@@ -488,6 +503,52 @@ func (h *AdminHandler) ExportJobs(c *gin.Context) {
 			strconv.FormatInt(row.APIKeyID, 10), row.Platform, row.Protocol, row.Mode, row.Status, row.Decision, row.Trigger, row.RequestID,
 			order, kind, row.Resolution, row.TargetDecision, score, row.Reason, strconv.Itoa(row.Bytes), csvSafe(row.Text)})
 	}
+}
+
+// MetricsHistory 返回最近 N 天的小时指标快照。
+func (h *AdminHandler) MetricsHistory(c *gin.Context) {
+	days, err := strconv.Atoi(c.DefaultQuery("days", "7"))
+	if err != nil || days <= 0 || days > 90 {
+		response.BadRequest(c, "days 必须为 1 至 90 的整数")
+		return
+	}
+	items, err := h.repo.MetricsHistory(c.Request.Context(), days)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, gin.H{"items": items})
+}
+
+// DeleteUserData 删除某用户的审计任务（保留处置、信任与熔断记录）。
+func (h *AdminHandler) DeleteUserData(c *gin.Context) {
+	userID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || userID <= 0 {
+		response.BadRequest(c, "用户 ID 无效")
+		return
+	}
+	deleted, err := h.repo.DeleteUserData(c.Request.Context(), userID)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	middleware.SetAuditExtra(c, map[string]any{"result": "success", "user_id": userID, "deleted_jobs": deleted})
+	response.Success(c, gin.H{"deleted_jobs": deleted})
+}
+
+// ExportUserData 导出单个用户的审计任务 CSV。
+func (h *AdminHandler) ExportUserData(c *gin.Context) {
+	userID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || userID <= 0 {
+		response.BadRequest(c, "用户 ID 无效")
+		return
+	}
+	rows, err := h.repo.ExportJobs(c.Request.Context(), Filter{UserID: &userID}, exportLimit, 0)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	writeExportCSV(c, rows, "user-"+strconv.FormatInt(userID, 10)+"-third-party-prompt-audit.csv")
 }
 
 // TemplateChurn 展示近 7 天各客户端指令块的唯一哈希占比，用于决定是否补模板规则。

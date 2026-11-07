@@ -199,6 +199,8 @@ type ConfigUpdate struct {
 	ExpectedRevision int64       `json:"expected_revision" binding:"required,min=1"`
 	Config           Config      `json:"config"`
 	Keys             []KeyUpdate `json:"keys"`
+	// LegacyPolicyConfirmed 表示管理员确认继续使用含已下线阶段名的政策文本。
+	LegacyPolicyConfirmed bool `json:"legacy_policy_confirmed"`
 }
 
 type activeConfig struct {
@@ -405,6 +407,16 @@ func validateConfig(config Config, activating bool) error {
 		}
 	}
 	return nil
+}
+
+// legacyPolicyText 判断政策文本是否仍引用已下线的审核阶段。
+func legacyPolicyText(prompt string) bool {
+	for _, marker := range []string{"audit_stage", "intent_binding", "effective_behavior"} {
+		if strings.Contains(prompt, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // privateNodeHost 判断审核节点是否指向本机或内网地址（含回环与私有网段）。
@@ -730,6 +742,10 @@ func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID in
 			return PublicConfig{}, infraerrors.BadRequest("third_party_audit_self_audit",
 				"审核节点 "+model.Name+" 指向本机或内网地址，可能与业务模型同源；如确认这样使用，请为该节点勾选“允许自审”")
 		}
+	}
+	if legacyPolicyText(input.Config.AuditPrompt) && !input.LegacyPolicyConfirmed {
+		return PublicConfig{}, infraerrors.BadRequest("third_party_audit_legacy_policy",
+			"审核政策仍包含已下线的审核阶段（audit_stage 等），请改用新版默认政策；确需保留请在页面确认后重试")
 	}
 	if err := validateConfig(input.Config, input.Config.Mode != "off"); err != nil {
 		return PublicConfig{}, infraerrors.BadRequest("third_party_audit_invalid_config", err.Error())

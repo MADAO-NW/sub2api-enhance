@@ -13,6 +13,7 @@ const props = withDefaults(defineProps<{ refreshKey?: number; active?: boolean }
 const emit = defineEmits<{ (event: 'changed'): void }>()
 const label = useAuditLabels(), app = useAppStore()
 const status = ref<'tripped' | 'trusted' | 'confirmed' | ''>('tripped')
+const search = ref('')
 const breakers = ref<BreakerEntry[]>([])
 const breakerPage = ref(1), breakerTotal = ref(0)
 const trusted = ref<TrustEntry[]>([])
@@ -34,7 +35,7 @@ async function loadBreakers(silent = false) {
   if (!silent) { loading.value = true; error.value = '' }
   else error.value = ''
   try {
-    const result = await api.breakerList(status.value, breakerPage.value, 20)
+    const result = await api.breakerList(status.value, breakerPage.value, 20, search.value)
     breakers.value = result.items
     breakerTotal.value = result.total
   } catch (err) { if (!silent) error.value = extractApiErrorMessage(err, label('error')) }
@@ -42,7 +43,7 @@ async function loadBreakers(silent = false) {
 }
 async function loadTrust(silent = false) {
   try {
-    const result = await api.trustList(trustPage.value, 20)
+    const result = await api.trustList(trustPage.value, 20, search.value)
     trusted.value = result.items
     trustTotal.value = result.total
   } catch (err) { if (!silent) error.value = extractApiErrorMessage(err, label('error')) }
@@ -62,6 +63,11 @@ async function act(kind: 'trust' | 'confirm' | 'untrust', hash: string) {
 function changeBreakerPage(value: number) { breakerPage.value = value; void loadBreakers() }
 function changeTrustPage(value: number) { trustPage.value = value; void loadTrust() }
 watch(status, () => { breakerPage.value = 1; void loadBreakers() })
+let searchTimer = 0
+watch(search, () => {
+  window.clearTimeout(searchTimer)
+  searchTimer = window.setTimeout(() => { breakerPage.value = 1; trustPage.value = 1; void loadBreakers(); void loadTrust() }, 300)
+})
 watch(() => props.refreshKey, () => { void loadBreakers(); void loadTrust() })
 // 每 5 秒静默刷新熔断与信任列表；页面不可见、正在加载或有待完成操作时跳过。
 const autoTimer = window.setInterval(() => {
@@ -82,6 +88,9 @@ onMounted(() => { void loadBreakers(); void loadTrust() })
           <h2 class="text-lg font-semibold">{{ label('breakerList') }}</h2>
           <p class="mt-1 text-sm text-gray-500 dark:text-dark-400">{{ label('breakerHint') }}</p>
         </div>
+        <label class="flex items-center gap-2 text-sm"><span>{{ label('search') }}</span>
+          <input v-model="search" class="input w-56" :placeholder="label('searchHint')" data-test="breaker-search" />
+        </label>
         <label class="flex items-center gap-2 text-sm"><span>{{ label('status') }}</span>
           <select v-model="status" class="input w-auto">
             <option value="tripped">{{ label('breakerTripped') }}</option>

@@ -12,7 +12,7 @@ import type { AuditJob, BreakerEntry, JobDetail, SavedConfig, TrustEntry } from 
 const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(), saveConfig: vi.fn(), testAdminEmail: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(),
   listModels: vi.fn(), enableAndReset: vi.fn(), probeDetails: vi.fn(), probe: vi.fn(), userKeys: vi.fn(),
-  jobs: vi.fn(), job: vi.fn(), jobPrompts: vi.fn(), templateChurn: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), trustList: vi.fn(), trust: vi.fn(), untrust: vi.fn(),
+  jobs: vi.fn(), job: vi.fn(), jobPrompts: vi.fn(), templateChurn: vi.fn(), metricsHistory: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), trustList: vi.fn(), trust: vi.fn(), untrust: vi.fn(),
   breakerList: vi.fn(), confirmBreaker: vi.fn(), retryAction: vi.fn(), stats: vi.fn(), runtime: vi.fn(),
   showError: vi.fn(), showSuccess: vi.fn(),
 }))
@@ -41,7 +41,7 @@ function job(): AuditJob {
     status: 'done', decision: 'block', current_round: 1, current_run_kind: 'request', current_requested_by: null, reuse_mode: 'allow',
     trigger_hash: 'hash-user', trigger_kind: 'user', enforcement_eligible: true, violation_counted: true, disable_counted: false,
     config_revision: 2, attempts: 1, max_attempts: 3, lease_until: null, next_attempt_at: '2026-09-06T00:00:00Z', failure_stage: '',
-    last_error_code: '', last_error_message: '', blocking_wait_ms: null, duration_ms: 1200, target_count: 2,
+    last_error_code: '', last_error_message: '', blocking_wait_ms: null, duration_ms: 1200, processing_ms: 900, target_count: 2,
     started_at: '2026-09-06T00:00:00Z', finished_at: '2026-09-06T00:00:01Z', created_at: '2026-09-06T00:00:00Z', updated_at: '2026-09-06T00:00:01Z',
   }
 }
@@ -82,6 +82,7 @@ beforeEach(() => {
   mocks.jobs.mockResolvedValue({ items: [job()], total: 1, page: 1, page_size: 20 })
   mocks.job.mockResolvedValue(detail())
   mocks.templateChurn.mockResolvedValue({ items: [{ client: 'generic', jobs: 10, distinct: 4, churn_rate: 0.4 }] })
+  mocks.metricsHistory.mockResolvedValue({ items: [{ hour: '2026-11-06T00:00:00Z', jobs: 5, blocked: 1, failed: 0, avg_blocking_ms: 120 }] })
   mocks.jobPrompts.mockResolvedValue({ targets: [
     { order: 1, kind: 'instruction', hash: 'a'.repeat(64), text: '系统提示词正文', bytes: 12, resolution: 'cache', decision: 'pass', reason: '正常', score: 0.02, trusted: false },
     { order: 2, kind: 'user', hash: 'b'.repeat(64), text: '违规用户提示词', bytes: 20, resolution: 'model', decision: 'block', reason: '违规', score: 0.95, trusted: false },

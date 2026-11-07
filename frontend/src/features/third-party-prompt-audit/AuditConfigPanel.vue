@@ -294,6 +294,9 @@ async function testAdminEmail() {
 // 保存前列出将要变更的字段，避免误改政策或阈值。
 const showDiff = ref(false)
 const pendingChanges = ref<string[]>([])
+// 旧版政策需显式勾选确认，后端才接受保存。
+const legacyConfirmed = ref(false)
+const legacyPolicy = computed(() => !!draft.value && /audit_stage|intent_binding|effective_behavior/.test(draft.value.audit_prompt))
 const diffLabels: Record<string, string> = {
   mode: '运行模式', retention_days: '记录保留天数', audit_prompt: '审核政策', worker_count: 'Worker 数',
   review_threshold: '复核阈值', block_threshold: '阻断阈值', aggregation: '聚合规则', admin_email: '管理员邮箱',
@@ -317,6 +320,7 @@ function save() {
   if (!draft.value || !saved.value) return
   pendingChanges.value = describeDiff()
   if (pendingChanges.value.length === 0) return
+  legacyConfirmed.value = false
   showDiff.value = true
 }
 async function confirmSave() {
@@ -324,7 +328,7 @@ async function confirmSave() {
   if (!draft.value || !saved.value) return
   saving.value = true
   try {
-    const result = await api.saveConfig(configUpdate(draft.value, saved.value.revision, keys))
+    const result = await api.saveConfig(configUpdate(draft.value, saved.value.revision, keys, legacyConfirmed.value))
     saved.value = result
     restore()
     app.showSuccess(label('saved'))
@@ -488,7 +492,8 @@ watch(() => props.refreshKey, () => { void load(true) })
     <BaseDialog :show="showDiff" :title="label('confirmChanges')" :close-on-click-outside="true" @close="showDiff = false">
       <p class="mb-3 text-sm text-gray-500 dark:text-dark-400">{{ label('confirmChangesHint') }}</p>
       <ul class="list-disc space-y-1 pl-5 text-sm"><li v-for="item in pendingChanges" :key="item">{{ item }}</li></ul>
-      <template #footer><div class="flex gap-3"><button class="btn btn-primary" :disabled="saving" @click="confirmSave">{{ label('confirmSave') }}</button><button class="btn btn-secondary" @click="showDiff = false">{{ label('cancelChanges') }}</button></div></template>
+      <label v-if="legacyPolicy" class="mt-3 flex items-start gap-2 text-sm text-amber-800 dark:text-amber-200"><input v-model="legacyConfirmed" type="checkbox" class="mt-1" />{{ label('legacyPolicyConfirm') }}</label>
+      <template #footer><div class="flex gap-3"><button class="btn btn-primary" :disabled="saving || (legacyPolicy && !legacyConfirmed)" @click="confirmSave">{{ label('confirmSave') }}</button><button class="btn btn-secondary" @click="showDiff = false">{{ label('cancelChanges') }}</button></div></template>
     </BaseDialog>
     <BaseDialog :show="attemptDetails !== null" :title="label('probeDetails')" :close-on-click-outside="true" @close="attemptDetails = null">
       <div v-for="attempt in attemptDetails" :key="attempt.id" class="mb-5 space-y-2">

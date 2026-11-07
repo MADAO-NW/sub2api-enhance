@@ -72,6 +72,8 @@ var (
 
 // templateRules 是严格模板规则表。字段清单与长度上限需要用真实样例复核后再调整。
 var templateRules = []templateRule{
+	{Client: ClientClaudeCode, Name: "claude_ide_reminder", Position: positionUserText, Action: templateStripSegment, MaxBytes: 2048,
+		Fields: "整块为单条已知 IDE 提示：The user opened the file … in the IDE. 或 The user selected the lines … from …", match: matchClaudeIDEReminder},
 	{Client: ClientClaudeCode, Name: "claude_billing_header", Position: positionSystemText, Action: templateStripBlock, MaxBytes: 512,
 		Fields: "整块仅一行 `x-anthropic-billing-header: <可打印 ASCII>`", match: wholeMatch(512, billingHeaderPattern.MatchString)},
 	{Client: ClientClaudeCode, Name: "claude_env", Position: positionSystemText, Action: templateStripSegment, MaxBytes: 2048,
@@ -156,7 +158,8 @@ func applyUserTemplates(rules []templateRule, text string, position templatePosi
 		default:
 			continue
 		}
-		spans := rule.match(text)
+		// 每条规则都在当前剩余文本上重新匹配，避免前一条剔除后区间偏移。
+		spans := rule.match(outcome.text)
 		if len(spans) == 0 {
 			continue
 		}
@@ -169,9 +172,11 @@ func applyUserTemplates(rules []templateRule, text string, position templatePosi
 		case templateInstruction:
 			outcome.instruction = true
 			if rule.Name == "claude_md_context" {
-				outcome.text = currentDatePattern.ReplaceAllString(text, "")
+				outcome.text = currentDatePattern.ReplaceAllString(outcome.text, "")
 			}
 			return outcome
+		case templateStripSegment:
+			outcome.text = removeSpans(outcome.text, spans)
 		}
 	}
 	return outcome
@@ -404,4 +409,17 @@ func TemplateRules() []TemplateRuleView {
 		views = append(views, TemplateRuleView{Client: rule.Client, Name: rule.Name, Position: rule.Position, Action: rule.Action, MaxBytes: rule.MaxBytes, Fields: rule.Fields})
 	}
 	return views
+}
+
+// claudeIDEReminderPattern 只匹配 Claude Code 注入的单行 IDE 提示。
+// 位置、句式、单行结构与长度都被约束；内容中夹带其它指令时不匹配，保留审核。
+var claudeIDEReminderPattern = regexp.MustCompile(`^\s*<system-reminder>\n(?:The user opened the file [^\n]{1,512} in the IDE\.(?: This may or may not be related to the current task\.)?|The user selected the lines? [0-9]{1,6}(?: to [0-9]{1,6})? from [^\n]{1,512})\n</system-reminder>`)
+
+// matchClaudeIDEReminder 返回需要剔除的区间；只剔除匹配到的那一段，保留同一文本块里的其它内容。
+func matchClaudeIDEReminder(text string) [][2]int {
+	index := claudeIDEReminderPattern.FindStringIndex(text)
+	if index == nil || index[1]-index[0] > 2048 {
+		return nil
+	}
+	return [][2]int{{index[0], index[1]}}
 }

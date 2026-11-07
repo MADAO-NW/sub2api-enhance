@@ -1,5 +1,13 @@
 export default {
   "thirdPartyPromptAudit": {
+    "totalDuration": "总耗时",
+    "search": "搜索",
+    "searchHint": "哈希前缀或正文关键词",
+    "legacyPolicyConfirm": "我确认继续使用含已下线阶段名的政策文本（仍按 target_kind 审核）",
+    "metricsHistory": "指标趋势（近 7 天）",
+    "metricsHistoryHint": "每小时快照，不受任务保留期清理影响。",
+    "hour": "时间",
+    "blocked": "阻断",
     "queueWait": "排队等待",
     "templateChurn": "指令块变更率（近 7 天）",
     "templateChurnHint": "唯一哈希数 / 请求数。比例接近 1 说明该客户端每轮都在改动指令块，需要补模板规则或按稳定块处理。",

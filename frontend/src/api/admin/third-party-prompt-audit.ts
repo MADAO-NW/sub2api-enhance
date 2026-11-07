@@ -63,7 +63,7 @@ export interface SavedConfig extends AuditConfig {
 }
 
 export interface KeyUpdate { model_id: string; action: 'keep' | 'replace' | 'clear'; api_key?: string }
-export interface ConfigUpdate { expected_revision: number; config: AuditConfig; keys: KeyUpdate[] }
+export interface ConfigUpdate { expected_revision: number; config: AuditConfig; keys: KeyUpdate[]; legacy_policy_confirmed?: boolean }
 
 export interface TemplateRule {
   client: string
@@ -238,6 +238,8 @@ export interface AuditJob {
   blocking_wait_ms: number | null
   // duration_ms 是任务从创建到结束的总耗时，两种模式都有值。
   duration_ms: number
+  // processing_ms 是开始处理到结束的耗时，不含排队。
+  processing_ms: number
   target_count: number
   started_at: string | null
   finished_at: string | null
@@ -267,6 +269,9 @@ export interface JobDetail {
 }
 
 // ClientChurn 是某客户端指令块唯一哈希占比，用于判断是否需要补模板规则。
+// MetricsHour 是每小时指标快照。
+export interface MetricsHour { hour: string; jobs: number; blocked: number; failed: number; avg_blocking_ms: number | null }
+
 export interface ClientChurn { client: string; jobs: number; distinct: number; churn_rate: number }
 
 export interface TrustEntry { hash: string; preview: string; bytes: number; trusted_by: number; reason: string; created_at: string }
@@ -327,6 +332,8 @@ export interface RetentionRecord {
   reviews: number
   texts: number
   duration_ms: number
+  // processing_ms 是开始处理到结束的耗时，不含排队。
+  processing_ms: number
   error: string
 }
 
@@ -420,19 +427,25 @@ export const thirdPartyPromptAuditAPI = {
   async jobPrompts(id: number) { return (await apiClient.get<{ targets: JobPrompt[] }>(`${base}/jobs/${id}/prompts`)).data },
   async preview(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits/preview`, value)).data },
   async reaudit(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits`, value)).data },
-  async trustList(page = 1, pageSize = 20) { return (await apiClient.get<AuditPage<TrustEntry>>(`${base}/trust`, { params: { page, page_size: pageSize } })).data },
+  async trustList(page = 1, pageSize = 20, q = '') { return (await apiClient.get<AuditPage<TrustEntry>>(`${base}/trust`, { params: { page, page_size: pageSize, q } })).data },
   async trust(hash: string, reason = '') { return (await apiClient.post(`${base}/trust`, { hash, reason })).data },
   async untrust(hash: string) { return (await apiClient.delete(`${base}/trust/${hash}`)).data },
+  async metricsHistory(days = 7) { return (await apiClient.get<{ items: MetricsHour[] }>(`${base}/stats/history`, { params: { days } })).data },
+  async deleteUserData(userId: number) { return (await apiClient.delete<{ deleted_jobs: number }>(`${base}/users/${userId}/data`)).data },
+  async exportUserData(userId: number) {
+    const response = await apiClient.get(`${base}/users/${userId}/export`, { responseType: 'blob', headers: { 'X-Enhance-Request': '1' } })
+    return response.data as Blob
+  },
   async templateChurn() { return (await apiClient.get<{ items: ClientChurn[] }>(`${base}/templates/churn`)).data },
-  async breakerList(status = '', page = 1, pageSize = 20) {
-    return (await apiClient.get<AuditPage<BreakerEntry>>(`${base}/breakers`, { params: { status, page, page_size: pageSize } })).data
+  async breakerList(status = '', page = 1, pageSize = 20, q = '') {
+    return (await apiClient.get<AuditPage<BreakerEntry>>(`${base}/breakers`, { params: { status, page, page_size: pageSize, q } })).data
   },
   async confirmBreaker(hash: string) { return (await apiClient.post(`${base}/breakers/${hash}/confirm`)).data },
   async drillBreaker(hash: string) { return (await apiClient.post<DrillResult>(`${base}/breakers/drill`, { hash })).data },
   async trustBatch(hashes: string[], reason = '') { return (await apiClient.post<{ trusted: string[] }>(`${base}/trust/batch`, { hashes, reason })).data },
-  async exportJobs(filter: AuditFilter) {
-    const response = await apiClient.get(`${base}/jobs/export`, { params: { ...filter, ids: filter.ids?.join(',') }, responseType: 'blob', headers: { 'X-Enhance-Request': '1' } })
-    return response.data as Blob
+  async exportJobs(filter: AuditFilter, limit = 1000, offset = 0) {
+    const response = await apiClient.get(`${base}/jobs/export`, { params: { ...filter, ids: filter.ids?.join(','), limit, offset }, responseType: 'blob', headers: { 'X-Enhance-Request': '1' } })
+    return { blob: response.data as Blob, hasMore: response.headers['x-export-has-more'] === 'true' }
   },
   async enableAndReset(id: number) { return (await apiClient.post<{ action_id: number; execution_status: string }>(`${base}/users/${id}/enable-and-reset`)).data },
   async retryAction(id: number) { return (await apiClient.post(`${base}/actions/${id}/retry`)).data }

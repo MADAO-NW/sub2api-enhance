@@ -8,8 +8,8 @@ export function editableConfig(value: SavedConfig): AuditConfig {
 	retention_days: retention_days ?? 30 })) as AuditConfig
 }
 
-export function configUpdate(config: AuditConfig, revision: number, keys: Record<string, KeyUpdate>): ConfigUpdate {
-  return { expected_revision: revision, config, keys: config.models.map(model => {
+export function configUpdate(config: AuditConfig, revision: number, keys: Record<string, KeyUpdate>, legacyConfirmed = false): ConfigUpdate {
+  return { expected_revision: revision, config, legacy_policy_confirmed: legacyConfirmed, keys: config.models.map(model => {
     const key = keys[model.id] ?? { model_id: model.id, action: 'keep' as const }
     return { model_id: model.id, action: key.action, ...(key.action === 'replace' ? { api_key: key.api_key } : {}) }
   }) }

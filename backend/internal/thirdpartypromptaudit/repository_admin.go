@@ -221,6 +221,9 @@ func (r *Repository) JobPrompts(ctx context.Context, id int64) ([]JobPrompt, err
 	return items, nil
 }
 
+// reauditBatchLimit 限制单次批量重审的任务数。
+const reauditBatchLimit = 200
+
 type reauditCandidate struct {
 	ID     int64
 	UserID int64
@@ -282,11 +285,18 @@ func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest,
 	if err != nil {
 		return nil, err
 	}
+	requeued := 0
 	for i := range result.Items {
 		item := &result.Items[i]
 		if item.Status != "ready" {
 			continue
 		}
+		// 单次批量重审设上限，避免一次请求灌满队列；其余条目明确标记跳过。
+		if requeued >= reauditBatchLimit {
+			item.Status, item.Reason = "skipped", "超过单次批量上限，请分批提交"
+			continue
+		}
+		requeued++
 		effective := snapshot
 		effective.Config = effectiveConfigForUser(snapshot.Config, item.userID)
 		encoded, err := json.Marshal(effective)
@@ -367,7 +377,7 @@ type ExportRow struct {
 }
 
 // ExportJobs 按过滤条件导出任务及其当前轮目标，供合规取证。
-func (r *Repository) ExportJobs(ctx context.Context, filter Filter, limit int) ([]ExportRow, error) {
+func (r *Repository) ExportJobs(ctx context.Context, filter Filter, limit, offset int) ([]ExportRow, error) {
 	if err := validateFilter(filter); err != nil {
 		return nil, err
 	}
@@ -379,8 +389,8 @@ func (r *Repository) ExportJobs(ctx context.Context, filter Filter, limit int) (
  LEFT JOIN sub2api_enhance.audit_job_targets t ON t.job_id=j.id AND t.round=j.current_round
  LEFT JOIN sub2api_enhance.prompt_texts p ON p.hash=t.hash
  LEFT JOIN sub2api_enhance.prompt_reviews r ON r.id=t.review_id
- WHERE ` + where + ` ORDER BY j.id DESC,t.target_order LIMIT $` + itoa(pageArg)
-	args = append(args, limit)
+ WHERE ` + where + ` ORDER BY j.id DESC,t.target_order LIMIT $` + itoa(pageArg) + ` OFFSET $` + itoa(pageArg+1)
+	args = append(args, limit, offset)
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -397,6 +407,36 @@ func (r *Repository) ExportJobs(ctx context.Context, filter Filter, limit int) (
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+// DeleteUserData 删除某用户的审计任务与不再被引用的文本/结果，保留处置、信任与熔断记录。
+func (r *Repository) DeleteUserData(ctx context.Context, userID int64) (int64, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	deleted, err := tx.ExecContext(ctx, `DELETE FROM sub2api_enhance.audit_jobs WHERE user_id=$1`, userID)
+	if err != nil {
+		return 0, err
+	}
+	count, _ := deleted.RowsAffected()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sub2api_enhance.prompt_reviews r
+ WHERE NOT EXISTS (SELECT 1 FROM sub2api_enhance.audit_job_targets t WHERE t.review_id=r.id)
+   AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.audit_jobs j JOIN sub2api_enhance.audit_job_targets t ON t.job_id=j.id WHERE t.review_id=r.id)`); err != nil {
+		return count, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sub2api_enhance.prompt_texts p
+ WHERE NOT EXISTS (SELECT 1 FROM sub2api_enhance.audit_job_targets t WHERE t.hash=p.hash)
+   AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.prompt_reviews r WHERE r.hash=p.hash)
+   AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.prompt_trust pt WHERE pt.hash=p.hash)
+   AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.instruction_breakers b WHERE b.hash=p.hash)`); err != nil {
+		return count, err
+	}
+	if err := tx.Commit(); err != nil {
+		return count, err
+	}
+	return count, nil
 }
 
 // jobFilterWhere 供统计与列表共用同一套过滤语义。
