@@ -318,10 +318,15 @@ describe('third-party prompt audit panels', () => {
     expect(mocks.jobPrompts).toHaveBeenCalledWith(7)
     expect(wrapper.text()).toContain('系统提示词正文')
     expect(wrapper.text()).toContain('违规用户提示词')
+    // 用户提示词排在最前：第一张卡片是用户目标，序号仍是真实目标序号。
+    const cards = wrapper.findAll('article')
+    expect(cards[0]!.text()).toContain('违规用户提示词')
+    expect(cards[0]!.text()).toContain('#2')
+    expect(cards[1]!.text()).toContain('系统提示词正文')
     const sample = wrapper.get('[data-test="sample-block"]')
     await sample.trigger('click')
     await flushPromises()
-    expect(mocks.createSample).toHaveBeenCalledWith({ job_id: 7, target_order: 1, expected: 'block' })
+    expect(mocks.createSample).toHaveBeenCalledWith({ job_id: 7, target_order: 2, expected: 'block' })
     // 重置按钮会清空条件并重新拉取列表。
     const reset = wrapper.get('[data-test="reset-filters"]')
     const before = mocks.jobs.mock.calls.length
