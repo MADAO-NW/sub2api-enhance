@@ -359,7 +359,6 @@ export interface AuditRuntime {
   last_error: { code: string; message: string; at: string } | null
   evaluation_latency: Distribution & { capacity: number; from: string | null; to: string | null }
   retention?: RetentionRecord
-  self_audit_nodes: string[]
   probes: ProbeResult[]
   scheduler?: {
     backpressured_total: number

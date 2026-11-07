@@ -32,6 +32,9 @@ const listingModels = ref<string[]>([])
 const resetting = ref(false)
 const testingAdminEmail = ref(false)
 const selectedResetUserID = ref<number | null>(null)
+// 用户数据管理：导出与删除（删除只清理审计数据，保留处置/信任/熔断记录）。
+const confirmDeleteUser = ref<number | null>(null)
+const userDataBusy = ref(false)
 const selectedRuleUserID = ref<number | null>(null)
 const probeInputKind = ref('text')
 const probeProtocol = ref('openai_responses')
@@ -272,6 +275,31 @@ function updateRuleThreshold(rule: UserRuleConfig, field: 'review_threshold' | '
   const value = Number((event.target as HTMLInputElement).value)
   rule[field] = Number.isFinite(value) ? value / 100 : 0
 }
+async function exportUserData() {
+  if (!selectedResetUserID.value) return
+  userDataBusy.value = true
+  try {
+    const blob = await api.exportUserData(selectedResetUserID.value)
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `user-${selectedResetUserID.value}-third-party-prompt-audit.csv`
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { userDataBusy.value = false }
+}
+async function removeUserData() {
+  const userID = confirmDeleteUser.value
+  if (!userID) return
+  userDataBusy.value = true
+  try {
+    const result = await api.deleteUserData(userID)
+    app.showSuccess(`${label('userDataDeleted')}: ${result.deleted_jobs}`)
+    confirmDeleteUser.value = null
+  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { userDataBusy.value = false }
+}
 async function resetCounter() {
   if (!selectedResetUserID.value) return
   resetting.value = true
@@ -481,7 +509,7 @@ watch(() => props.refreshKey, () => { void load(true) })
               </section>
             </div>
           </div>
-          <div class="border-t border-gray-200 pt-5 dark:border-dark-700"><h3 class="font-semibold">{{ label('counterManagement') }}</h3><p class="mb-4 mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('counterManagementHint') }}</p><div class="grid gap-4 md:grid-cols-[minmax(0,1fr)_auto]"><label class="space-y-2"><span class="text-sm">{{ label('user') }}</span><select v-model="selectedResetUserID" class="input"><option :value="null">{{ label('chooseUser') }}</option><option v-for="user in resetUsers" :key="user.id" :value="user.id">{{ user.username }} (#{{ user.id }}) · {{ userStatusLabel(user.status) }} · {{ label('disableViolationCount') }} {{ user.disable_violation_count }}</option></select></label><button type="button" class="btn btn-secondary self-end" :disabled="!selectedResetUserID || resetting || selectedResetUser?.action_pending" @click="resetCounter">{{ label(resetting ? 'loading' : 'enableAndReset') }}</button></div><p v-if="selectedResetUser" class="mt-3 text-xs text-gray-500 dark:text-dark-400">{{ selectedResetUser.email }} · {{ userRoleLabel(selectedResetUser.role) }} · {{ userStatusLabel(selectedResetUser.status) }} · {{ label('disableViolationCount') }} {{ selectedResetUser.disable_violation_count }} · {{ label('lastCounterReset') }} {{ formatTime(selectedResetUser.disable_reset_at) }}<span v-if="selectedResetUser.action_pending"> · {{ label('actionPending') }}</span></p></div>
+          <div class="border-t border-gray-200 pt-5 dark:border-dark-700"><h3 class="font-semibold">{{ label('counterManagement') }}</h3><p class="mb-4 mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('counterManagementHint') }}</p><div class="grid gap-4 md:grid-cols-[minmax(0,1fr)_auto]"><label class="space-y-2"><span class="text-sm">{{ label('user') }}</span><select v-model="selectedResetUserID" class="input"><option :value="null">{{ label('chooseUser') }}</option><option v-for="user in resetUsers" :key="user.id" :value="user.id">{{ user.username }} (#{{ user.id }}) · {{ userStatusLabel(user.status) }} · {{ label('disableViolationCount') }} {{ user.disable_violation_count }}</option></select></label><div class="flex flex-wrap items-end gap-2"><button type="button" class="btn btn-secondary" :disabled="!selectedResetUserID || userDataBusy" @click="exportUserData">{{ label('exportUserData') }}</button><button type="button" class="btn btn-secondary" :disabled="!selectedResetUserID || userDataBusy" @click="confirmDeleteUser = selectedResetUserID">{{ label('deleteUserData') }}</button><button type="button" class="btn btn-secondary" :disabled="!selectedResetUserID || resetting || selectedResetUser?.action_pending" @click="resetCounter">{{ label(resetting ? 'loading' : 'enableAndReset') }}</button></div></div><p v-if="selectedResetUser" class="mt-3 text-xs text-gray-500 dark:text-dark-400">{{ selectedResetUser.email }} · {{ userRoleLabel(selectedResetUser.role) }} · {{ userStatusLabel(selectedResetUser.status) }} · {{ label('disableViolationCount') }} {{ selectedResetUser.disable_violation_count }} · {{ label('lastCounterReset') }} {{ formatTime(selectedResetUser.disable_reset_at) }}<span v-if="selectedResetUser.action_pending"> · {{ label('actionPending') }}</span></p></div>
         </section>
       </fieldset>
       <div class="sticky bottom-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-gray-200 bg-white/95 p-4 shadow-lg backdrop-blur dark:border-dark-600 dark:bg-dark-800/95">
@@ -489,6 +517,11 @@ watch(() => props.refreshKey, () => { void load(true) })
         <div class="flex gap-2"><button type="button" class="btn btn-secondary" :disabled="saving || !dirty" @click="restore">{{ label('reset') }}</button><button type="submit" class="btn btn-primary" :disabled="saving || !dirty" data-test="save-config">{{ label(saving ? 'loading' : 'save') }}</button></div>
       </div>
     </form>
+    <BaseDialog :show="confirmDeleteUser !== null" :title="label('deleteUserData')" :close-on-click-outside="true" @close="confirmDeleteUser = null">
+      <p class="text-sm text-red-700 dark:text-red-300">{{ label('deleteUserDataHint') }}</p>
+      <p class="mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('deleteUserDataKeeps') }}</p>
+      <template #footer><div class="flex gap-3"><button class="btn btn-primary" :disabled="userDataBusy" data-test="confirm-delete-user" @click="removeUserData">{{ label('confirmSave') }}</button><button class="btn btn-secondary" @click="confirmDeleteUser = null">{{ label('cancelChanges') }}</button></div></template>
+    </BaseDialog>
     <BaseDialog :show="showDiff" :title="label('confirmChanges')" :close-on-click-outside="true" @close="showDiff = false">
       <p class="mb-3 text-sm text-gray-500 dark:text-dark-400">{{ label('confirmChangesHint') }}</p>
       <ul class="list-disc space-y-1 pl-5 text-sm"><li v-for="item in pendingChanges" :key="item">{{ item }}</li></ul>

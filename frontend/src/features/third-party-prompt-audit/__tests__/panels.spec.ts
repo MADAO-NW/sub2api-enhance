@@ -112,7 +112,7 @@ beforeEach(() => {
     warning_enabled: true, disable_enabled: true, instance_id: 'i', started_at: '2026-09-06T00:00:00Z', as_of: '2026-09-06T00:00:01Z',
     running: true, mode: 'async', revision: 1, expected_revision: 1, worker_capacity: 4, active_workers: 1, database_ok: true,
     database_error: '', config_error: '', intake_failures: 0, last_success: null, last_error: null,
-    evaluation_latency: { count: 0, capacity: 1000, p50_ms: null, p95_ms: null, from: null, to: null }, probes: [], self_audit_nodes: [],
+    evaluation_latency: { count: 0, capacity: 1000, p50_ms: null, p95_ms: null, from: null, to: null }, probes: [],
     scheduler: { backpressured_total: 0, blocking_waiters: 0, nodes: [] },
     redis: { ok: true, status: 'ok', error: '', ttl_seconds: 1800, check_error: '', last_success: null },
   })

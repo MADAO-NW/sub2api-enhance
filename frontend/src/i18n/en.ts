@@ -1,5 +1,10 @@
 export default {
   "thirdPartyPromptAudit": {
+    "exportUserData": "Export this user data",
+    "deleteUserData": "Delete this user data",
+    "deleteUserDataHint": "Deletes all audit jobs, rounds, targets and model calls of this user. This cannot be undone.",
+    "deleteUserDataKeeps": "Enforcement state, enforcement actions, trust records and breakers are kept (count-once needs them long term).",
+    "userDataDeleted": "Deleted jobs",
     "generic": "Generic client",
     "claude_code": "Claude Code",
     "codex": "Codex CLI",

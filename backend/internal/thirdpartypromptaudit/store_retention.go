@@ -13,6 +13,9 @@ const retentionBatchSize = 500
 // retentionInterval 是保留期清理的执行间隔（决策 24）。
 const retentionInterval = time.Hour
 
+// failureCheckInterval 是指标快照与失败率检查的执行间隔。
+const failureCheckInterval = 5 * time.Minute
+
 // retentionStatements 按依赖顺序清理过期数据。任务删除会级联删除轮次、目标与模型调用，
 // 处置表中的来源外键置空；处置状态、处置动作、信任记录、只计一次记录和熔断记录都不在清理范围内。
 var retentionStatements = []struct {
@@ -97,16 +100,22 @@ func (s *Service) collectHourlyMetrics() {
 	}
 }
 
-// runRetention 每小时按最新已应用的保留天数清理一次；保存配置后的下一轮立即使用新值。
+// runRetention 每小时按保留天数清理一次；失败率与指标快照每 5 分钟检查一次，
+// 让失败率告警的延迟从 1 小时降到分钟级。
 func (s *Service) runRetention() {
 	defer s.wg.Done()
-	ticker := time.NewTicker(retentionInterval)
+	ticker := time.NewTicker(failureCheckInterval)
 	defer ticker.Stop()
+	lastCleanup := time.Now()
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
+		}
+		s.collectHourlyMetrics()
+		if time.Since(lastCleanup) < retentionInterval {
+			continue
 		}
 		days := s.config.RetentionDays()
 		started := time.Now()
@@ -117,14 +126,13 @@ func (s *Service) runRetention() {
 		if err != nil {
 			record.Error = err.Error()
 			s.recordRetention(record)
-			s.collectHourlyMetrics()
 			if s.ctx.Err() == nil {
 				s.noteError("retention_cleanup_failed", err)
 			}
 			continue
 		}
 		s.recordRetention(record)
-		s.collectHourlyMetrics()
+		lastCleanup = time.Now()
 		logger.LegacyPrintf("third_party_prompt_audit", "审计记录保留期清理完成 retention_days=%d jobs=%d probe_attempts=%d reviews=%d texts=%d",
 			days, result.Jobs, result.ProbeAttempts, result.Reviews, result.Texts)
 	}

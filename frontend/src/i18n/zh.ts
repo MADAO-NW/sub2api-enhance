@@ -1,5 +1,10 @@
 export default {
   "thirdPartyPromptAudit": {
+    "exportUserData": "导出该用户审计数据",
+    "deleteUserData": "删除该用户审计数据",
+    "deleteUserDataHint": "将删除该用户的全部审核任务、轮次、目标与模型调用记录，不可恢复。",
+    "deleteUserDataKeeps": "处置状态、处置动作、信任记录与熔断记录会保留（“只计一次”需要长期有效）。",
+    "userDataDeleted": "已删除任务数",
     "generic": "通用客户端",
     "claude_code": "Claude Code",
     "codex": "Codex CLI",
