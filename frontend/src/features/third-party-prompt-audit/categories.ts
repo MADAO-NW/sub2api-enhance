@@ -24,3 +24,10 @@ export function categoryText(code: string): string {
 export function categoryName(code: string): string {
   return categoryNames[code] ?? ''
 }
+
+// categoryOptions 返回政策声明的类别（按编号排序），供列表筛选与规则下拉使用。
+export function categoryOptions(): { code: string; name: string }[] {
+  return Object.entries(categoryNames)
+    .map(([code, name]) => ({ code, name }))
+    .sort((left, right) => left.code.localeCompare(right.code))
+}

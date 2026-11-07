@@ -295,18 +295,17 @@ describe('third-party prompt audit panels', () => {
     wrapper.unmount()
   })
 
-  it('looks up job IDs with a # prefix and categories in R01 form', async () => {
+  it('looks up job IDs with a # prefix and filters by a declared category', async () => {
     const wrapper = mount(AuditRecords, { global: { stubs } })
     await flushPromises()
+    // 类别下拉直接列出政策声明的编号与标题，不再需要手输。
+    const options = wrapper.findAll('[data-test="category-filter"] option').map(option => option.text())
+    expect(options).toContain('R07 恶意使用')
     await wrapper.get('[data-test="request-id"]').setValue('#7')
-    await wrapper.get('[data-test="category-filter"]').setValue('r07')
+    await wrapper.get('[data-test="category-filter"]').setValue('R07')
     await wrapper.get('form').trigger('submit')
     await flushPromises()
     expect(mocks.jobs).toHaveBeenLastCalledWith({ ids: [7], category: 'R07' }, 1, 20)
-    await wrapper.get('[data-test="category-filter"]').setValue('violations')
-    await wrapper.get('form').trigger('submit')
-    await flushPromises()
-    expect(wrapper.text()).toContain('categoryInvalid')
     wrapper.unmount()
   })
 

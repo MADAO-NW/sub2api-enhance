@@ -11,8 +11,8 @@ import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { configUpdate, editableConfig, formatTime, parametersText, parseParameters } from './viewModel'
 import { useAuditLabels } from './labels'
+import { categoryOptions, categoryText, loadCategoryNames } from './categories'
 
-import { categoryName } from './categories'
 const props = withDefaults(defineProps<{ refreshKey?: number; active?: boolean; focusNodeID?: string }>(), { refreshKey: 0, active: true, focusNodeID: '' })
 const label = useAuditLabels()
 const { t } = useI18n()
@@ -88,27 +88,34 @@ const disableWarning = computed(() => {
 const categoryRuleRows = computed(() => Object.entries(draft.value?.category_rules ?? {}).map(([code, disposition]) => ({ code, disposition })))
 function addCategoryRule() {
   if (!draft.value) return
-  let index = 1
-  let code = `R${String(index).padStart(2, '0')}`
-  while (draft.value.category_rules[code]) {
-    index++
-    code = `R${String(index).padStart(2, '0')}`
+  // 优先使用政策已声明且尚未配置的类别；政策没有声明时退回 R01、R02…
+  const rules = draft.value.category_rules
+  const declared = categoryOptions().map(item => item.code)
+  let code = declared.find(item => rules[item] === undefined)
+  if (!code) {
+    let index = 1
+    let fallback = `R${String(index).padStart(2, '0')}`
+    while (rules[fallback]) {
+      index++
+      fallback = `R${String(index).padStart(2, '0')}`
+    }
+    code = fallback
   }
-  draft.value.category_rules[code] = 'notice_only'
+  rules[code] = 'notice_only'
 }
 function updateCategoryCode(oldCode: string, event: Event) {
-  const input = event.target as HTMLInputElement
-  const next = input.value.trim().toUpperCase()
+  const control = event.target as HTMLInputElement | HTMLSelectElement
+  const next = control.value.trim().toUpperCase()
   if (!draft.value) return
   const collision = next !== oldCode && draft.value.category_rules[next] !== undefined
   if (!/^R\d{2}$/.test(next) || collision) {
-    input.value = oldCode
+    control.value = oldCode
     return
   }
   const disposition = draft.value.category_rules[oldCode]
   delete draft.value.category_rules[oldCode]
   draft.value.category_rules[next] = disposition
-  input.value = next
+  control.value = next
 }
 function updateCategoryDisposition(code: string, event: Event) {
   if (!draft.value) return
@@ -373,7 +380,8 @@ async function refreshQuiet() {
 }
 const autoTimer = window.setInterval(() => { void refreshQuiet() }, 5000)
 onUnmounted(() => window.clearInterval(autoTimer))
-onMounted(load)
+// 类别规则的下拉需要政策里的编号与标题；先取一次再加载配置（模块内已缓存）。
+onMounted(() => { void loadCategoryNames(); void load() })
 watch(() => props.refreshKey, () => { void load(true) })
 </script>
 
@@ -492,8 +500,11 @@ watch(() => props.refreshKey, () => { void load(true) })
               <div class="flex items-center justify-between"><h4 class="font-semibold">{{ label('categoryRules') }}</h4><button type="button" class="btn btn-secondary" data-test="add-category-rule" @click="addCategoryRule">{{ label('addCategoryRule') }}</button></div>
               <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('categoryRulesHint') }}</p>
               <div v-for="row in categoryRuleRows" :key="row.code" class="flex flex-wrap items-center gap-3">
-                <input :value="row.code" class="input w-24" maxlength="3" aria-label="R01" @change="updateCategoryCode(row.code, $event)" />
-                <span v-if="categoryName(row.code)" class="text-xs text-gray-500 dark:text-dark-400">{{ categoryName(row.code) }}</span>
+                <select v-if="categoryOptions().length" :value="row.code" class="input w-64" aria-label="R01" @change="updateCategoryCode(row.code, $event)">
+                  <option v-for="item in categoryOptions()" :key="item.code" :value="item.code">{{ categoryText(item.code) }}</option>
+                  <option v-if="!categoryOptions().some(item => item.code === row.code)" :value="row.code">{{ row.code }}</option>
+                </select>
+                <input v-else :value="row.code" class="input w-24" maxlength="3" aria-label="R01" @change="updateCategoryCode(row.code, $event)" />
                 <select :value="row.disposition" class="input w-56" @change="updateCategoryDisposition(row.code, $event)">
                   <option value="immediate_disable">{{ label('dispositionImmediateDisable') }}</option>
                   <option value="notice_only">{{ label('dispositionNoticeOnly') }}</option>

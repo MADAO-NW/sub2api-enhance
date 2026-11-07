@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import Pagination from '@/components/common/Pagination.vue'
@@ -10,7 +10,7 @@ import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import AuditDetail from './AuditDetail.vue'
 import { categoryFilter, categoryList, formatMS, formatTime, jobQueryFilter, toLocalInput } from './viewModel'
-import { categoryText } from './categories'
+import { categoryOptions, categoryText, loadCategoryNames } from './categories'
 import { useAuditLabels } from './labels'
 
 const props = withDefaults(defineProps<{ initialFilter?: AuditFilter; initialJobID?: number | null; refreshKey?: number; active?: boolean }>(), { initialJobID: null, refreshKey: 0, active: true })
@@ -263,6 +263,8 @@ function syncInitialFilter(value: AuditFilter | undefined) {
 watch(() => props.initialFilter, value => { syncInitialFilter(value) }, { immediate: true })
 watch(() => props.initialJobID, value => { if (value) detailID.value = value })
 watch(() => props.refreshKey, () => { void load() })
+// 类别下拉需要政策里的编号与标题；直接打开任务页时也自取一次（模块内已缓存）。
+onMounted(() => { void loadCategoryNames() })
 onUnmounted(() => {
   window.clearTimeout(autoTimer)
   generation++
@@ -274,8 +276,12 @@ onUnmounted(() => {
     <form class="card space-y-4 p-5" @submit.prevent="apply">
       <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <label class="space-y-1 text-sm"><span>{{ label('requestOrJobID') }}</span><input v-model="requestQuery" class="input" :placeholder="label('requestIDHint')" data-test="request-id" /></label>
-        <label class="space-y-1 text-sm"><span>{{ label('category') }}</span><input v-model="categoryQuery" class="input" :placeholder="label('categoryHint')" list="audit-categories" data-test="category-filter" />
-          <datalist id="audit-categories"><option v-for="code in ['R01', 'R02', 'R03', 'R04', 'R05', 'R06', 'R07', 'R08', 'R09', 'R10', 'R11', 'R12', 'R13', 'R14']" :key="code" :value="code" /></datalist>
+        <label class="space-y-1 text-sm"><span>{{ label('category') }}</span>
+          <select v-model="categoryQuery" class="input" data-test="category-filter">
+            <option value="">{{ label('all') }}</option>
+            <option v-for="item in categoryOptions()" :key="item.code" :value="item.code">{{ categoryText(item.code) }}</option>
+            <option v-if="categoryQuery && !categoryOptions().some(item => item.code === categoryQuery)" :value="categoryQuery">{{ categoryQuery }}</option>
+          </select>
         </label>
         <label class="space-y-1 text-sm"><span>{{ label('decision') }}</span><select v-model="filters.decision" class="input"><option value="">{{ label('all') }}</option><option v-for="item in ['pass', 'review', 'block']" :key="item" :value="item">{{ label(item) }}</option></select></label>
         <label class="space-y-1 text-sm"><span>{{ label('status') }}</span><select v-model="filters.status" class="input"><option value="">{{ label('all') }}</option><option v-for="item in states" :key="item" :value="item">{{ label(item) }}</option></select></label>
