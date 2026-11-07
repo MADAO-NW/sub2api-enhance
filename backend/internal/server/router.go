@@ -23,6 +23,10 @@ func metricsAllowed(c *gin.Context, r *http.Request) bool {
 	if token := c.GetString("readonly_token"); token != "" {
 		return subtle.ConstantTimeCompare([]byte(c.GetHeader("X-Enhance-Readonly-Token")), []byte(token)) == 1
 	}
+	// 经反向代理转发时必然带转发头，此时不再按“本机”放行，避免把指标暴露到公网。
+	if r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("X-Real-IP") != "" || r.Header.Get("Forwarded") != "" {
+		return false
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
