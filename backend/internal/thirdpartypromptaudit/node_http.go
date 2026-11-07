@@ -24,13 +24,6 @@ func nodeEndpointURL(raw, endpoint string) (string, error) {
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return "", errors.New("节点地址必须是不含凭据和查询项的 HTTP(S) 地址")
 	}
-	if u.Scheme == "http" {
-		host := u.Hostname()
-		ip := net.ParseIP(host)
-		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-			return "", errors.New("非本机审核节点必须使用 HTTPS，避免审核文本和节点凭据明文传输")
-		}
-	}
 	u.Path = strings.TrimRight(u.Path, "/")
 	// 地址已经以 /v1 结尾时只追加资源路径，并保留 /openai 等前缀。
 	if strings.HasSuffix(u.Path, "/v1") {
