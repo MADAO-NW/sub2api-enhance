@@ -318,11 +318,12 @@ describe('third-party prompt audit panels', () => {
     expect(mocks.jobPrompts).toHaveBeenCalledWith(7)
     expect(wrapper.text()).toContain('系统提示词正文')
     expect(wrapper.text()).toContain('违规用户提示词')
-    // 用户提示词排在最前：第一张卡片是用户目标，序号仍是真实目标序号。
+    // 用户提示词排在最前，卡片序号按显示顺序从 1 重新编号；内部目标序号不变。
     const cards = wrapper.findAll('article')
     expect(cards[0]!.text()).toContain('违规用户提示词')
-    expect(cards[0]!.text()).toContain('#2')
+    expect(cards[0]!.text()).toContain('#1')
     expect(cards[1]!.text()).toContain('系统提示词正文')
+    expect(cards[1]!.text()).toContain('#2')
     const sample = wrapper.get('[data-test="sample-block"]')
     await sample.trigger('click')
     await flushPromises()

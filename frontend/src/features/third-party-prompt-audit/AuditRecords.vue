@@ -33,7 +33,7 @@ const promptLoading = ref(false), sampling = ref('')
 // 正文按任务缓存，重复打开同一行不再请求。
 const promptCache = new Map<number, JobPrompt[]>()
 // orderedPromptTargets 把用户提示词排在最前：它是本次请求的实际输入，打开弹窗时优先核对；
-// 其余目标保持后端下发的顺序（指令块按目标序号），卡片上的序号仍是真实目标序号。
+// 其余目标保持后端下发的顺序（指令块按目标序号）；卡片序号按显示顺序从 1 重新编号。
 const orderedPromptTargets = computed(() => [...promptTargets.value].sort((a, b) => Number(b.kind === 'user') - Number(a.kind === 'user')))
 // 快捷筛选：裁决与失败状态一键过滤。
 const quickFilters = [
@@ -351,9 +351,9 @@ onUnmounted(() => {
       <p v-if="promptLoading" role="status">{{ label('loading') }}</p>
       <div v-else class="space-y-4">
         <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('currentPromptHint') }}</p>
-        <article v-for="target in orderedPromptTargets" :key="target.order" class="space-y-2 rounded-xl bg-gray-50 p-4 dark:bg-dark-900">
+        <article v-for="(target, index) in orderedPromptTargets" :key="target.order" class="space-y-2 rounded-xl bg-gray-50 p-4 dark:bg-dark-900">
           <div class="flex flex-wrap items-center gap-3 text-sm">
-            <strong>#{{ target.order }} · {{ label(target.kind) }}</strong>
+            <strong>#{{ index + 1 }} · {{ label(target.kind) }}</strong>
             <span>{{ target.bytes }} B</span>
             <span v-if="target.resolution">{{ label('resolution') }}: {{ label('resolution_' + target.resolution) }}</span>
             <span v-if="target.decision">{{ label(target.decision) }}<template v-if="target.score !== null"> · {{ target.score }}</template></span>
