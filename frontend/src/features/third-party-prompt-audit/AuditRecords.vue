@@ -11,7 +11,7 @@ import AuditDetail from './AuditDetail.vue'
 import { formatMS, formatTime, toLocalInput } from './viewModel'
 import { useAuditLabels } from './labels'
 
-const props = withDefaults(defineProps<{ initialFilter?: AuditFilter; refreshKey?: number }>(), { refreshKey: 0 })
+const props = withDefaults(defineProps<{ initialFilter?: AuditFilter; refreshKey?: number; active?: boolean }>(), { refreshKey: 0, active: true })
 const emit = defineEmits<{ (event: 'reaudit-created', ids: number[]): void }>()
 const label = useAuditLabels(), app = useAppStore()
 const filters = reactive<AuditFilter>({}), applied = ref<AuditFilter>({})
@@ -30,7 +30,7 @@ const promptLoading = ref(false)
 let generation = 0
 // 列表每 5 秒静默刷新一次；打开弹窗或正在加载时跳过，避免打断操作。
 const autoTimer = window.setInterval(() => {
-  if (document.visibilityState !== 'visible') return
+  if (!props.active || document.visibilityState !== 'visible') return
   if (loading.value || detailID.value !== null || promptJobID.value !== null || previewRequest.value !== null) return
   void load(true)
 }, 5000)
@@ -159,7 +159,7 @@ onUnmounted(() => {
       </div>
       <div class="flex flex-wrap gap-3">
         <button class="btn btn-primary" :disabled="loading">{{ label(loading ? 'loading' : 'apply') }}</button>
-        <button type="button" class="btn btn-secondary" :disabled="loading" data-test="reset-filters" @click="resetFilters">{{ label('reset') }}</button>
+        <button type="button" class="btn btn-secondary" :disabled="loading" data-test="reset-filters" @click="resetFilters">{{ label('resetFilters') }}</button>
         <button type="button" class="btn btn-secondary" :disabled="loading || !selected.length" @click="openPreview(true)">{{ label('reauditSelected') }} ({{ selected.length }})</button>
         <button type="button" class="btn btn-secondary" :disabled="loading || !total" @click="openPreview(false)">{{ label('reauditFilter') }} ({{ total }})</button>
       </div>

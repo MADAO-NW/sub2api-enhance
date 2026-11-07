@@ -9,7 +9,7 @@ import { extractApiErrorMessage } from '@/utils/apiError'
 import { formatTime } from './viewModel'
 import { useAuditLabels } from './labels'
 
-const props = withDefaults(defineProps<{ refreshKey?: number }>(), { refreshKey: 0 })
+const props = withDefaults(defineProps<{ refreshKey?: number; active?: boolean }>(), { refreshKey: 0, active: true })
 const emit = defineEmits<{ (event: 'changed'): void }>()
 const label = useAuditLabels(), app = useAppStore()
 const status = ref<'tripped' | 'trusted' | 'confirmed' | ''>('tripped')
@@ -54,7 +54,7 @@ watch(status, () => { breakerPage.value = 1; void loadBreakers() })
 watch(() => props.refreshKey, () => { void loadBreakers(); void loadTrust() })
 // 每 5 秒静默刷新熔断与信任列表；页面不可见、正在加载或有待完成操作时跳过。
 const autoTimer = window.setInterval(() => {
-  if (document.visibilityState !== 'visible' || loading.value || pending.value) return
+  if (!props.active || document.visibilityState !== 'visible' || loading.value || pending.value) return
   void loadBreakers(true)
   void loadTrust(true)
 }, 5000)

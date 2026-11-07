@@ -9,7 +9,7 @@ import { extractApiErrorMessage } from '@/utils/apiError'
 import { configUpdate, editableConfig, formatTime } from './viewModel'
 import { useAuditLabels } from './labels'
 
-const props = withDefaults(defineProps<{ refreshKey?: number }>(), { refreshKey: 0 })
+const props = withDefaults(defineProps<{ refreshKey?: number; active?: boolean }>(), { refreshKey: 0, active: true })
 const label = useAuditLabels()
 const app = useAppStore()
 const saved = ref<SavedConfig | null>(null)
@@ -315,7 +315,7 @@ async function probe(model: AuditModel) {
 }
 // 每 5 秒同步一次服务端配置；正在编辑或有未保存修改时跳过，避免覆盖草稿。
 async function refreshQuiet() {
-  if (dirty.value || saving.value || loading.value || document.visibilityState !== 'visible') return
+  if (!props.active || dirty.value || saving.value || loading.value || document.visibilityState !== 'visible') return
   try {
     const [configResult, contractResult] = await Promise.all([api.getConfig(), api.getContract()])
     saved.value = configResult

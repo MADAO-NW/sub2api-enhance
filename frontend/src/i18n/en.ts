@@ -1,5 +1,6 @@
 export default {
   "thirdPartyPromptAudit": {
+    "resetFilters": "Reset",
     "currentPrompt": "Audited prompts",
     "viewPrompt": "View prompts",
     "currentPromptHint": "Text sent to the audit model in the current round: stable instruction blocks and the current-turn user prompt are audited independently.",

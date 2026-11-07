@@ -6,7 +6,7 @@ import { formatMS, formatTime, timeRange, toLocalInput } from './viewModel'
 import { useAuditLabels } from './labels'
 
 const emit = defineEmits<{ (event: 'inspect-jobs', filter: AuditFilter): void }>()
-const props = withDefaults(defineProps<{ refreshKey?: number }>(), { refreshKey: 0 })
+const props = withDefaults(defineProps<{ refreshKey?: number; active?: boolean }>(), { refreshKey: 0, active: true })
 const label = useAuditLabels()
 const from = ref(toLocalInput(new Date(Date.now() - 86400000)))
 const to = ref(toLocalInput(new Date()))
@@ -34,7 +34,7 @@ async function refresh() {
 }
 // 每 5 秒按当前时间范围静默刷新；页面不可见或正在加载时跳过。
 const autoTimer = window.setInterval(() => {
-  if (document.visibilityState !== 'visible' || loading.value) return
+  if (!props.active || document.visibilityState !== 'visible' || loading.value) return
   void load()
 }, 5000)
 onUnmounted(() => window.clearInterval(autoTimer))

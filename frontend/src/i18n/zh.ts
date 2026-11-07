@@ -1,5 +1,6 @@
 export default {
   "thirdPartyPromptAudit": {
+    "resetFilters": "重置",
     "currentPrompt": "当前审核的提示词",
     "viewPrompt": "查看提示词",
     "currentPromptHint": "该任务当前轮实际送审的正文：稳定指令块与当前回合用户提示词分别独立审核。",

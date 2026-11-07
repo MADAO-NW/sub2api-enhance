@@ -71,10 +71,10 @@ onUnmounted(() => { disposed = true })
           :class="active === tab ? 'bg-primary-600 text-white' : 'bg-white text-gray-600 hover:bg-primary-50 dark:bg-dark-800 dark:text-dark-300'"
           :aria-current="active === tab ? 'page' : undefined" @click="select(tab)">{{ label(tab === 'trust' ? 'trustTab' : tab) }}</button>
       </nav>
-      <AuditOverview v-show="active === 'overview'" :refresh-key="tabRefresh.overview + refreshKey" @inspect-jobs="inspectJobs" />
-      <AuditRecords v-if="visited.includes('jobs')" v-show="active === 'jobs'" :initial-filter="jobFilter" :refresh-key="tabRefresh.jobs + refreshKey" @reaudit-created="trackReaudits" />
-      <TrustPanel v-if="visited.includes('trust')" v-show="active === 'trust'" :refresh-key="tabRefresh.trust + refreshKey" @changed="refreshAll" />
-      <AuditConfigPanel v-if="visited.includes('config')" v-show="active === 'config'" :refresh-key="tabRefresh.config" />
+      <AuditOverview v-show="active === 'overview'" :active="active === 'overview'" :refresh-key="tabRefresh.overview + refreshKey" @inspect-jobs="inspectJobs" />
+      <AuditRecords v-if="visited.includes('jobs')" v-show="active === 'jobs'" :initial-filter="jobFilter" :active="active === 'jobs'" :refresh-key="tabRefresh.jobs + refreshKey" @reaudit-created="trackReaudits" />
+      <TrustPanel v-if="visited.includes('trust')" v-show="active === 'trust'" :active="active === 'trust'" :refresh-key="tabRefresh.trust + refreshKey" @changed="refreshAll" />
+      <AuditConfigPanel v-if="visited.includes('config')" v-show="active === 'config'" :active="active === 'config'" :refresh-key="tabRefresh.config" />
     </div>
   </main>
 </template>
