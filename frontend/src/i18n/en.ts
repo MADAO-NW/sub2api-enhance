@@ -59,6 +59,7 @@ export default {
     "targetsHint": "Instruction blocks and the current-turn user prompt are audited independently; the job takes the most severe decision.",
     "instruction": "Instruction",
     "user": "User prompt",
+    "userColumn": "User",
     "auditedText": "Audited text",
     "resolution": "Resolution",
     "cache": "Global cache",

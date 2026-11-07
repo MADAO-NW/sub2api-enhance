@@ -3,6 +3,7 @@ package thirdpartypromptaudit
 import (
 	"context"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -219,7 +220,7 @@ func TestRetentionKeepsEnforcementMarksBreakersAndTrust(t *testing.T) {
 	mock.ExpectExec(`DELETE FROM sub2api_enhance.audit_jobs`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, retentionBatchSize))
 	mock.ExpectExec(`DELETE FROM sub2api_enhance.audit_jobs`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 3))
 	mock.ExpectExec(`DELETE FROM sub2api_enhance.model_attempts`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(`row_number\(\) OVER \(PARTITION BY r.hash,r.eval_hash`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`row_number\(\) OVER \(PARTITION BY r.hash,r.eval_hash`).WithArgs(retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`DELETE FROM sub2api_enhance.prompt_reviews WHERE id IN \(SELECT r.id`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectExec(`DELETE FROM sub2api_enhance.prompt_texts`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 4))
 	mock.ExpectExec(`DELETE FROM sub2api_enhance.policy_replays`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 2))
@@ -227,6 +228,23 @@ func TestRetentionKeepsEnforcementMarksBreakersAndTrust(t *testing.T) {
 	result, err := repo.RunRetention(context.Background(), 30)
 	require.Equal(t, RetentionResult{Jobs: retentionBatchSize + 3, ProbeAttempts: 1, ReviewDuplicates: 1, Reviews: 2, Texts: 4, Replays: 2}, result)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestRetentionStatementArgsMatchPlaceholders 校验每条清理语句引用的占位符数量与传入参数数量一致，
+// 避免多传未引用参数导致 PostgreSQL 无法推断参数类型。
+func TestRetentionStatementArgsMatchPlaceholders(t *testing.T) {
+	placeholder := regexp.MustCompile(`\$(\d+)`)
+	for _, statement := range retentionStatements {
+		largest := 0
+		for _, match := range placeholder.FindAllStringSubmatch(statement.query, -1) {
+			number, err := strconv.Atoi(match[1])
+			require.NoError(t, err, statement.name)
+			if number > largest {
+				largest = number
+			}
+		}
+		require.Equal(t, largest, len(statement.args(30)), statement.name)
+	}
 }
 
 func TestUntrustRestoresBreakerToTripped(t *testing.T) {

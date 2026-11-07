@@ -307,6 +307,7 @@ const diffLabels: Record<string, string> = {
   review_threshold: '复核阈值', block_threshold: '阻断阈值', aggregation: '聚合规则', admin_email: '管理员邮箱',
   platforms: '平台范围', all_groups: '全部分组', group_ids: '分组', excluded_user_ids: '不审核用户',
   models: '审核节点', user_rules: '用户规则', warning: '提醒规则', disable: '停用规则',
+  category_rules: '违规类别处置', escalate_on_warning: '提醒触发时自动加严',
 }
 function describeDiff(): string[] {
   if (!draft.value || !saved.value) return []
@@ -501,7 +502,7 @@ watch(() => props.refreshKey, () => { void load(true) })
           </div><div class="flex flex-wrap items-end gap-3"><label class="min-w-72 flex-1 space-y-2"><span class="text-sm">{{ label('adminEmail') }}</span><input v-model="draft.admin_email" class="input" type="email" /><span class="block text-xs text-gray-500 dark:text-dark-400">{{ label('adminEmailHint') }}</span></label><button type="button" class="btn btn-secondary self-end" data-test="test-admin-email" :disabled="saving || loading || testingAdminEmail || !saved.admin_email || draft.admin_email !== saved.admin_email" @click="testAdminEmail">{{ label(testingAdminEmail ? 'loading' : 'testAdminEmail') }}</button></div><p class="text-xs text-gray-500 dark:text-dark-400">{{ label('testAdminEmailHint') }}</p>
           <div class="border-t border-gray-200 pt-5 dark:border-dark-700">
             <h3 class="font-semibold">{{ label('userRules') }}</h3><p class="mb-4 mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('userRulesHint') }}</p>
-            <div class="flex flex-wrap items-end gap-3"><label class="min-w-72 flex-1 space-y-2"><span class="text-sm">{{ label('user') }}</span><select v-model="selectedRuleUserID" class="input"><option :value="null">{{ label('chooseRuleUser') }}</option><option v-for="user in ruleUsers" :key="user.id" :value="user.id">{{ user.username }} (#{{ user.id }}) · {{ user.email }} · {{ userRoleLabel(user.role) }}</option></select></label><button type="button" class="btn btn-secondary" :disabled="!selectedRuleUserID" @click="addUserRule">{{ label('addUserRule') }}</button></div>
+            <div class="flex flex-wrap items-end gap-3"><label class="min-w-72 flex-1 space-y-2"><span class="text-sm">{{ label('userColumn') }}</span><select v-model="selectedRuleUserID" class="input"><option :value="null">{{ label('chooseRuleUser') }}</option><option v-for="user in ruleUsers" :key="user.id" :value="user.id">{{ user.username }} (#{{ user.id }}) · {{ user.email }} · {{ userRoleLabel(user.role) }}</option></select></label><button type="button" class="btn btn-secondary" :disabled="!selectedRuleUserID" @click="addUserRule">{{ label('addUserRule') }}</button></div>
             <div class="mt-4 space-y-4">
               <section v-for="rule in draft.user_rules" :key="rule.user_id" class="rounded-xl border border-gray-200 p-4 dark:border-dark-600">
                 <div class="flex flex-wrap items-start justify-between gap-3"><div><strong>{{ auditUser(rule.user_id)?.username || `#${rule.user_id}` }} (#{{ rule.user_id }})</strong><p class="text-xs text-gray-500">{{ auditUser(rule.user_id)?.email }} · {{ userRoleLabel(auditUser(rule.user_id)?.role || '') }}</p></div><button type="button" class="btn btn-ghost text-red-600" @click="removeUserRule(rule.user_id)">{{ label('removeUserRule') }}</button></div>

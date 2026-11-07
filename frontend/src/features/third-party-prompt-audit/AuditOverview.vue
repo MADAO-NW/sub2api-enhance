@@ -180,7 +180,7 @@ watch(() => props.refreshKey, () => { void refresh() })
         </div>
         <table class="w-full text-left text-sm">
           <thead class="text-gray-500 dark:text-dark-400"><tr>
-            <th class="p-2">{{ label('user') }}</th><th class="p-2">{{ label('jobs') }}</th><th class="p-2">{{ label('blocks') }}</th>
+            <th class="p-2">{{ label('userColumn') }}</th><th class="p-2">{{ label('jobs') }}</th><th class="p-2">{{ label('blocks') }}</th>
             <th class="p-2">{{ label('violations') }}</th><th class="p-2">{{ label('category') }}</th>
           </tr></thead>
           <tbody>

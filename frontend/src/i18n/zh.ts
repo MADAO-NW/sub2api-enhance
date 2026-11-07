@@ -59,6 +59,7 @@ export default {
     "targetsHint": "指令块与当前回合用户提示词分别独立审核，结论取最严重的一项。",
     "instruction": "指令块",
     "user": "用户提示词",
+    "userColumn": "用户",
     "auditedText": "待审正文",
     "resolution": "结论来源",
     "cache": "全库缓存",

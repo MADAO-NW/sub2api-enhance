@@ -16,24 +16,30 @@ const retentionInterval = time.Hour
 // failureCheckInterval 是指标快照与失败率检查的执行间隔。
 const failureCheckInterval = 5 * time.Minute
 
+// retentionStatement 是一条分批清理语句；usesDays 表示语句里使用了保留天数参数。
+// 每条语句必须只接收它真正引用的参数，否则 PostgreSQL 无法推断多余参数的类型。
+type retentionStatement struct {
+	name     string
+	query    string
+	usesDays bool
+}
+
 // retentionStatements 按依赖顺序清理过期数据。任务删除会级联删除轮次、目标与模型调用，
-// 处置表中的来源外键置空；处置状态、处置动作、信任记录、只计一次记录和熔断记录都不在清理范围内。
-var retentionStatements = []struct {
-	name  string
-	query string
-}{
+// 处置表中的来源外键置空；处置状态、处置动作、信任记录、只计一次记录、熔断记录与
+// 被误判样本引用的文本都不在清理范围内。
+var retentionStatements = []retentionStatement{
 	{"jobs", `DELETE FROM sub2api_enhance.audit_jobs WHERE id IN (SELECT id FROM sub2api_enhance.audit_jobs
- WHERE created_at<clock_timestamp()-make_interval(days=>$1) AND status NOT IN ('queued','processing','retry') ORDER BY id LIMIT $2)`},
+ WHERE created_at<clock_timestamp()-make_interval(days=>$1) AND status NOT IN ('queued','processing','retry') ORDER BY id LIMIT $2)`, true},
 	{"probe_attempts", `DELETE FROM sub2api_enhance.model_attempts WHERE id IN (SELECT id FROM sub2api_enhance.model_attempts
- WHERE job_id IS NULL AND created_at<clock_timestamp()-make_interval(days=>$1) ORDER BY id LIMIT $2)`},
+ WHERE job_id IS NULL AND created_at<clock_timestamp()-make_interval(days=>$1) ORDER BY id LIMIT $2)`, true},
 	{"review_duplicates", `DELETE FROM sub2api_enhance.prompt_reviews WHERE id IN (
  SELECT id FROM (SELECT r.id, row_number() OVER (PARTITION BY r.hash,r.eval_hash ORDER BY r.created_at DESC,r.id DESC) AS rn
   FROM sub2api_enhance.prompt_reviews r
   WHERE NOT EXISTS (SELECT 1 FROM sub2api_enhance.audit_job_targets t WHERE t.review_id=r.id)) ranked
- WHERE ranked.rn>5 LIMIT $2)`},
+ WHERE ranked.rn>5 LIMIT $1)`, false},
 	{"reviews", `DELETE FROM sub2api_enhance.prompt_reviews WHERE id IN (SELECT r.id FROM sub2api_enhance.prompt_reviews r
  WHERE r.created_at<clock_timestamp()-make_interval(days=>$1)
- AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.audit_job_targets t WHERE t.review_id=r.id) ORDER BY r.id LIMIT $2)`},
+ AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.audit_job_targets t WHERE t.review_id=r.id) ORDER BY r.id LIMIT $2)`, true},
 	{"texts", `DELETE FROM sub2api_enhance.prompt_texts WHERE hash IN (SELECT p.hash FROM sub2api_enhance.prompt_texts p
 WHERE p.first_seen_at<clock_timestamp()-make_interval(days=>$1)
  AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.audit_job_targets t WHERE t.hash=p.hash)
@@ -41,9 +47,17 @@ WHERE p.first_seen_at<clock_timestamp()-make_interval(days=>$1)
  AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.prompt_trust pt WHERE pt.hash=p.hash)
  AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.instruction_breakers b WHERE b.hash=p.hash)
  AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.policy_samples s WHERE s.hash=p.hash)
- ORDER BY p.hash LIMIT $2)`},
+ ORDER BY p.hash LIMIT $2)`, true},
 	{"replays", `DELETE FROM sub2api_enhance.policy_replays WHERE id IN (SELECT id FROM sub2api_enhance.policy_replays
- WHERE created_at<clock_timestamp()-make_interval(days=>$1) AND status<>'running' ORDER BY id LIMIT $2)`},
+ WHERE created_at<clock_timestamp()-make_interval(days=>$1) AND status<>'running' ORDER BY id LIMIT $2)`, true},
+}
+
+// args 返回该语句实际需要的参数，避免传入未被引用的参数。
+func (s retentionStatement) args(days int) []any {
+	if s.usesDays {
+		return []any{days, retentionBatchSize}
+	}
+	return []any{retentionBatchSize}
 }
 
 // RunRetention 按保留天数分批清理过期审计记录，每批独立提交；ctx 取消时停止。
@@ -55,7 +69,7 @@ func (r *Repository) RunRetention(ctx context.Context, days int) (RetentionResul
 			if err := ctx.Err(); err != nil {
 				return result, err
 			}
-			deleted, err := r.db.ExecContext(ctx, statement.query, days, retentionBatchSize)
+			deleted, err := r.db.ExecContext(ctx, statement.query, statement.args(days)...)
 			if err != nil {
 				return result, err
 			}
