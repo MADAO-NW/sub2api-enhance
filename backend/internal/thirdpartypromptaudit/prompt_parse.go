@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -58,38 +57,8 @@ func (p *ParsedRequest) Targets() []PromptText {
 }
 
 func newPromptText(kind, text string) PromptText {
-	// 入库与送审前统一掩码高置信密钥形态：既不落库，也不发给第三方审核模型。
-	text = maskSecrets(text)
 	digest := sha256.Sum256([]byte(kind + "\x00" + text))
 	return PromptText{Kind: kind, Text: text, Hash: hex.EncodeToString(digest[:])}
-}
-
-// secretPatterns 覆盖常见凭据形态；只替换密钥本体，保留可读上下文。
-var secretPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`sk-[A-Za-z0-9_-]{16,}`),
-	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
-	regexp.MustCompile(`eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`),
-	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._-]{16,}`),
-	regexp.MustCompile(`(?i)(postgres(?:ql)?|mysql|redis|mongodb)://[^\s"']{8,}`),
-	regexp.MustCompile(`(?i)password\s*[=:]\s*[^\s"',]{6,}`),
-}
-
-// maskSecrets 把疑似凭据替换为固定占位符，长度信息通过占位符数量体现。
-func maskSecrets(text string) string {
-	for _, pattern := range secretPatterns {
-		text = pattern.ReplaceAllStringFunc(text, func(match string) string {
-			if strings.Contains(strings.ToLower(match), "://") {
-				if index := strings.Index(match, "://"); index >= 0 {
-					return match[:index+3] + "[REDACTED]"
-				}
-			}
-			if index := strings.IndexAny(match, "=:"); index >= 0 && strings.HasPrefix(strings.ToLower(match), "password") {
-				return match[:index+1] + " [REDACTED]"
-			}
-			return "[REDACTED]"
-		})
-	}
-	return text
 }
 
 // normalizePromptText 统一换行并去掉首尾空白，保证同一内容得到同一哈希；
