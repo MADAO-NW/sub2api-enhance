@@ -12,6 +12,7 @@ import { extractApiErrorMessage } from '@/utils/apiError'
 import { configUpdate, editableConfig, formatTime, parametersText, parseParameters } from './viewModel'
 import { useAuditLabels } from './labels'
 
+import { categoryName } from './categories'
 const props = withDefaults(defineProps<{ refreshKey?: number; active?: boolean; focusNodeID?: string }>(), { refreshKey: 0, active: true, focusNodeID: '' })
 const label = useAuditLabels()
 const { t } = useI18n()
@@ -492,6 +493,7 @@ watch(() => props.refreshKey, () => { void load(true) })
               <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('categoryRulesHint') }}</p>
               <div v-for="row in categoryRuleRows" :key="row.code" class="flex flex-wrap items-center gap-3">
                 <input :value="row.code" class="input w-24" maxlength="3" aria-label="R01" @change="updateCategoryCode(row.code, $event)" />
+                <span v-if="categoryName(row.code)" class="text-xs text-gray-500 dark:text-dark-400">{{ categoryName(row.code) }}</span>
                 <select :value="row.disposition" class="input w-56" @change="updateCategoryDisposition(row.code, $event)">
                   <option value="immediate_disable">{{ label('dispositionImmediateDisable') }}</option>
                   <option value="notice_only">{{ label('dispositionNoticeOnly') }}</option>

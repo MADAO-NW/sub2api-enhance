@@ -148,7 +148,10 @@ onMounted(() => { void load() })
             <span v-if="item.id">#{{ item.id }}</span>
             <span v-if="item.action_type">{{ label(item.action_type) }}</span>
             <span v-if="item.username">{{ item.username }}<span v-if="item.user_id" class="text-gray-500"> (#{{ item.user_id }})</span></span>
-            <span v-if="item.status">{{ item.status }}</span>
+            <span v-if="item.health">{{ label(item.health) }}</span>
+            <span v-else-if="item.status">{{ item.status }}</span>
+            <span v-if="item.name" class="font-medium">{{ item.name }}</span>
+            <span v-if="item.error_code" class="text-gray-500 dark:text-dark-400">{{ item.error_code }}</span>
             <span v-if="item.detail" class="break-all text-gray-500 dark:text-dark-400">{{ item.detail }}</span>
             <button v-if="category.key === 'action_failed' || category.key === 'notification_failed'" class="btn btn-secondary btn-sm"
               :disabled="pending === `retry-${item.id}` || !item.id" data-test="inbox-retry" @click="retry(item.id ?? 0)">{{ label('retryNow') }}</button>

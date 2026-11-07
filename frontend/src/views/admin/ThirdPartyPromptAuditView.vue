@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { onUnmounted, reactive, ref } from 'vue'
+import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { loadCategoryNames } from '@/features/third-party-prompt-audit/categories'
 import AuditOverview from '@/features/third-party-prompt-audit/AuditOverview.vue'
 import AuditInbox from '@/features/third-party-prompt-audit/AuditInbox.vue'
 import AuditRecords from '@/features/third-party-prompt-audit/AuditRecords.vue'
@@ -88,6 +89,8 @@ async function trackReaudits(ids: number[]) {
   } finally { tracking = false }
 }
 // 待处理角标不单独轮询：概览与待处理页签各自按 30 秒节奏加载 /inbox，并把总数交给角标。
+// 类别映射只取一次：政策里声明的 “R07 标题” 用于在所有页面给类别编号补名称。
+onMounted(() => { void loadCategoryNames() })
 onUnmounted(() => {
   disposed = true
 })

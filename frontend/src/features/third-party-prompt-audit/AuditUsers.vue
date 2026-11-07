@@ -8,6 +8,7 @@ import {
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { categoryList, formatTime, timeRange, toLocalInput } from './viewModel'
+import { categoryText } from './categories'
 import { useAuditLabels } from './labels'
 
 const props = withDefaults(defineProps<{ refreshKey?: number; active?: boolean; initialRange?: { from: string; to: string } | null }>(), { initialRange: null, refreshKey: 0, active: true })
@@ -184,7 +185,7 @@ onMounted(() => { void load() })
                 <td class="p-3 tabular-nums">{{ row.violations.toLocaleString() }}<span v-if="row.pending_actions" class="mt-1 block text-xs text-amber-700 dark:text-amber-400">{{ label('pendingActions') }} {{ row.pending_actions }}</span></td>
                 <td class="whitespace-nowrap p-3">{{ formatTime(row.last_block_at) }}</td>
                 <td class="p-3 text-xs">
-                  <span v-for="category in categoryList(row.categories)" :key="category" class="mr-1 inline-block rounded bg-gray-100 px-2 py-0.5 dark:bg-dark-700">{{ category }}</span>
+                  <span v-for="category in categoryList(row.categories)" :key="category" class="mr-1 inline-block rounded bg-gray-100 px-2 py-0.5 dark:bg-dark-700">{{ categoryText(category) }}</span>
                   <span v-if="!categoryList(row.categories).length" class="text-gray-500">{{ label('uncategorized') }}</span>
                 </td>
                 <td class="p-3"><button class="btn btn-secondary btn-sm whitespace-nowrap" :data-test="`risk-toggle-${row.user_id}`" @click="toggle(row)">{{ label(expanded.includes(row.user_id) ? 'collapse' : 'expand') }}</button></td>

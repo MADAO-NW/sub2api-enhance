@@ -390,6 +390,10 @@ export interface InboxEntry {
   job_id?: number | null
   status?: string
   detail?: string
+  // 节点项：name 是节点显示名，health 用 i18n 本地化，error_code 是最近一次失败码。
+  name?: string
+  health?: string
+  error_code?: string
   hash?: string
   occurred_at: string
 }
@@ -595,11 +599,15 @@ export interface AuditStats extends StatsQuery {
 export interface CategoryRecognition { model_id: string; total: number; recognized: number; rate: number }
 // CategoryCount 是阻断任务按触发类别的计数；category 为空表示未分类，多类别任务在每个类别下各计一次。
 export interface CategoryCount { category: string; count: number }
+// CategoryName 是政策声明的类别编号与标题，如 R07 恶意使用。
+export interface CategoryName { code: string; name: string }
 
 const base = '/admin/third-party-prompt-audit'
 
 export const thirdPartyPromptAuditAPI = {
   async getConfig() { return (await apiClient.get<SavedConfig>(`${base}/config`)).data },
+  // categories 返回当前政策声明的类别编号与标题，供界面在编号后补名称。
+  async categories() { return (await apiClient.get<{ items: CategoryName[] }>(`${base}/categories`)).data },
   async saveConfig(value: ConfigUpdate) { return (await apiClient.put<SavedConfig>(`${base}/config`, value)).data },
   // configImpact 只做保存前的影响估算，失败不影响保存。
   async configImpact(value: AuditConfig) { return (await apiClient.post<ConfigImpact>(`${base}/config/impact`, value)).data },

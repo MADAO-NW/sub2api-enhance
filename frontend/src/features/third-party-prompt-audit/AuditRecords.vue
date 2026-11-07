@@ -10,6 +10,7 @@ import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import AuditDetail from './AuditDetail.vue'
 import { categoryFilter, categoryList, formatMS, formatTime, jobQueryFilter, toLocalInput } from './viewModel'
+import { categoryText } from './categories'
 import { useAuditLabels } from './labels'
 
 const props = withDefaults(defineProps<{ initialFilter?: AuditFilter; initialJobID?: number | null; refreshKey?: number; active?: boolean }>(), { initialJobID: null, refreshKey: 0, active: true })
@@ -45,9 +46,21 @@ const quickFilters = [
 function applyQuick(value: string) {
   const [field, target] = value.split(':')
   const next: AuditFilter = { ...(applied.value ?? {}) }
-  if (field === 'decision') { next.decision = target; delete next.status }
-  else if (field === 'status') { next.status = target; delete next.decision }
-  else if (field === 'run_kind') next.run_kind = target
+  // 快捷筛选同时写回上方表单，让管理员看到当前条件并能在其基础上继续调整。
+  if (field === 'decision') {
+    next.decision = target
+    delete next.status
+    filters.decision = target
+    delete filters.status
+  } else if (field === 'status') {
+    next.status = target
+    delete next.decision
+    filters.status = target
+    delete filters.decision
+  } else if (field === 'run_kind') {
+    next.run_kind = target
+    filters.run_kind = target
+  }
   applied.value = next
   page.value = 1
   void load()
@@ -328,7 +341,7 @@ onUnmounted(() => {
               </td>
               <td class="p-3 text-xs">
                 <p v-if="row.trigger_kind">{{ label(row.trigger_kind) }}</p>
-                <p v-for="category in categoryList(row.trigger_categories)" :key="category" class="mt-1 inline-block rounded bg-gray-100 px-2 py-0.5 dark:bg-dark-700">{{ category }}</p>
+                <p v-for="category in categoryList(row.trigger_categories)" :key="category" class="mt-1 inline-block rounded bg-gray-100 px-2 py-0.5 dark:bg-dark-700">{{ categoryText(category) }}</p>
                 <p v-if="!categoryList(row.trigger_categories).length" class="mt-1 text-gray-500">{{ label('uncategorized') }}</p>
               </td>
               <td class="p-3 text-xs">
@@ -356,7 +369,7 @@ onUnmounted(() => {
             <strong>#{{ index + 1 }} · {{ label(target.kind) }}</strong>
             <span>{{ target.bytes }} B</span>
             <span v-if="target.resolution">{{ label('resolution') }}: {{ label('resolution_' + target.resolution) }}</span>
-            <span v-if="target.decision">{{ label(target.decision) }}<template v-if="target.score !== null"> · {{ target.score }}</template></span>
+            <span>{{ label('decision') }}: <strong :class="target.decision === 'block' ? 'text-red-600 dark:text-red-400' : target.decision === 'review' ? 'text-amber-700 dark:text-amber-400' : ''">{{ target.decision ? label(target.decision) : label('notAudited') }}</strong><template v-if="target.score !== null && target.score !== undefined"> · {{ target.score }}</template></span>
             <span v-if="target.sampled" class="text-xs text-primary-600 dark:text-primary-400" data-test="target-sampled">{{ label('sampledMark') }}</span>
             <button v-if="target.kind === 'instruction'" class="btn btn-secondary btn-sm" :disabled="promptTrusting" data-test="trust-target" @click="togglePromptTrust(target)">{{ label(target.trusted ? 'untrust' : 'trust') }}</button>
             <button class="btn btn-secondary btn-sm" data-test="copy-prompt" @click="copyPrompt(target)">{{ label('copyText') }}</button>
@@ -377,6 +390,10 @@ onUnmounted(() => {
         <template v-if="preview">
           <p>{{ label('matched') }}: {{ preview.matched }} · {{ label('ready') }}: {{ preview.ready }}</p>
           <p class="rounded-xl bg-gray-50 p-3 text-sm dark:bg-dark-900" data-test="estimated-targets">{{ t('admin.thirdPartyPromptAudit.estimatedTargets', { count: preview.estimated_targets }) }}</p>
+          <div class="flex flex-wrap items-center gap-3 rounded-xl border border-primary-200 bg-primary-50/60 p-3 dark:border-primary-900 dark:bg-primary-950/30">
+            <button v-if="!submitted" class="btn btn-primary" :disabled="previewLoading || !preview.ready" @click="submit">{{ label('submitReaudit') }}</button>
+            <p v-else role="status">{{ label('submitted') }}</p>
+          </div>
           <div class="max-h-96 overflow-auto">
             <div v-for="item in previewItems" :key="item.job_id" class="border-t border-gray-100 py-3 text-sm dark:border-dark-700">
               <span>Job #{{ item.job_id }} → {{ label(item.status === 'requeued' ? 'submitted' : item.status) }}</span>
@@ -384,8 +401,6 @@ onUnmounted(() => {
             </div>
           </div>
           <Pagination :page="previewPage" :page-size="20" :total="preview.items.length" :show-page-size-selector="false" @update:page="previewPage = $event" />
-          <button v-if="!submitted" class="btn btn-primary" :disabled="previewLoading || !preview.ready" @click="submit">{{ label('submitReaudit') }}</button>
-          <p v-else role="status">{{ label('submitted') }}</p>
         </template>
       </div>
     </BaseDialog>

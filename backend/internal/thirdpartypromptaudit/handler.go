@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -88,6 +89,27 @@ func (h *AdminHandler) GetConfig(c *gin.Context) {
 	response.Success(c, config)
 }
 
+// ListCategories 返回当前政策声明的违规类别编号与名称，供前端在编号后补上标题。
+// 名称只来自政策文本里的 “R01 标题” 行，未声明时返回空列表，前端原样显示编号。
+func (h *AdminHandler) ListCategories(c *gin.Context) {
+	config, err := h.config.ReadSaved(c.Request.Context())
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	names := policyCategoryNames(config.AuditPrompt)
+	codes := make([]string, 0, len(names))
+	for code := range names {
+		codes = append(codes, code)
+	}
+	slices.Sort(codes)
+	items := make([]gin.H, 0, len(codes))
+	for _, code := range codes {
+		items = append(items, gin.H{"code": code, "name": names[code]})
+	}
+	response.Success(c, gin.H{"items": items})
+}
+
 func (h *AdminHandler) UpdateConfig(c *gin.Context) {
 	var input ConfigUpdate
 	if err := bindStrict(c, &input); err != nil {
@@ -103,7 +125,7 @@ func (h *AdminHandler) UpdateConfig(c *gin.Context) {
 	middleware.SetAuditExtra(c, map[string]any{"result": "success", "previous_revision": before.Revision, "revision": result.Revision})
 	h.service.notify()
 	h.service.refreshNodeLimits()
-	h.service.evaluator.nodeScheduler().resetHealth()
+	h.service.evaluator.nodeScheduler().resetHealthFor(changedNodeIDs(before.Models, result.Models, input.Keys))
 	h.config.mu.RLock()
 	if h.config.active != nil {
 		result.AppliedRevision = h.config.active.Stored.Revision
@@ -111,6 +133,32 @@ func (h *AdminHandler) UpdateConfig(c *gin.Context) {
 	h.config.mu.RUnlock()
 	result.InstanceID = h.service.metrics.InstanceID
 	response.Success(c, result)
+}
+
+// changedNodeIDs 返回保存后需要重新验证健康的节点：连接参数变化，或凭据被替换/清除。
+// 新加入的节点还没有观测状态，不需要重置；改名、容量、策略等改动不影响连通性。
+func changedNodeIDs(before, after []ModelConfig, keys []KeyUpdate) map[string]bool {
+	previous := make(map[string]ModelConfig, len(before))
+	for _, model := range before {
+		previous[model.ID] = model
+	}
+	changed := map[string]bool{}
+	for _, model := range after {
+		old, ok := previous[model.ID]
+		if !ok {
+			continue
+		}
+		if old.BaseURL != model.BaseURL || old.Model != model.Model || old.TimeoutMS != model.TimeoutMS ||
+			old.Enabled != model.Enabled || !reflect.DeepEqual(old.Parameters, model.Parameters) {
+			changed[model.ID] = true
+		}
+	}
+	for _, key := range keys {
+		if key.Action != "keep" {
+			changed[key.ModelID] = true
+		}
+	}
+	return changed
 }
 
 func (h *AdminHandler) TestAdminEmail(c *gin.Context) {

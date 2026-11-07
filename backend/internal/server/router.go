@@ -115,6 +115,7 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	q.POST("/batches/:id/acknowledge", quota.Acknowledge)
 	a := group.Group("/third-party-prompt-audit")
 	a.GET("/config", handler.GetConfig)
+	a.GET("/categories", handler.ListCategories)
 	a.PUT("/config", handler.UpdateConfig)
 	a.POST("/config/impact", handler.ConfigImpact)
 	a.POST("/test-email", handler.TestAdminEmail)

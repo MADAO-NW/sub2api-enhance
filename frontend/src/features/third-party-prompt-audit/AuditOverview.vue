@@ -6,6 +6,7 @@ import {
 } from '@/api/admin/third-party-prompt-audit'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { categoryList, costSummary, formatMS, formatTime, timeRange, toLocalInput } from './viewModel'
+import { categoryText } from './categories'
 import { useAuditLabels } from './labels'
 import TrendChart from './TrendChart.vue'
 
@@ -187,7 +188,7 @@ watch(() => props.refreshKey, () => { void refresh() })
               <td class="p-2">(#{{ user.user_id }}) {{ user.username || '—' }}</td>
               <td class="p-2 tabular-nums">{{ user.jobs }}</td><td class="p-2 tabular-nums">{{ user.blocks }}</td>
               <td class="p-2 tabular-nums">{{ user.violations }}</td>
-              <td class="p-2 text-xs">{{ categoryList(user.categories).join(', ') || label('uncategorized') }}</td>
+              <td class="p-2 text-xs">{{ categoryList(user.categories).map(categoryText).join(', ') || label('uncategorized') }}</td>
             </tr>
           </tbody>
         </table>
@@ -235,7 +236,7 @@ watch(() => props.refreshKey, () => { void refresh() })
         <div class="flex flex-wrap gap-2">
           <button v-for="item in categoryCounts" :key="item.category" class="rounded-xl bg-gray-50 px-4 py-3 text-left transition hover:bg-primary-50 dark:bg-dark-900 dark:hover:bg-dark-700"
             @click="inspect(item.category ? { from: stats.from, to: stats.to, decision: 'block', category: item.category } : { from: stats.from, to: stats.to, decision: 'block' })">
-            <span class="block text-sm">{{ item.category || label('uncategorized') }}</span>
+            <span class="block text-sm">{{ item.category ? categoryText(item.category) : label('uncategorized') }}</span>
             <strong class="mt-1 block text-xl tabular-nums">{{ item.count.toLocaleString() }}</strong>
           </button>
         </div>
@@ -315,7 +316,7 @@ watch(() => props.refreshKey, () => { void refresh() })
                 <thead class="text-gray-500"><tr><th class="p-2">{{ label('modelID') }}</th><th class="p-2">{{ label('health') }}</th><th class="p-2">{{ label('nodeLoad') }}</th><th class="p-2">{{ label('waiting') }}</th><th class="p-2">{{ label('failureCount') }}</th><th class="p-2">{{ label('latency') }}</th><th class="p-2">{{ label('nextProbe') }}</th></tr></thead>
                 <tbody>
                   <tr v-for="node in runtime.scheduler.nodes" :key="node.model_id" class="border-t border-gray-100 dark:border-dark-700">
-                    <td class="p-2">{{ node.model_id }}</td><td class="p-2">{{ label(node.health) }}</td>
+                    <td class="p-2">{{ node.model_id }}</td><td class="p-2">{{ label(node.health === 'unknown' ? 'healthUnknown' : node.health) }}</td>
                     <td class="p-2">{{ node.active }} / {{ node.max_concurrency }} · {{ Math.round(node.load_ratio * 100) }}%</td>
                     <td class="p-2">{{ node.eligible_waiters }}</td>
                     <td class="p-2">{{ node.consecutive_failures }}<span v-if="node.last_error_code" class="block text-xs text-red-600">{{ node.last_error_code }}</span></td>

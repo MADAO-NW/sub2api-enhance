@@ -5,6 +5,7 @@ import { thirdPartyPromptAuditAPI as api, type AuditAction, type JobDetail, type
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { categoryList, formatMS, formatTime } from './viewModel'
+import { categoryText } from './categories'
 import { useAuditLabels } from './labels'
 import NodeDecision from './NodeDecision.vue'
 
@@ -15,6 +16,8 @@ const detail = ref<JobDetail | null>(null)
 const loading = ref(false), pending = ref(false), error = ref('')
 const sampling = ref('')
 let generation = 0
+// orderedTargets 把用户提示词排在最前，序号按显示顺序从 1 重新编号；样本与信任仍用真实目标序号。
+const orderedTargets = computed(() => [...(detail.value?.targets ?? [])].sort((a, b) => Number(b.kind === 'user') - Number(a.kind === 'user')))
 const job = computed(() => detail.value?.job)
 const pretty = (value: unknown) => JSON.stringify(value, null, 2)
 function attemptRequest(attempt: ModelAttempt) {
@@ -116,7 +119,7 @@ watch(() => [props.id, props.refreshKey], load, { immediate: true })
         </div>
         <p class="break-words text-sm">{{ job.identity.username }} · {{ job.identity.user_email }} · {{ job.identity.api_key_name }} · {{ job.identity.group_name }}</p>
         <p class="break-all text-sm text-gray-500 dark:text-dark-400">{{ label('requestID') }}: {{ job.request_id || '—' }} · {{ job.identity.endpoint }} · {{ job.protocol }} · {{ job.model }}</p>
-        <p class="text-sm">{{ label('category') }}: <span v-for="category in categoryList(job.trigger_categories)" :key="category" class="mr-2 inline-block rounded bg-gray-100 px-2 py-0.5 text-xs dark:bg-dark-700">{{ category }}</span><span v-if="!categoryList(job.trigger_categories).length" class="text-gray-500">{{ label('uncategorized') }}</span></p>
+        <p class="text-sm">{{ label('category') }}: <span v-for="category in categoryList(job.trigger_categories)" :key="category" class="mr-2 inline-block rounded bg-gray-100 px-2 py-0.5 text-xs dark:bg-dark-700">{{ categoryText(category) }}</span><span v-if="!categoryList(job.trigger_categories).length" class="text-gray-500">{{ label('uncategorized') }}</span></p>
         <p class="text-sm">{{ label('created') }}: {{ formatTime(job.created_at) }} · {{ label('attempts') }}: {{ job.attempts }} / {{ job.max_attempts }} · {{ label('clientFingerprint') }}: {{ job.client_fingerprint }}</p>
         <p v-if="job.orphan_continuation" class="text-sm text-amber-700 dark:text-amber-400">{{ label('orphanContinuation') }}</p>
         <p class="text-sm">{{ label('enforcement') }}: {{ job.enforcement_eligible ? label('eligible') : label('notEligible') }}<span v-if="job.violation_counted"> · {{ label('violationCounted') }}</span><span v-if="job.disable_counted"> · {{ label('disableCounted') }}</span></p>
@@ -128,13 +131,14 @@ watch(() => [props.id, props.refreshKey], load, { immediate: true })
       <section class="space-y-3 border-t border-gray-200 pt-5 dark:border-dark-700">
         <h3 class="font-semibold">{{ label('targets') }}</h3>
         <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('targetsHint') }}</p>
-        <article v-for="target in detail.targets" :key="target.order" class="space-y-3 rounded-xl bg-gray-50 p-4 dark:bg-dark-900">
+        <article v-for="(target, index) in orderedTargets" :key="target.order" class="space-y-3 rounded-xl bg-gray-50 p-4 dark:bg-dark-900">
           <div class="flex flex-wrap items-center gap-3 text-sm">
-            <strong>#{{ target.order }} · {{ label(target.kind) }}</strong>
+            <strong>#{{ index + 1 }} · {{ label(target.kind) }}</strong>
             <span>{{ target.bytes }} B</span>
             <span class="break-all font-mono text-xs text-gray-500">{{ target.hash }}</span>
             <span v-if="target.resolution">{{ label('resolution') }}: {{ label('resolution_' + target.resolution) }}</span>
             <strong v-if="target.decision" :class="target.decision === 'block' ? 'text-red-600 dark:text-red-400' : target.decision === 'review' ? 'text-amber-700 dark:text-amber-400' : ''">{{ label(target.decision) }}</strong>
+            <strong v-else class="text-gray-500 dark:text-dark-400">{{ label('notAudited') }}</strong>
             <span v-if="target.sampled" class="text-xs text-primary-600 dark:text-primary-400" data-test="target-sampled">{{ label('sampledMark') }}</span>
             <button v-if="target.kind === 'instruction'" class="btn btn-secondary btn-sm" :disabled="pending" @click="toggleTrust(target)">{{ label(target.trusted ? 'untrust' : 'trust') }}</button>
             <button class="btn btn-secondary btn-sm" :disabled="sampling === `${target.order}:pass`" data-test="detail-sample-pass" @click="addSample(target, 'pass')">{{ label('addSamplePass') }}</button>
@@ -168,7 +172,7 @@ watch(() => [props.id, props.refreshKey], load, { immediate: true })
       <section v-if="detail.rounds.length" class="space-y-3 border-t border-gray-200 pt-5 dark:border-dark-700">
         <h3 class="font-semibold">{{ label('roundHistory') }}</h3>
         <article v-for="round in detail.rounds" :key="round.round" class="rounded-lg border border-gray-100 p-3 text-sm dark:border-dark-700">
-          <p><strong>{{ label('auditRound') }} {{ round.round }}</strong> · {{ label(round.run_kind) }} · {{ label(round.decision) }} · {{ label(reuseLabel(round.reuse_mode)) }} · {{ label('trigger') }}: {{ round.trigger_kind ? label(round.trigger_kind) : '—' }}<span v-if="round.trigger_categories?.length"> · {{ categoryList(round.trigger_categories).join(', ') }}</span></p>
+          <p><strong>{{ label('auditRound') }} {{ round.round }}</strong> · {{ label(round.run_kind) }} · {{ label(round.decision) }} · {{ label(reuseLabel(round.reuse_mode)) }} · {{ label('trigger') }}: {{ round.trigger_kind ? label(round.trigger_kind) : '—' }}<span v-if="round.trigger_categories?.length"> · {{ categoryList(round.trigger_categories).map(categoryText).join(', ') }}</span></p>
           <p class="mt-1 text-gray-500">{{ formatTime(round.started_at) }} — {{ formatTime(round.finished_at) }}<span v-if="round.requested_by"> · {{ label('userID') }} {{ round.requested_by }}</span><span v-if="round.config_revision"> · {{ label('revision') }} {{ round.config_revision }}</span></p>
         </article>
       </section>

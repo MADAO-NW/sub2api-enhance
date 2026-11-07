@@ -110,15 +110,19 @@ func (r *Repository) ListActionRecords(ctx context.Context, filter ActionFilter,
 
 // InboxEntry 是待处理工作台中的一条事项；事项是否已处理完全由源数据状态决定。
 type InboxEntry struct {
-	Category   string    `json:"category"`
-	ID         int64     `json:"id,omitempty"`
-	ActionType string    `json:"action_type,omitempty"`
-	UserID     int64     `json:"user_id,omitempty"`
-	Username   string    `json:"username,omitempty"`
-	JobID      *int64    `json:"job_id,omitempty"`
-	Status     string    `json:"status,omitempty"`
-	Detail     string    `json:"detail,omitempty"`
-	Hash       string    `json:"hash,omitempty"`
+	Category   string `json:"category"`
+	ID         int64  `json:"id,omitempty"`
+	ActionType string `json:"action_type,omitempty"`
+	UserID     int64  `json:"user_id,omitempty"`
+	Username   string `json:"username,omitempty"`
+	JobID      *int64 `json:"job_id,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Detail     string `json:"detail,omitempty"`
+	Hash       string `json:"hash,omitempty"`
+	// Name、Health、ErrorCode 只用于节点项：前端按 Health 本地化状态，并展示节点名与错误码。
+	Name       string    `json:"name,omitempty"`
+	Health     string    `json:"health,omitempty"`
+	ErrorCode  string    `json:"error_code,omitempty"`
 	OccurredAt time.Time `json:"occurred_at"`
 }
 

@@ -167,3 +167,20 @@ func TestNodeSchedulerAsyncBackpressureDoesNotWait(t *testing.T) {
 	require.Equal(t, uint64(1), scheduler.runtime([]ModelConfig{model}).BackpressuredTotal)
 	release()
 }
+
+// 保存配置只重置连接受影响的节点；无关改动不再把全部节点打回未知。
+func TestResetHealthForOnlyClearsTargetNodes(t *testing.T) {
+	scheduler := newNodeScheduler()
+	models := []ModelConfig{{ID: "a", Enabled: true, MaxConcurrency: 2}, {ID: "b", Enabled: true, MaxConcurrency: 2}}
+	scheduler.updateLimits(models)
+	scheduler.observe("a", nil, time.Millisecond)
+	scheduler.observe("b", nil, time.Millisecond)
+	require.Equal(t, nodeHealthHealthy, scheduler.states["a"].health)
+	scheduler.resetHealthFor(map[string]bool{"a": true})
+	require.Equal(t, nodeHealthUnknown, scheduler.states["a"].health)
+	require.Equal(t, nodeHealthHealthy, scheduler.states["b"].health)
+	// 空集合表示这次保存没有任何节点连接变化。
+	scheduler.observe("a", nil, time.Millisecond)
+	scheduler.resetHealthFor(nil)
+	require.Equal(t, nodeHealthHealthy, scheduler.states["a"].health)
+}

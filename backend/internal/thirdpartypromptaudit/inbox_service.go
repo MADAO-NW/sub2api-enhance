@@ -59,20 +59,34 @@ func (s *Service) Inbox(ctx context.Context) (*Inbox, error) {
 	return inbox, nil
 }
 
-// unhealthyNodes 读取当前节点健康，把非正常状态（含凭据失效）作为待处理事项。
+// unhealthyNodes 读取当前节点健康，把真正的异常（降级、冷却、恢复探测、配置异常）作为待处理事项。
 func (s *Service) unhealthyNodes() ([]InboxEntry, error) {
 	snapshot, err := s.config.Active()
 	if err != nil {
 		return nil, err
 	}
+	return unhealthyNodeEntries(s.evaluator.nodeScheduler().runtime(snapshot.Models).Nodes, time.Now().UTC()), nil
+}
+
+// unhealthyNodeEntries 把运行态节点转成待处理事项。
+// unknown 表示尚未验证（进程刚启动、刚保存过节点配置、或还没有真实调用与节点测试），
+// 不是故障；disabled 由管理员主动关闭。两者都不进待处理，避免工作台长期挂着“节点异常”。
+// 事项时间取最近一次真实观测（没有观测时退回冷却到期时间），不用每次刷新的当前时间。
+func unhealthyNodeEntries(nodes []nodeRuntimeSnapshot, now time.Time) []InboxEntry {
 	items := []InboxEntry{}
-	now := time.Now().UTC()
-	for _, node := range s.evaluator.nodeScheduler().runtime(snapshot.Models).Nodes {
-		if node.Health == nodeHealthHealthy || node.Health == nodeHealthDisabled {
+	for _, node := range nodes {
+		switch node.Health {
+		case nodeHealthHealthy, nodeHealthUnknown, nodeHealthDisabled:
 			continue
 		}
-		items = append(items, InboxEntry{Category: "node_unhealthy", ActionType: "node", Detail: node.ModelID,
-			Status: node.Health + " · " + node.LastErrorCode, OccurredAt: now})
+		occurred := now
+		if node.LastObservedAt != nil {
+			occurred = *node.LastObservedAt
+		} else if node.CooldownUntil != nil {
+			occurred = *node.CooldownUntil
+		}
+		items = append(items, InboxEntry{Category: "node_unhealthy", ActionType: "node", Name: node.Name,
+			Detail: node.ModelID, Health: node.Health, ErrorCode: node.LastErrorCode, OccurredAt: occurred})
 	}
-	return items, nil
+	return items
 }

@@ -47,6 +47,7 @@ func (e *nodeScheduleError) Error() string { return e.Code }
 
 type nodeRuntimeSnapshot struct {
 	ModelID             string     `json:"model_id"`
+	Name                string     `json:"name,omitempty"`
 	Health              string     `json:"health"`
 	Active              int        `json:"active"`
 	MaxConcurrency      int        `json:"max_concurrency"`
@@ -92,11 +93,21 @@ func (s *nodeScheduler) updateLimits(models []ModelConfig) {
 	s.signal()
 }
 
-// resetHealth 在管理员保存节点配置后重新验证全部启用节点。
-func (s *nodeScheduler) resetHealth() {
+// resetHealthFor 在管理员保存节点配置后，只重置连接受影响的节点健康：base_url、model、
+// 超时、启用状态或高级参数变化，以及凭据被替换/清除。
+// 仅修改政策、阈值、邮箱等不影响节点连通的配置时保留已观测健康，
+// 避免每次保存都把全部节点打回 unknown，导致待处理工作台反复出现“节点异常”。
+func (s *nodeScheduler) resetHealthFor(ids map[string]bool) {
+	if len(ids) == 0 {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, state := range s.states {
+	for id := range ids {
+		state := s.states[id]
+		if state == nil {
+			continue
+		}
 		state.health, state.lastErrorCode = nodeHealthUnknown, ""
 		state.consecutiveFailures, state.openCount = 0, 0
 		state.cooldownUntil, state.probing = time.Time{}, false
@@ -358,7 +369,7 @@ func (s *nodeScheduler) runtime(models []ModelConfig) schedulerRuntimeSnapshot {
 		if !model.Enabled {
 			health = nodeHealthDisabled
 		}
-		item := nodeRuntimeSnapshot{ModelID: model.ID, Health: health, Active: state.active, MaxConcurrency: state.limit, EligibleWaiters: state.waiting,
+		item := nodeRuntimeSnapshot{ModelID: model.ID, Name: model.Name, Health: health, Active: state.active, MaxConcurrency: state.limit, EligibleWaiters: state.waiting,
 			LoadRatio: float64(state.active) / float64(state.limit), LatencyEWMAMS: state.latencyEWMAMS, ConsecutiveFailures: state.consecutiveFailures, LastErrorCode: state.lastErrorCode}
 		if !state.cooldownUntil.IsZero() {
 			value := state.cooldownUntil.UTC()

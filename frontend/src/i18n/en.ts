@@ -383,6 +383,8 @@ export default {
     "half_open": "Recovery probe running",
     "misconfigured": "Misconfigured",
     "disabled": "Disabled",
+    "notAudited": "Not audited",
+    "healthUnknown": "Unverified",
     "bindingTriggered": "Instruction risk reached the threshold; intent binding was evaluated",
     "dispatch": "Dispatch order",
     "health_then_load": "Health first, then lowest load",

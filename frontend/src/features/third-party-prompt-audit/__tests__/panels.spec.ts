@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   inbox: vi.fn(), actions: vi.fn(), riskUsers: vi.fn(), cost: vi.fn(), clearEscalation: vi.fn(),
   samples: vi.fn(), createSample: vi.fn(), updateSample: vi.fn(), deleteSample: vi.fn(),
   replays: vi.fn(), replay: vi.fn(), startReplay: vi.fn(),
+  categories: vi.fn(),
   showError: vi.fn(), showSuccess: vi.fn(),
 }))
 vi.mock('@/api/admin/third-party-prompt-audit', () => ({ thirdPartyPromptAuditAPI: mocks }))
@@ -117,6 +118,7 @@ beforeEach(() => {
   mocks.job.mockResolvedValue(detail())
   mocks.templateChurn.mockResolvedValue({ items: [{ client: 'codex', jobs: 10, distinct: 4, churn_rate: 0.4 }] })
   mocks.metricsHistory.mockResolvedValue({ items: [{ hour: '2026-11-06T00:00:00Z', jobs: 5, blocked: 1, failed: 0, avg_blocking_ms: 120 }] })
+  mocks.categories.mockResolvedValue({ items: [{ code: 'R07', name: '恶意使用' }] })
   mocks.jobPrompts.mockResolvedValue({ targets: [
     { order: 1, kind: 'instruction', hash: 'a'.repeat(64), text: '系统提示词正文', bytes: 12, resolution: 'cache', decision: 'pass', reason: '正常', score: 0.02, trusted: false, sampled: false },
     { order: 2, kind: 'user', hash: 'b'.repeat(64), text: '违规用户提示词', bytes: 20, resolution: 'model', decision: 'block', reason: '违规', score: 0.95, trusted: false, sampled: true },
@@ -162,13 +164,13 @@ beforeEach(() => {
   mocks.exportUserData.mockResolvedValue(new Blob(['\ufeffjob_id\n'], { type: 'text/csv' }))
   mocks.deleteUserData.mockResolvedValue({ deleted_jobs: 4 })
   mocks.inbox.mockResolvedValue({
-    total: 3, action_failed: 1, notification_failed: 1, breaker_pending: 1, node_unhealthy: 0,
+    total: 4, action_failed: 1, notification_failed: 1, breaker_pending: 1, node_unhealthy: 1,
     failure_rate: { window_minutes: 30, jobs: 20, failed: 3, rate: 0.15, threshold: 0.1, min_jobs: 10, exceeded: true },
     categories: [
       { key: 'action_failed', count: 1, items: [{ category: 'action_failed', id: 5, action_type: 'disable', user_id: 3, username: 'alice', job_id: 7, status: 'failed', occurred_at: '2026-09-06T00:00:00Z' }] },
       { key: 'notification_failed', count: 1, items: [{ category: 'notification_failed', id: 6, action_type: 'warning', user_id: 3, status: 'failed', occurred_at: '2026-09-06T00:00:00Z' }] },
       { key: 'breaker_pending', count: 1, items: [{ category: 'breaker_pending', hash: 'c'.repeat(64), detail: '共享指令块', status: '2 个用户', occurred_at: '2026-09-06T00:00:00Z' }] },
-      { key: 'node_unhealthy', count: 0, items: [] },
+      { key: 'node_unhealthy', count: 1, items: [{ category: 'node_unhealthy', action_type: 'node', name: '节点 A', detail: 'node-a', health: 'cooldown', error_code: 'rate_limited', occurred_at: '2026-09-06T00:00:00Z' }] },
       { key: 'failure_rate', count: 1, items: [] },
     ],
     notification_window_days: 7,
@@ -337,6 +339,20 @@ describe('third-party prompt audit panels', () => {
     wrapper.unmount()
   })
 
+  it('writes quick filters back into the form selects', async () => {
+    const wrapper = mount(AuditRecords, { global: { stubs } })
+    await flushPromises()
+    const quick = wrapper.findAll('[data-test="quick-filter"]').find(button => button.text() === 'block')
+    expect(quick).toBeTruthy()
+    await quick!.trigger('click')
+    await flushPromises()
+    const decision = wrapper.findAll('select').find(select => select.findAll('option').some(option => option.text() === 'block'))
+    expect(decision).toBeTruthy()
+    expect((decision!.element as HTMLSelectElement).value).toBe('block')
+    expect(mocks.jobs).toHaveBeenLastCalledWith({ decision: 'block' }, 1, 20)
+    wrapper.unmount()
+  })
+
   it('previews a reaudit without a reuse mode and shows the estimated targets', async () => {
     const wrapper = mount(AuditRecords, { global: { stubs } })
     await flushPromises()
@@ -357,6 +373,12 @@ describe('third-party prompt audit panels', () => {
     expect(text).toContain('cache')
     expect(text).toContain('model')
     expect(text).toContain('reuseFresh')
+    // 用户提示词排在最前并按显示顺序从 1 编号；样本仍提交真实目标序号。
+    const cards = wrapper.findAll('article')
+    expect(cards[0]!.text()).toContain('#1')
+    expect(cards[0]!.text()).toContain('违规用户提示词')
+    expect(cards[1]!.text()).toContain('#2')
+    expect(cards[1]!.text()).toContain('系统提示词正文')
     const trustButton = wrapper.findAll('button').find(button => button.text() === 'trust')
     expect(trustButton).toBeTruthy()
     await trustButton!.trigger('click')
@@ -364,7 +386,7 @@ describe('third-party prompt audit panels', () => {
     expect(mocks.trust).toHaveBeenCalledWith('a'.repeat(64), expect.any(String))
     await wrapper.get('[data-test="detail-sample-pass"]').trigger('click')
     await flushPromises()
-    expect(mocks.createSample).toHaveBeenCalledWith({ job_id: 7, target_order: 1, expected: 'pass' })
+    expect(mocks.createSample).toHaveBeenCalledWith({ job_id: 7, target_order: 2, expected: 'pass' })
     wrapper.unmount()
   })
 
@@ -454,7 +476,7 @@ describe('third-party prompt audit panels', () => {
     try {
       const wrapper = mount(AuditOverview, { global: { stubs } })
       await flushPromises()
-      expect(wrapper.emitted('inbox-loaded')?.[0]).toEqual([3])
+      expect(wrapper.emitted('inbox-loaded')?.[0]).toEqual([4])
       const inboxCalls = mocks.inbox.mock.calls.length, statsCalls = mocks.stats.mock.calls.length
       await vi.advanceTimersByTimeAsync(5000)
       expect(mocks.stats.mock.calls.length).toBeGreaterThan(statsCalls)
@@ -482,10 +504,14 @@ describe('third-party prompt audit panels', () => {
     expect(text).toContain('action_failed')
     expect(text).toContain('failure_rate')
     expect(text).toContain('alice')
+    // 节点异常项展示节点名与本地化状态，而不是裸 health 码与 UUID。
+    expect(text).toContain('节点 A')
+    expect(text).toContain('cooldown')
+    expect(text).toContain('rate_limited')
     await wrapper.get('[data-test="inbox-retry"]').trigger('click')
     await flushPromises()
     expect(mocks.retryAction).toHaveBeenCalledWith(5)
-    expect(wrapper.emitted('loaded')?.[0]).toEqual([3])
+    expect(wrapper.emitted('loaded')?.[0]).toEqual([4])
     expect(wrapper.get('[data-test="inbox-notification-window"]').text()).toContain('notificationWindowHint')
     // 下钻列表与分类计数同口径：通知失败只看下发的 7 天窗口，待核对同时列出 failed 与 unknown。
     const before = Date.now()

@@ -383,6 +383,8 @@ export default {
     "half_open": "恢复探测中",
     "misconfigured": "配置异常",
     "disabled": "未启用",
+    "notAudited": "未审核",
+    "healthUnknown": "未验证",
     "bindingTriggered": "指令上下文达到阈值，已执行关联裁决",
     "dispatch": "调度顺序",
     "health_then_load": "健康优先、空闲优先",

@@ -216,6 +216,40 @@ func TestInboxCountsLimitNotificationFailuresToWindow(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+// 待处理工作台只报真正的节点异常：未验证与未启用不算异常，时间取最近一次观测。
+func TestUnhealthyNodeEntriesSkipsUnverifiedNodes(t *testing.T) {
+	observed := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	cooldown := observed.Add(2 * time.Minute)
+	now := observed.Add(time.Hour)
+	items := unhealthyNodeEntries([]nodeRuntimeSnapshot{
+		{ModelID: "healthy", Health: nodeHealthHealthy},
+		{ModelID: "fresh", Health: nodeHealthUnknown},
+		{ModelID: "off", Health: nodeHealthDisabled},
+		{ModelID: "degraded", Name: "节点 A", Health: nodeHealthDegraded, LastErrorCode: "timeout", LastObservedAt: &observed},
+		{ModelID: "cooling", Health: nodeHealthCooldown, CooldownUntil: &cooldown},
+	}, now)
+	require.Len(t, items, 2)
+	require.Equal(t, InboxEntry{Category: "node_unhealthy", ActionType: "node", Name: "节点 A", Detail: "degraded",
+		Health: nodeHealthDegraded, ErrorCode: "timeout", OccurredAt: observed}, items[0])
+	require.Equal(t, "cooling", items[1].Detail)
+	require.Equal(t, nodeHealthCooldown, items[1].Health)
+	require.Equal(t, cooldown, items[1].OccurredAt)
+}
+
+// 保存配置只在连接参数或凭据变化时重置对应节点；改名、容量、策略等改动不影响节点健康。
+func TestChangedNodeIDsOnlyMarksConnectionChanges(t *testing.T) {
+	base := []ModelConfig{{ID: "a", Name: "A", Enabled: true, BaseURL: "https://a", Model: "m", TimeoutMS: 1000, MaxConcurrency: 2}}
+	same := append([]ModelConfig{}, base...)
+	require.Empty(t, changedNodeIDs(base, same, []KeyUpdate{{ModelID: "a", Action: "keep"}}))
+	renamed := []ModelConfig{{ID: "a", Name: "A2", Enabled: true, BaseURL: "https://a", Model: "m", TimeoutMS: 1000, MaxConcurrency: 8}}
+	require.Empty(t, changedNodeIDs(base, renamed, nil))
+	moved := []ModelConfig{{ID: "a", Name: "A", Enabled: true, BaseURL: "https://b", Model: "m", TimeoutMS: 1000, MaxConcurrency: 2}}
+	require.Equal(t, map[string]bool{"a": true}, changedNodeIDs(base, moved, nil))
+	require.Equal(t, map[string]bool{"a": true}, changedNodeIDs(base, same, []KeyUpdate{{ModelID: "a", Action: "replace"}}))
+	added := append(append([]ModelConfig{}, base...), ModelConfig{ID: "b", Enabled: true})
+	require.Empty(t, changedNodeIDs(base, added, nil))
+}
+
 // 动作列表可同时按多个执行状态筛选，工作台下钻与计数口径一致；非法状态直接拒绝。
 func TestListActionRecordsAcceptsMultipleExecutionStatuses(t *testing.T) {
 	db, mock, err := sqlmock.New()
