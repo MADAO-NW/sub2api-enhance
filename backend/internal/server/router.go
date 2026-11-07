@@ -121,10 +121,12 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	a.POST("/breakers/:hash/confirm", handler.ConfirmBreaker)
 	a.POST("/actions/:id/retry", handler.RetryAction)
 	a.POST("/users/:id/enable-and-reset", handler.EnableAndReset)
-	r.GET("/metrics", func(c *gin.Context) {
+	metricsHandler := func(c *gin.Context) {
 		c.Header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		c.String(200, handler.PrometheusMetrics(c.Request.Context()))
-	})
+	}
+	r.GET("/metrics", metricsHandler)
+	r.GET("/enhance/api/v1/metrics", metricsHandler)
 	r.GET("/health", updates.Health)
 	r.GET("/enhance/api/v1/health", updates.Health)
 	static := http.StripPrefix("/enhance/", http.FileServer(http.FS(assets)))
