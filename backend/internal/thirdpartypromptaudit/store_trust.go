@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"slices"
+	"time"
 
 	infraerrors "sub2api-enhance/internal/pkg/errors"
 	"sub2api-enhance/internal/pkg/logger"
@@ -134,6 +136,134 @@ func (l sqlInstructionLedger) tripBreaker(ctx context.Context, hash string, user
 func (l sqlInstructionLedger) updateBreakerUsers(ctx context.Context, hash string, users int) error {
 	_, err := l.tx.ExecContext(ctx, `UPDATE sub2api_enhance.instruction_breakers SET distinct_users=$2,updated_at=clock_timestamp() WHERE hash=$1`, hash, users)
 	return err
+}
+
+// drillLedger 是熔断演练用的内存实现：不写库，只复用判定流程。
+type drillLedger struct {
+	users      map[string]int
+	breakers   map[string]string
+	marks      map[string]bool
+	suppressed map[string]bool
+}
+
+func newDrillLedger() *drillLedger {
+	return &drillLedger{users: map[string]int{}, breakers: map[string]string{}, marks: map[string]bool{}, suppressed: map[string]bool{}}
+}
+
+func (l *drillLedger) lockInstruction(context.Context, string) error { return nil }
+
+func (l *drillLedger) breakerStatus(_ context.Context, hash string) (string, bool, error) {
+	status, ok := l.breakers[hash]
+	return status, ok, nil
+}
+
+func (l *drillLedger) markExists(_ context.Context, userID int64, hash string) (bool, error) {
+	return l.marks[itoa(int(userID))+":"+hash], nil
+}
+
+func (l *drillLedger) distinctUsers(_ context.Context, hash string) (int, error) {
+	return l.users[hash], nil
+}
+
+func (l *drillLedger) insertMark(_ context.Context, userID int64, hash string, _ int64, suppressed bool) error {
+	l.marks[itoa(int(userID))+":"+hash] = true
+	l.suppressed[itoa(int(userID))+":"+hash] = suppressed
+	l.users[hash]++
+	return nil
+}
+
+func (l *drillLedger) tripBreaker(_ context.Context, hash string, _ int, _ int64) error {
+	l.breakers[hash] = BreakerTripped
+	return nil
+}
+
+func (l *drillLedger) updateBreakerUsers(context.Context, string, int) error { return nil }
+
+// DrillResult 是熔断演练结果：每一步的用户数与判定，不写任何业务表。
+type DrillResult struct {
+	Hash      string   `json:"hash"`
+	Threshold int      `json:"threshold"`
+	Steps     []string `json:"steps"`
+	Tripped   bool     `json:"tripped"`
+}
+
+// DrillBreaker 用假哈希走一遍“只计一次 + 熔断”判定流程，供管理员验证规则是否符合预期。
+func DrillBreaker(hash string) (DrillResult, error) {
+	ledger := newDrillLedger()
+	result := DrillResult{Hash: hash, Threshold: instructionBreakerUserThreshold}
+	for userID := int64(1); userID <= int64(instructionBreakerUserThreshold)+1; userID++ {
+		outcome, err := applyInstructionViolations(context.Background(), ledger, userID, 0, []string{hash})
+		if err != nil {
+			return result, err
+		}
+		step := "用户" + itoa(int(userID)) + "："
+		switch {
+		case len(outcome.Tripped) > 0:
+			step += "触发熔断（暂停累计与停用）"
+			result.Tripped = true
+		case len(outcome.Countable) > 0:
+			step += "计一次"
+		case len(outcome.Suppressed) > 0:
+			step += "熔断暂停，不计入"
+		case len(outcome.Repeated) > 0:
+			step += "已计过，不重复计数"
+		default:
+			step += "无变化"
+		}
+		result.Steps = append(result.Steps, step)
+	}
+	return result, nil
+}
+
+// RecordNodeAuthNotice 记录一次审核节点凭据失效，每个任务只留一条，只通知管理员。
+func (r *Repository) RecordNodeAuthNotice(ctx context.Context, job *AuditJob, modelName, message string) error {
+	if job == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	action := Action{UserID: job.UserID, JobID: &job.ID, ActionType: "node_auth_notice", NotificationStatus: "pending",
+		AuthCacheStatus: "not_required", ExecutionStatus: "succeeded", AppliedAt: &now, CompletedAt: &now,
+		RuleSnapshot:     map[string]any{"model": modelName},
+		BusinessSnapshot: map[string]any{"model": modelName, "error": message, "request_id": job.RequestID}}
+	if job.Config.AdminEmail != "" {
+		action.Deliveries = []Delivery{{Recipient: job.Config.AdminEmail, Kind: "admin", Subject: "第三方提示词审计：审核节点凭据失效",
+			Body:   "<p>审核节点凭据被上游拒绝，节点已降级。</p><p>节点：" + modelName + "</p><p>错误：" + message + "</p>",
+			Status: "pending", Attempts: []DeliveryAttempt{}}}
+	} else {
+		action.NotificationStatus = "not_required"
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rule, _ := json.Marshal(action.RuleSnapshot)
+	business, _ := json.Marshal(action.BusinessSnapshot)
+	deliveries, _ := json.Marshal(action.Deliveries)
+	_, err = tx.ExecContext(ctx, `INSERT INTO sub2api_enhance.third_party_prompt_audit_enforcement_actions
+ (user_id,job_id,action_type,rule_snapshot,business_snapshot,notification_status,deliveries,auth_cache_status,execution_status,applied_at,completed_at)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (job_id,action_type) DO NOTHING`,
+		action.UserID, action.JobID, action.ActionType, string(rule), string(business), action.NotificationStatus, string(deliveries),
+		action.AuthCacheStatus, action.ExecutionStatus, action.AppliedAt, action.CompletedAt)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// TrustInstructions 批量信任指令块；单个失败不影响其他项，返回成功哈希。
+func (r *Repository) TrustInstructions(ctx context.Context, hashes []string, actorID int64, reason string) ([]string, error) {
+	trusted := make([]string, 0, len(hashes))
+	for _, hash := range hashes {
+		if err := r.TrustInstruction(ctx, hash, actorID, reason); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return trusted, err
+		}
+		trusted = append(trusted, hash)
+	}
+	return trusted, nil
 }
 
 // ListTrust 返回管理员信任的指令块及内容预览。

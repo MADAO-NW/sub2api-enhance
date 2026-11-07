@@ -2,6 +2,7 @@ package thirdpartypromptaudit
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,9 @@ import (
 	"sub2api-enhance/internal/pkg/response"
 	"sub2api-enhance/internal/server/middleware"
 )
+
+// exportLimit 限制单次导出条数，避免一次拉取过多目标正文。
+const exportLimit = 5000
 
 type AdminHandler struct {
 	service *Service
@@ -406,6 +410,75 @@ func (h *AdminHandler) ListBreakers(c *gin.Context) {
 		return
 	}
 	response.Success(c, result)
+}
+
+// DrillBreaker 用假哈希演示“只计一次 + 熔断”判定，不写任何业务表。
+func (h *AdminHandler) DrillBreaker(c *gin.Context) {
+	var input TrustRequest
+	if err := bindStrict(c, &input); err != nil {
+		response.BadRequest(c, "演练请求无效："+err.Error())
+		return
+	}
+	result, err := DrillBreaker(input.Hash)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+// TrustBatch 批量信任指令块，返回成功信任的哈希。
+func (h *AdminHandler) TrustBatch(c *gin.Context) {
+	var input struct {
+		Hashes []string `json:"hashes" binding:"required,min=1,max=200,dive,len=64"`
+		Reason string   `json:"reason" binding:"max=200"`
+	}
+	if err := bindStrict(c, &input); err != nil {
+		response.BadRequest(c, "批量信任请求无效："+err.Error())
+		return
+	}
+	trusted, err := h.repo.TrustInstructions(c.Request.Context(), input.Hashes, adminActor(c), input.Reason)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	middleware.SetAuditExtra(c, map[string]any{"result": "success", "requested": len(input.Hashes), "trusted": len(trusted)})
+	response.Success(c, gin.H{"trusted": trusted})
+}
+
+// ExportJobs 按当前过滤条件导出 CSV，用于合规取证。
+func (h *AdminHandler) ExportJobs(c *gin.Context) {
+	filter, err := filterFromQuery(c)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	rows, err := h.repo.ExportJobs(c.Request.Context(), filter, exportLimit)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.Header("Content-Type", "text/csv; charset=utf-8")
+	c.Header("Content-Disposition", "attachment; filename=third-party-prompt-audit.csv")
+	_, _ = c.Writer.WriteString("\ufeff")
+	writer := csv.NewWriter(c.Writer)
+	defer writer.Flush()
+	_ = writer.Write([]string{"job_id", "created_at", "user_id", "api_key_id", "platform", "protocol", "mode", "status", "decision", "trigger", "request_id",
+		"target_order", "target_kind", "resolution", "target_decision", "score", "reason", "bytes", "text"})
+	for _, row := range rows {
+		order, kind := "", ""
+		if row.Order != nil {
+			order = strconv.Itoa(*row.Order)
+		}
+		kind = row.Kind
+		score := ""
+		if row.Score != nil {
+			score = strconv.FormatFloat(*row.Score, 'f', 4, 64)
+		}
+		_ = writer.Write([]string{strconv.FormatInt(row.JobID, 10), row.CreatedAt.UTC().Format(time.RFC3339), strconv.FormatInt(row.UserID, 10),
+			strconv.FormatInt(row.APIKeyID, 10), row.Platform, row.Protocol, row.Mode, row.Status, row.Decision, row.Trigger, row.RequestID,
+			order, kind, row.Resolution, row.TargetDecision, score, row.Reason, strconv.Itoa(row.Bytes), row.Text})
+	}
 }
 
 func (h *AdminHandler) ConfirmBreaker(c *gin.Context) {

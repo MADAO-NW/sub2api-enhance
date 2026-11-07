@@ -2,7 +2,7 @@
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import Pagination from '@/components/common/Pagination.vue'
 import {
-  thirdPartyPromptAuditAPI as api, type BreakerEntry, type TrustEntry,
+  thirdPartyPromptAuditAPI as api, type BreakerEntry, type DrillResult, type TrustEntry,
 } from '@/api/admin/third-party-prompt-audit'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
@@ -18,6 +18,17 @@ const breakerPage = ref(1), breakerTotal = ref(0)
 const trusted = ref<TrustEntry[]>([])
 const trustPage = ref(1), trustTotal = ref(0)
 const loading = ref(false), pending = ref(''), error = ref('')
+// 熔断演练：用假哈希走一遍判定，不写任何业务表。
+const drillHash = ref('')
+const drill = ref<DrillResult | null>(null)
+const drilling = ref(false)
+async function runDrill() {
+  if (drillHash.value.length !== 64) { app.showError(label('drillHashInvalid')); return }
+  drilling.value = true
+  try { drill.value = await api.drillBreaker(drillHash.value) }
+  catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { drilling.value = false }
+}
 
 async function loadBreakers(silent = false) {
   if (!silent) { loading.value = true; error.value = '' }
@@ -112,6 +123,18 @@ onMounted(() => { void loadBreakers(); void loadTrust() })
         </table>
       </div>
       <Pagination :page="breakerPage" :page-size="20" :page-size-options="[20, 50]" :total="breakerTotal" @update:page="changeBreakerPage" />
+    </section>
+    <section class="card space-y-3 p-5" data-test="breaker-drill">
+      <h2 class="text-lg font-semibold">{{ label('breakerDrill') }}</h2>
+      <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('breakerDrillHint') }}</p>
+      <div class="flex flex-wrap items-end gap-3">
+        <label class="space-y-2 text-sm"><span>{{ label('instructionBlock') }}</span><input v-model="drillHash" class="input w-96 font-mono" :placeholder="label('drillHashPlaceholder')" /></label>
+        <button class="btn btn-secondary" :disabled="drilling || drillHash.length !== 64" @click="runDrill">{{ label(drilling ? 'loading' : 'runDrill') }}</button>
+      </div>
+      <div v-if="drill" class="space-y-1 text-sm">
+        <p>{{ label('threshold') }}: {{ drill.threshold }} · {{ drill.tripped ? label('drillTripped') : label('drillNotTripped') }}</p>
+        <p v-for="(step, index) in drill.steps" :key="index">{{ step }}</p>
+      </div>
     </section>
     <section class="card space-y-4 p-5">
       <div>

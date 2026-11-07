@@ -41,7 +41,7 @@ function job(): AuditJob {
     status: 'done', decision: 'block', current_round: 1, current_run_kind: 'request', current_requested_by: null, reuse_mode: 'allow',
     trigger_hash: 'hash-user', trigger_kind: 'user', enforcement_eligible: true, violation_counted: true, disable_counted: false,
     config_revision: 2, attempts: 1, max_attempts: 3, lease_until: null, next_attempt_at: '2026-09-06T00:00:00Z', failure_stage: '',
-    last_error_code: '', last_error_message: '', blocking_wait_ms: null, target_count: 2,
+    last_error_code: '', last_error_message: '', blocking_wait_ms: null, duration_ms: 1200, target_count: 2,
     started_at: '2026-09-06T00:00:00Z', finished_at: '2026-09-06T00:00:01Z', created_at: '2026-09-06T00:00:00Z', updated_at: '2026-09-06T00:00:01Z',
   }
 }
@@ -101,16 +101,16 @@ beforeEach(() => {
     from: '2026-09-05T00:00:00Z', to: '2026-09-06T00:00:00Z', timezone: 'Asia/Shanghai', mode: '',
     jobs: 12, orphan_jobs: 1, reaudit_jobs: 2, failed_jobs: 3, decisions: { pass: 8, review: 1, block: 3 },
     waiting_jobs: 2, waiting_since: '2026-09-06T00:00:00Z', action_pending: 1, action_by_state: { pending: 1 },
-    blocking_jobs: 4, blocking_avg_ms: 120, blocking_max_ms: 400,
-    cache_miss: [{ client: 'codex', targets: 4, model_calls: 1, miss_rate: 0.25 }],
+    blocking_jobs: 4, blocking_avg_ms: 120, blocking_max_ms: 400, blocking_p50_ms: 110, blocking_p95_ms: 380, job_p50_ms: 800, job_p95_ms: 2400,
+    cache_miss: [{ client: 'codex', kind: 'instruction', targets: 4, model_calls: 1, miss_rate: 0.25 }],
   })
   mocks.runtime.mockResolvedValue({
     warning_enabled: true, disable_enabled: true, instance_id: 'i', started_at: '2026-09-06T00:00:00Z', as_of: '2026-09-06T00:00:01Z',
     running: true, mode: 'async', revision: 1, expected_revision: 1, worker_capacity: 4, active_workers: 1, database_ok: true,
     database_error: '', config_error: '', intake_failures: 0, last_success: null, last_error: null,
-    evaluation_latency: { count: 0, capacity: 1000, p50_ms: null, p95_ms: null, from: null, to: null }, probes: [],
+    evaluation_latency: { count: 0, capacity: 1000, p50_ms: null, p95_ms: null, from: null, to: null }, probes: [], self_audit_nodes: [],
     scheduler: { backpressured_total: 0, blocking_waiters: 0, nodes: [] },
-    redis: { ok: true, status: 'ok', error: '', ttl_seconds: 1800, last_success: null },
+    redis: { ok: true, status: 'ok', error: '', ttl_seconds: 1800, check_error: '', last_success: null },
   })
   mocks.probeDetails.mockResolvedValue([])
 })

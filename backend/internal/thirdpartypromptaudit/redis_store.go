@@ -20,10 +20,12 @@ const turnKeyTTL = 30 * time.Minute
 
 // RedisRuntime 是运行态页面展示的 Redis 可用性。
 type RedisRuntime struct {
-	OK          bool       `json:"ok"`
-	Status      string     `json:"status"`
-	Error       string     `json:"error"`
-	TTLSeconds  int        `json:"ttl_seconds"`
+	OK         bool   `json:"ok"`
+	Status     string `json:"status"`
+	Error      string `json:"error"`
+	TTLSeconds int    `json:"ttl_seconds"`
+	// CheckError 记录启动自检失败原因（例如 ACL 不允许 SET/GET 或键前缀不匹配）。
+	CheckError  string     `json:"check_error"`
 	LastSuccess *time.Time `json:"last_success"`
 }
 
@@ -56,7 +58,37 @@ func NewRedisStore(ctx context.Context, rawURL string) (*RedisStore, error) {
 		return nil, errors.New("增强 Redis 连接不可用")
 	}
 	store.noteSuccess()
+	// 启动自检：真实读写一次回合键前缀，提前暴露 ACL 前缀/命令权限问题。
+	store.Check(ctx)
 	return store, nil
+}
+
+// Check 用一次带 TTL 的写入+读取验证回合键所需权限；失败只记录，不阻塞启动。
+func (s *RedisStore) Check(ctx context.Context) error {
+	key := redisKeyPrefix + "check"
+	if err := s.client.Set(ctx, key, "1", 10*time.Second).Err(); err != nil {
+		s.noteCheckError(err)
+		return err
+	}
+	value, err := s.client.Get(ctx, key).Result()
+	if err != nil {
+		s.noteCheckError(err)
+		return err
+	}
+	if value != "1" {
+		s.noteCheckError(errors.New("自检读取结果不匹配"))
+		return errors.New("自检读取结果不匹配")
+	}
+	s.mu.Lock()
+	s.state.CheckError = ""
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *RedisStore) noteCheckError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.CheckError = err.Error()
 }
 
 func (s *RedisStore) Close() error { return s.client.Close() }

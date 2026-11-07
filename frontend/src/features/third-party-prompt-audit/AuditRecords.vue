@@ -27,13 +27,26 @@ const states = ['queued', 'processing', 'retry', 'done', 'failed', 'skipped']
 const promptJobID = ref<number | null>(null)
 const promptTargets = ref<JobPrompt[]>([])
 const promptLoading = ref(false)
+// 正文按任务缓存，重复打开同一行不再请求。
+const promptCache = new Map<number, JobPrompt[]>()
 let generation = 0
-// 列表每 5 秒静默刷新一次；打开弹窗或正在加载时跳过，避免打断操作。
-const autoTimer = window.setInterval(() => {
-  if (!props.active || document.visibilityState !== 'visible') return
-  if (loading.value || detailID.value !== null || promptJobID.value !== null || previewRequest.value !== null) return
-  void load(true)
-}, 5000)
+// 自适应轮询：有待办变化时 5 秒一次，连续两次无变化后退避到 15 秒；弹窗或加载中跳过。
+let autoDelay = 5000
+let lastSignature = ''
+let autoTimer = 0
+function scheduleRefresh() {
+  autoTimer = window.setTimeout(async () => {
+    if (props.active && document.visibilityState === 'visible' && !loading.value && detailID.value === null && promptJobID.value === null && previewRequest.value === null) {
+      const before = lastSignature
+      await load(true)
+      const signature = `${total.value}:${rows.value.map(row => `${row.id}-${row.status}-${row.decision ?? ''}`).join(',')}`
+      lastSignature = signature
+      autoDelay = signature !== before && before !== '' ? 5000 : Math.min(autoDelay === 5000 ? 15000 : autoDelay, 15000)
+    }
+    scheduleRefresh()
+  }, autoDelay)
+}
+scheduleRefresh()
 
 async function load(silent = false) {
   const current = ++generation
@@ -102,12 +115,42 @@ function closePreview() {
   submitted.value = false
   draftReuse.value = 'allow'
 }
+const promptTrusting = ref(false)
+const exporting = ref(false)
+async function togglePromptTrust(target: JobPrompt) {
+  promptTrusting.value = true
+  try {
+    if (target.trusted) await api.untrust(target.hash)
+    else await api.trust(target.hash, '任务列表手工信任')
+    target.trusted = !target.trusted
+    promptCache.delete(promptJobID.value ?? 0)
+    app.showSuccess(label('saved'))
+  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { promptTrusting.value = false }
+}
+async function exportCSV() {
+  exporting.value = true
+  try {
+    const blob = await api.exportJobs(applied.value)
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `third-party-prompt-audit-${new Date().toISOString().slice(0, 10)}.csv`
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { exporting.value = false }
+}
+
 async function openPrompts(id: number) {
   promptJobID.value = id
+  const cached = promptCache.get(id)
+  if (cached) { promptTargets.value = cached; return }
   promptTargets.value = []
   promptLoading.value = true
   try {
     promptTargets.value = (await api.jobPrompts(id)).targets
+    promptCache.set(id, promptTargets.value)
   } catch (err) {
     app.showError(extractApiErrorMessage(err, label('error')))
     promptJobID.value = null
@@ -139,7 +182,7 @@ watch(() => props.initialFilter, value => {
 }, { immediate: true })
 watch(() => props.refreshKey, () => { void load() })
 onUnmounted(() => {
-  window.clearInterval(autoTimer)
+  window.clearTimeout(autoTimer)
   generation++
 })
 </script>
@@ -160,6 +203,7 @@ onUnmounted(() => {
       <div class="flex flex-wrap gap-3">
         <button class="btn btn-primary" :disabled="loading">{{ label(loading ? 'loading' : 'apply') }}</button>
         <button type="button" class="btn btn-secondary" :disabled="loading" data-test="reset-filters" @click="resetFilters">{{ label('resetFilters') }}</button>
+        <button type="button" class="btn btn-secondary" :disabled="exporting" data-test="export-jobs" @click="exportCSV">{{ label(exporting ? 'loading' : 'exportCSV') }}</button>
         <button type="button" class="btn btn-secondary" :disabled="loading || !selected.length" @click="openPreview(true)">{{ label('reauditSelected') }} ({{ selected.length }})</button>
         <button type="button" class="btn btn-secondary" :disabled="loading || !total" @click="openPreview(false)">{{ label('reauditFilter') }} ({{ total }})</button>
       </div>
@@ -211,7 +255,7 @@ onUnmounted(() => {
                 <p v-if="row.disable_counted">{{ label('disableCounted') }}</p>
               </td>
               <td class="p-3"><button class="btn btn-secondary btn-sm whitespace-nowrap" data-test="view-prompt" @click="openPrompts(row.id)">{{ label('viewPrompt') }}</button></td>
-              <td class="whitespace-nowrap p-3">{{ formatMS(row.blocking_wait_ms) }}</td>
+              <td class="whitespace-nowrap p-3">{{ formatMS(row.duration_ms) }}<span v-if="row.blocking_wait_ms !== null" class="mt-1 block text-xs text-gray-500">{{ label('blockingWait') }} {{ formatMS(row.blocking_wait_ms) }}</span></td>
               <td class="p-3"><button class="btn btn-secondary btn-sm whitespace-nowrap" @click="detailID = row.id">{{ label('detail') }}</button></td>
             </tr>
             <tr v-if="!loading && !rows.length"><td colspan="9" class="p-10 text-center text-gray-500">{{ label('empty') }}</td></tr>
@@ -231,6 +275,7 @@ onUnmounted(() => {
             <span>{{ target.bytes }} B</span>
             <span v-if="target.resolution">{{ label('resolution') }}: {{ label(target.resolution) }}</span>
             <span v-if="target.decision">{{ label(target.decision) }}<template v-if="target.score !== null"> · {{ target.score }}</template></span>
+            <button v-if="target.kind === 'instruction'" class="btn btn-secondary btn-sm" :disabled="promptTrusting" data-test="trust-target" @click="togglePromptTrust(target)">{{ label(target.trusted ? 'untrust' : 'trust') }}</button>
           </div>
           <pre class="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white p-3 text-xs dark:bg-dark-950">{{ target.text || '—' }}</pre>
           <p v-if="target.reason" class="text-xs text-gray-500 dark:text-dark-400">{{ target.reason }}</p>

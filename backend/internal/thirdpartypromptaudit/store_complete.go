@@ -258,10 +258,18 @@ func (r *Repository) CompleteAuditJob(ctx context.Context, job *AuditJob, foregr
 	}
 	if runKind == "request" && foreground && job.Mode == "blocking" && eligible && decision == DecisionBlock {
 		now := time.Now().UTC()
+		// 同一次违规已经产生提醒动作时不再重复发信，只保留阻断证据。
+		merged := slices.Contains(actionTypes, "warning")
+		status := "pending"
+		if merged {
+			status = "not_required"
+		}
 		action := Action{UserID: job.UserID, JobID: &job.ID, ActionType: "blocking_notice", ExecutionStatus: "succeeded", AppliedAt: &now, CompletedAt: &now,
-			NotificationStatus: "pending", AuthCacheStatus: "not_required", RuleSnapshot: map[string]any{"audit_revision": job.Config.Revision, "decision": decision},
+			NotificationStatus: status, AuthCacheStatus: "not_required", RuleSnapshot: map[string]any{"audit_revision": job.Config.Revision, "decision": decision},
 			BusinessSnapshot: map[string]any{"user": user, "request_id": job.RequestID, "trigger_hash": trigger.Hash, "trigger_kind": trigger.Kind}}
-		action.Deliveries = jobActionDeliveries(action, user, current.AdminEmail)
+		if !merged {
+			action.Deliveries = jobActionDeliveries(action, user, current.AdminEmail)
+		}
 		if len(action.Deliveries) == 0 {
 			action.NotificationStatus = "not_required"
 		}

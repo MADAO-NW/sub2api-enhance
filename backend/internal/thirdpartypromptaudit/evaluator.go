@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
+	"sync"
 	"time"
+
+	"sub2api-enhance/internal/pkg/logger"
 )
 
 // blockingCapacityWait 是同步审核等待节点容量的上限（既定 5 秒边界）。
@@ -98,26 +102,71 @@ func (e *Evaluator) Review(ctx context.Context, job *AuditJob, target *JobTarget
 		return nil, &AuditError{Code: "no_models", Stage: "config", Message: "没有启用审核节点"}
 	}
 	blockThreshold := aggregationBlockThreshold(job.Config.Aggregation, len(models))
-	remaining := models
+	remaining := append([]ModelConfig(nil), models...)
 	results := make([]NodeResult, 0, len(models))
 	blocks := 0
-	for index := range models {
+
+	// 阶段 1：不等待容量地抢占节点；选择与摘除串行执行，保证同一次执行不重复选择同一节点。
+	type reserved struct {
+		model    ModelConfig
+		release  func()
+		dispatch DispatchSnapshot
+	}
+	held := make([]reserved, 0, len(models))
+	for len(remaining) > 0 {
+		model, release, dispatch, acquireErr := e.node.acquireWithPolicy(ctx, remaining, false)
+		if acquireErr != nil {
+			break
+		}
+		held = append(held, reserved{model: model, release: release, dispatch: dispatch})
+		remaining = slices.DeleteFunc(remaining, func(candidate ModelConfig) bool { return candidate.ID == model.ID })
+	}
+
+	// 阶段 2：已抢到容量的节点并行调用；任一节点判定违规后仍按聚合规则决定是否提前结束。
+	if len(held) > 0 {
+		records := make([]*NodeResult, len(held))
+		failures := make([]*AuditError, len(held))
+		var wait sync.WaitGroup
+		for index := range held {
+			wait.Add(1)
+			go func(index int) {
+				defer wait.Done()
+				defer held[index].release()
+				records[index], failures[index] = e.runNode(ctx, job, target, keys, held[index].model, held[index].dispatch)
+			}(index)
+		}
+		wait.Wait()
+		for index := range held {
+			if failures[index] != nil {
+				return nil, failures[index]
+			}
+		}
+		for index := range held {
+			record := records[index]
+			results = append(results, *record)
+			if record.Error == nil && record.Confidence != nil && classifyScore(*record.Confidence, job.Config.Config) == DecisionBlock {
+				blocks++
+			}
+		}
+	}
+
+	// 阶段 3：容量不足的节点按原有语义（同步模式等待 5 秒）逐个补足。
+	for len(remaining) > 0 && !(blocks >= blockThreshold && job.Config.Aggregation != "all_block") {
 		if ctx.Err() != nil {
 			return nil, requestFailure(ctx.Err())
 		}
-		record, stop := e.callNode(ctx, job, target, keys, &remaining, &index)
+		record, stop := e.callNode(ctx, job, target, keys, &remaining)
 		if record == nil {
 			return nil, stop
 		}
 		results = append(results, *record)
-		if record.Error == nil && classifyScore(*record.Confidence, job.Config.Config) == DecisionBlock {
+		if record.Error == nil && record.Confidence != nil && classifyScore(*record.Confidence, job.Config.Config) == DecisionBlock {
 			blocks++
 		}
-		if blocks >= blockThreshold && job.Config.Aggregation != "all_block" {
-			for _, model := range remaining {
-				results = append(results, NodeResult{ModelID: model.ID, ModelName: model.Name, Skipped: true, SkipReason: "aggregation_reached"})
-			}
-			break
+	}
+	if blocks >= blockThreshold && job.Config.Aggregation != "all_block" {
+		for _, model := range remaining {
+			results = append(results, NodeResult{ModelID: model.ID, ModelName: model.Name, Skipped: true, SkipReason: "aggregation_reached"})
 		}
 	}
 	votes := votesFrom(results, job.Config.Config)
@@ -135,7 +184,7 @@ func (e *Evaluator) Review(ctx context.Context, job *AuditJob, target *JobTarget
 }
 
 // callNode 调度一个节点并完成一次真实调用；调度失败返回 nil 和致命错误。
-func (e *Evaluator) callNode(ctx context.Context, job *AuditJob, target *JobTarget, keys map[string]string, remaining *[]ModelConfig, index *int) (*NodeResult, *AuditError) {
+func (e *Evaluator) callNode(ctx context.Context, job *AuditJob, target *JobTarget, keys map[string]string, remaining *[]ModelConfig) (*NodeResult, *AuditError) {
 	waitForCapacity := job.Mode == "blocking"
 	acquireCtx := ctx
 	var cancel context.CancelFunc
@@ -160,6 +209,11 @@ func (e *Evaluator) callNode(ctx context.Context, job *AuditJob, target *JobTarg
 			break
 		}
 	}
+	return e.runNode(ctx, job, target, keys, model, dispatch)
+}
+
+// runNode 在已占用的容量上完成一次真实节点调用并更新节点健康。
+func (e *Evaluator) runNode(ctx context.Context, job *AuditJob, target *JobTarget, keys map[string]string, model ModelConfig, dispatch DispatchSnapshot) (*NodeResult, *AuditError) {
 	key := keys[model.ID]
 	if key == "" {
 		return nil, &AuditError{Code: "credential_binding_unavailable", Stage: "config", Message: "审核节点凭据不可用"}
@@ -175,6 +229,12 @@ func (e *Evaluator) callNode(ctx context.Context, job *AuditJob, target *JobTarg
 	score, attemptID, failure := e.client.EvaluateTarget(ctx, job, model, key, job.Config, client, url, target.Kind, target.Text, target.Hash, &order)
 	// 只有真实节点调用才更新节点健康。
 	e.node.observe(model.ID, failure, time.Since(started))
+	if failure != nil && authFailure(failure) {
+		// 凭据失效单独通知管理员；每任务只记一次，通知失败不影响审核结论。
+		if err := e.repo.RecordNodeAuthNotice(ctx, job, model.Name, failure.Message); err != nil {
+			logger.LegacyPrintf("third_party_prompt_audit", "审核节点凭据失效通知写入失败 job_id=%d model=%s error=%v", job.ID, model.Name, err)
+		}
+	}
 	record := &NodeResult{ModelID: model.ID, ModelName: model.Name, AttemptID: &attemptID, Dispatch: &dispatch}
 	if failure != nil {
 		record.Error = failure
@@ -183,6 +243,16 @@ func (e *Evaluator) callNode(ctx context.Context, job *AuditJob, target *JobTarg
 	record.Confidence = &score.Confidence
 	record.Reason = score.Reason
 	return record, nil
+}
+
+// authFailure 判断节点失败是否属于凭据被上游拒绝。
+func authFailure(failure *AuditError) bool {
+	if failure == nil {
+		return false
+	}
+	message := strings.ToUpper(failure.Message)
+	return strings.Contains(message, "HTTP 401") || strings.Contains(message, "HTTP 403") ||
+		strings.Contains(message, "INVALID_API_KEY") || strings.Contains(failure.Code, "unauthorized")
 }
 
 // votesFrom 把节点投票还原为聚合输入；失败与跳过保持原样，未知票不会被当成通过。

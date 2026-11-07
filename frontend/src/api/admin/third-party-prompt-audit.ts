@@ -15,6 +15,8 @@ export interface AuditModel {
   timeout_ms: number
   max_concurrency: number
   parameters?: Record<string, unknown>
+  // allow_self_audit 允许把节点指向本机/内网网关（自审）。
+  allow_self_audit?: boolean
 }
 
 export interface UserRuleConfig {
@@ -234,6 +236,8 @@ export interface AuditJob {
   last_error_code: string
   last_error_message: string
   blocking_wait_ms: number | null
+  // duration_ms 是任务从创建到结束的总耗时，两种模式都有值。
+  duration_ms: number
   target_count: number
   started_at: string | null
   finished_at: string | null
@@ -251,6 +255,7 @@ export interface JobPrompt {
   decision?: AuditDecision
   reason?: string
   score: number | null
+  trusted: boolean
 }
 
 export interface JobDetail {
@@ -306,7 +311,21 @@ export interface ReauditRequest { reuse_mode?: 'allow' | 'force'; filter: AuditF
 export interface ReauditResult { matched: number; ready: number; items: { job_id: number; status: string; reason: string }[] }
 
 export interface Distribution { count: number; p50_ms: number | null; p95_ms: number | null }
-export interface ClientMissRate { client: string; targets: number; model_calls: number; miss_rate: number }
+export interface ClientMissRate { client: string; kind: PromptKind; targets: number; model_calls: number; miss_rate: number }
+
+// RetentionRecord 是最近一次保留期清理结果。
+export interface RetentionRecord {
+  finished_at: string
+  days: number
+  jobs: number
+  probe_attempts: number
+  reviews: number
+  texts: number
+  duration_ms: number
+  error: string
+}
+
+export interface DrillResult { hash: string; threshold: number; steps: string[]; tripped: boolean }
 
 export interface AuditRuntime {
   warning_enabled: boolean
@@ -327,6 +346,8 @@ export interface AuditRuntime {
   last_success: string | null
   last_error: { code: string; message: string; at: string } | null
   evaluation_latency: Distribution & { capacity: number; from: string | null; to: string | null }
+  retention?: RetentionRecord
+  self_audit_nodes: string[]
   probes: ProbeResult[]
   scheduler?: {
     backpressured_total: number
@@ -337,7 +358,7 @@ export interface AuditRuntime {
       last_error_code: string; last_observed_at: string | null
     }[]
   }
-  redis?: { ok: boolean; status: string; error: string; ttl_seconds: number; last_success: string | null }
+  redis?: { ok: boolean; status: string; error: string; ttl_seconds: number; check_error: string; last_success: string | null }
 }
 
 export interface StatsQuery { from: string; to: string; timezone: string; mode?: string }
@@ -356,6 +377,10 @@ export interface AuditStats extends StatsQuery {
   blocking_jobs: number
   blocking_avg_ms: number | null
   blocking_max_ms: number | null
+  blocking_p50_ms: number | null
+  blocking_p95_ms: number | null
+  job_p50_ms: number | null
+  job_p95_ms: number | null
   cache_miss: ClientMissRate[]
 }
 
@@ -393,6 +418,12 @@ export const thirdPartyPromptAuditAPI = {
     return (await apiClient.get<AuditPage<BreakerEntry>>(`${base}/breakers`, { params: { status, page, page_size: pageSize } })).data
   },
   async confirmBreaker(hash: string) { return (await apiClient.post(`${base}/breakers/${hash}/confirm`)).data },
+  async drillBreaker(hash: string) { return (await apiClient.post<DrillResult>(`${base}/breakers/drill`, { hash })).data },
+  async trustBatch(hashes: string[], reason = '') { return (await apiClient.post<{ trusted: string[] }>(`${base}/trust/batch`, { hashes, reason })).data },
+  async exportJobs(filter: AuditFilter) {
+    const response = await apiClient.get(`${base}/jobs/export`, { params: { ...filter, ids: filter.ids?.join(',') }, responseType: 'blob', headers: { 'X-Enhance-Request': '1' } })
+    return response.data as Blob
+  },
   async enableAndReset(id: number) { return (await apiClient.post<{ action_id: number; execution_status: string }>(`${base}/users/${id}/enable-and-reset`)).data },
   async retryAction(id: number) { return (await apiClient.post(`${base}/actions/${id}/retry`)).data }
 }

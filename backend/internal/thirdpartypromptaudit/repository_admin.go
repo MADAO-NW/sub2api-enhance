@@ -7,6 +7,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/lib/pq"
 )
@@ -183,6 +184,7 @@ type JobPrompt struct {
 	Decision   string   `json:"decision,omitempty"`
 	Reason     string   `json:"reason,omitempty"`
 	Score      *float64 `json:"score"`
+	Trusted    bool     `json:"trusted"`
 }
 
 // JobPrompts 只读取当前轮的审核目标正文，不加载调用流水与处置动作。
@@ -208,7 +210,7 @@ func (r *Repository) JobPrompts(ctx context.Context, id int64) ([]JobPrompt, err
 	items := make([]JobPrompt, 0, len(targets))
 	for _, target := range targets {
 		item := JobPrompt{Order: target.Order, Kind: target.Kind, Hash: target.Hash, Text: target.Text, Bytes: target.Bytes,
-			Resolution: target.Resolution, Decision: string(target.Decision)}
+			Resolution: target.Resolution, Decision: string(target.Decision), Trusted: target.Trusted}
 		if target.ReviewID != nil {
 			if review := reviews[*target.ReviewID]; review != nil {
 				item.Reason, item.Score = review.Reason, review.Score
@@ -339,6 +341,62 @@ func (r *Repository) appendRound(ctx context.Context, jobID, actorID int64, reus
 		return err
 	}
 	return tx.Commit()
+}
+
+// ExportRow 是任务导出的一行：任务字段 + 当前轮目标正文与结论。
+type ExportRow struct {
+	JobID          int64
+	CreatedAt      time.Time
+	UserID         int64
+	APIKeyID       int64
+	Platform       string
+	Protocol       string
+	Mode           string
+	Status         string
+	Decision       string
+	Trigger        string
+	RequestID      string
+	Order          *int
+	Kind           string
+	Resolution     string
+	TargetDecision string
+	Score          *float64
+	Reason         string
+	Bytes          int
+	Text           string
+}
+
+// ExportJobs 按过滤条件导出任务及其当前轮目标，供合规取证。
+func (r *Repository) ExportJobs(ctx context.Context, filter Filter, limit int) ([]ExportRow, error) {
+	if err := validateFilter(filter); err != nil {
+		return nil, err
+	}
+	where, args := filterSQL(filter, true)
+	pageArg := len(args) + 1
+	query := `SELECT j.id,j.created_at,j.user_id,j.api_key_id,j.platform,j.protocol,j.mode,j.status,COALESCE(j.decision,''),COALESCE(j.trigger_kind,''),j.request_id,
+ t.target_order,t.kind,COALESCE(t.resolution,''),COALESCE(t.decision,''),r.score,COALESCE(r.reason,''),COALESCE(p.bytes,0),COALESCE(p.text,'')
+ FROM sub2api_enhance.audit_jobs j
+ LEFT JOIN sub2api_enhance.audit_job_targets t ON t.job_id=j.id AND t.round=j.current_round
+ LEFT JOIN sub2api_enhance.prompt_texts p ON p.hash=t.hash
+ LEFT JOIN sub2api_enhance.prompt_reviews r ON r.id=t.review_id
+ WHERE ` + where + ` ORDER BY j.id DESC,t.target_order LIMIT $` + itoa(pageArg)
+	args = append(args, limit)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	items := make([]ExportRow, 0)
+	for rows.Next() {
+		var item ExportRow
+		if err := rows.Scan(&item.JobID, &item.CreatedAt, &item.UserID, &item.APIKeyID, &item.Platform, &item.Protocol, &item.Mode,
+			&item.Status, &item.Decision, &item.Trigger, &item.RequestID, &item.Order, &item.Kind, &item.Resolution,
+			&item.TargetDecision, &item.Score, &item.Reason, &item.Bytes, &item.Text); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 // jobFilterWhere 供统计与列表共用同一套过滤语义。

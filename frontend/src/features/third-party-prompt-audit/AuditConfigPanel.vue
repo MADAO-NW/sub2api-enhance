@@ -59,6 +59,8 @@ const probeInput = computed({
     else { probeScenario.value = 'custom'; customProbeInput.value = value }
   }
 })
+// 旧版政策仍含已下线的审核阶段名，给出提示并可一键换成新版默认政策。
+const deprecatedPolicy = computed(() => !!draft.value && /audit_stage|intent_binding|effective_behavior|current_user/.test(draft.value.audit_prompt))
 const dirty = computed(() => !!saved.value && !!draft.value && (JSON.stringify(draft.value) !== JSON.stringify(editableConfig(saved.value)) || Object.values(keys).some(key => key.action !== 'keep')))
 const resetUsers = computed(() => users.value.filter(user => user.role === 'user'))
 const ruleUsers = computed(() => users.value.filter(user => !(draft.value?.user_rules ?? []).some(rule => rule.user_id === user.id)))
@@ -364,6 +366,10 @@ watch(() => props.refreshKey, () => { void load(true) })
         <section class="card p-5 sm:p-6">
           <div class="flex flex-wrap items-center justify-between gap-3"><h2 class="text-lg font-semibold">{{ label('policy') }}</h2><button v-if="contract" type="button" class="btn btn-secondary" @click="draft.audit_prompt = contract.default_policy">{{ label('defaultPolicy') }}</button></div><p class="mb-5 mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('promptHint') }}</p>
           <div class="grid gap-6 xl:grid-cols-2">
+            <p v-if="deprecatedPolicy" class="rounded-lg bg-amber-50 p-3 text-sm text-amber-800 dark:bg-amber-950/30 dark:text-amber-200" data-test="deprecated-policy">
+              {{ label('deprecatedPolicyHint') }}
+              <button type="button" class="btn btn-secondary btn-sm ml-2" @click="draft.audit_prompt = contract?.default_policy ?? draft.audit_prompt">{{ label('useDefaultPolicy') }}</button>
+            </p>
             <label class="block space-y-2"><span class="text-sm font-medium">{{ label('policy') }}</span><textarea v-model="draft.audit_prompt" class="input min-h-96 font-mono text-sm" rows="18" required data-test="audit-policy" /></label>
             <div v-if="contract" class="min-w-0 space-y-2"><h3 class="text-sm font-medium">{{ label('contract') }} · {{ contract.version }}</h3><pre class="max-h-96 overflow-auto whitespace-pre-wrap rounded-xl bg-gray-50 p-4 text-sm dark:bg-dark-900" data-test="fixed-contract">{{ contract.output_contract }}</pre></div>
           </div>
@@ -379,6 +385,7 @@ watch(() => props.refreshKey, () => { void load(true) })
               <label class="space-y-2"><span class="text-sm">{{ label('model') }}</span><input v-model="model.model" class="input" required :list="`audit-models-${model.id}`" :placeholder="label('chooseOrInputModel')" data-test="model-input" /><datalist :id="`audit-models-${model.id}`"><option v-for="option in modelOptions[model.id] ?? []" :key="option" :value="option" /></datalist></label>
               <label class="space-y-2"><span class="text-sm">{{ label('timeout') }}</span><input v-model.number="model.timeout_ms" class="input" type="number" min="1" step="1" required /></label>
               <label class="space-y-2"><span class="text-sm">{{ label('nodeMaxConcurrency') }}</span><input v-model.number="model.max_concurrency" class="input" type="number" min="1" step="1" required /></label>
+              <label class="flex items-center gap-2 self-end pb-3 text-sm"><input v-model="model.allow_self_audit" type="checkbox" />{{ label('allowSelfAudit') }}</label>
             </div>
             <p class="text-sm"><span class="text-gray-500 dark:text-dark-400">{{ label('name') }}：</span>{{ model.name || label('chooseModel') }}</p>
             <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('timeoutHint') }}</p>

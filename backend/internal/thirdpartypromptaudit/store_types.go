@@ -68,11 +68,13 @@ type AuditJob struct {
 	LastErrorCode       string         `json:"last_error_code"`
 	LastErrorMessage    string         `json:"last_error_message"`
 	BlockingWaitMS      *int64         `json:"blocking_wait_ms"`
-	TargetCount         int            `json:"target_count"`
-	StartedAt           *time.Time     `json:"started_at"`
-	FinishedAt          *time.Time     `json:"finished_at"`
-	CreatedAt           time.Time      `json:"created_at"`
-	UpdatedAt           time.Time      `json:"updated_at"`
+	// DurationMS 是任务从创建到结束的总耗时，两种模式都有值（未结束为 0）。
+	DurationMS  int64      `json:"duration_ms"`
+	TargetCount int        `json:"target_count"`
+	StartedAt   *time.Time `json:"started_at"`
+	FinishedAt  *time.Time `json:"finished_at"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 	// Dispatched 表示本次执行已经发出真实模型调用，用于区分容量退回和普通失败。
 	Dispatched bool `json:"-"`
 }

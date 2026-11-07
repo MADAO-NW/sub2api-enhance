@@ -100,11 +100,16 @@ type RuntimeSnapshot struct {
 	Probes            []ProbeResult            `json:"probes"`
 	Scheduler         schedulerRuntimeSnapshot `json:"scheduler"`
 	Redis             RedisRuntime             `json:"redis"`
+	// Retention 是最近一次保留期清理的结果。
+	Retention *RetentionRecord `json:"retention,omitempty"`
+	// SelfAuditNodes 列出指向本机/内网的启用节点，提示审核与被审可能同源。
+	SelfAuditNodes []string `json:"self_audit_nodes"`
 }
 
 func (s *Service) Runtime(ctx context.Context) RuntimeSnapshot {
 	result := RuntimeSnapshot{InstanceID: s.metrics.InstanceID, StartedAt: s.metrics.StartedAt, AsOf: time.Now().UTC(), Running: s.running.Load(),
-		Mode: s.config.EffectiveMode(), ActiveWorkers: s.active.Load(), IntakeFailures: s.metrics.IntakeFailures.Load(), Probes: []ProbeResult{}}
+		Mode: s.config.EffectiveMode(), ActiveWorkers: s.active.Load(), IntakeFailures: s.metrics.IntakeFailures.Load(),
+		Probes: []ProbeResult{}, SelfAuditNodes: []string{}}
 	result.WorkerCapacity = s.config.WorkerCapacity()
 	if s.redis != nil {
 		result.Redis = s.redis.Runtime()
@@ -125,8 +130,14 @@ func (s *Service) Runtime(ctx context.Context) RuntimeSnapshot {
 		result.ConfigError = s.config.loadError.Error()
 	}
 	s.config.mu.RUnlock()
+	result.Retention = s.retentionSnapshot()
 	if snapshot, err := s.config.Active(); err == nil {
 		result.Scheduler = s.evaluator.nodeScheduler().runtime(snapshot.Models)
+		for _, model := range snapshot.Models {
+			if model.Enabled && privateNodeHost(model.BaseURL) {
+				result.SelfAuditNodes = append(result.SelfAuditNodes, model.Name)
+			}
+		}
 	} else {
 		result.Scheduler = schedulerRuntimeSnapshot{Nodes: []nodeRuntimeSnapshot{}}
 	}

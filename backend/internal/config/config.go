@@ -17,9 +17,11 @@ type Config struct {
 	EnhanceRedisURL                                                         string
 	Listen, DatabaseURL, OfficialURL, PublicOrigin, AdminKey, EncryptionKey string
 	TrustedProxies                                                          []string
-	DatabaseConnections, IngressConnections                                 int
-	SMTPHost, SMTPPort, SMTPUser, SMTPPassword, SMTPFrom, SMTPFromName      string
-	SMTPUseTLS                                                              bool
+	// ReadonlyToken 仅用于只读监控接口（stats/runtime），为空时不开放只读通道。
+	ReadonlyToken                                                      string
+	DatabaseConnections, IngressConnections                            int
+	SMTPHost, SMTPPort, SMTPUser, SMTPPassword, SMTPFrom, SMTPFromName string
+	SMTPUseTLS                                                         bool
 }
 
 func Load() (*Config, error) {

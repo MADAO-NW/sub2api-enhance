@@ -17,7 +17,8 @@ const auditJobColumns = `j.id,j.user_id,j.api_key_id,j.group_id,j.identity_snaps
 j.turn_fingerprint,j.orphan_continuation,j.status,COALESCE(j.decision,'') AS decision,j.current_round,j.current_run_kind,j.current_requested_by,j.reuse_mode,
 COALESCE(j.trigger_hash,'') AS trigger_hash,COALESCE(j.trigger_kind,'') AS trigger_kind,j.enforcement_eligible,j.violation_counted,j.disable_counted,
 j.config_revision,j.config_snapshot,j.attempts,j.max_attempts,j.claim_generation,j.lease_until,j.next_attempt_at,COALESCE(j.failure_stage,'') AS failure_stage,
-COALESCE(j.last_error_code,'') AS last_error_code,COALESCE(j.last_error_message,'') AS last_error_message,j.blocking_wait_ms,j.started_at,j.finished_at,j.created_at,j.updated_at,
+COALESCE(j.last_error_code,'') AS last_error_code,COALESCE(j.last_error_message,'') AS last_error_message,j.blocking_wait_ms,
+COALESCE((EXTRACT(EPOCH FROM (j.finished_at-j.created_at))*1000)::bigint,0) AS duration_ms,j.started_at,j.finished_at,j.created_at,j.updated_at,
 COALESCE(NULLIF(display_user.username,''),j.identity_snapshot::json->>'username','') AS display_username,
 COALESCE(NULLIF(display_user.email,''),j.identity_snapshot::json->>'user_email','') AS display_email,
 (SELECT count(*) FROM sub2api_enhance.audit_job_targets t WHERE t.job_id=j.id AND t.round=j.current_round) AS target_count`

@@ -54,6 +54,12 @@ watch(() => props.refreshKey, () => { void refresh() })
       <span class="py-2 text-xs text-gray-500 dark:text-dark-400">{{ label('timezone') }}: {{ timezone }}</span>
     </form>
     <p v-if="error" class="rounded-xl bg-red-50 p-4 text-red-700 dark:bg-red-950/30 dark:text-red-300" role="alert">{{ error }}</p>
+    <p v-if="runtime?.self_audit_nodes?.length" class="rounded-xl bg-amber-50 p-4 text-sm text-amber-800 dark:bg-amber-950/30 dark:text-amber-200" data-test="self-audit-warning">
+      {{ label('selfAuditWarning') }}: {{ runtime.self_audit_nodes.join('、') }}
+    </p>
+    <p v-if="runtime?.redis?.check_error" class="rounded-xl bg-red-50 p-4 text-sm text-red-700 dark:bg-red-950/30 dark:text-red-300" data-test="redis-check-error">
+      {{ label('redisCheckFailed') }}: {{ runtime.redis.check_error }}
+    </p>
     <template v-if="stats">
       <p class="text-sm text-gray-500 dark:text-dark-400">{{ formatTime(stats.from) }} — {{ formatTime(stats.to) }} · {{ stats.timezone }} · {{ label('mode') }}: {{ label(stats.mode || 'all') }}</p>
       <section class="card p-5" data-test="audit-overview-summary">
@@ -98,7 +104,8 @@ watch(() => props.refreshKey, () => { void refresh() })
         <section class="card p-5">
           <h2 class="text-lg font-semibold">{{ label('blockingWait') }}</h2>
           <p class="my-2 text-sm text-gray-500 dark:text-dark-400">{{ label('blockingWaitHint') }}</p>
-          <p class="text-sm">{{ label('jobs') }}: {{ stats.blocking_jobs }} · {{ label('average') }}: {{ formatMS(stats.blocking_avg_ms) }} · {{ label('maximum') }}: {{ formatMS(stats.blocking_max_ms) }}</p>
+          <p class="text-sm">{{ label('jobs') }}: {{ stats.blocking_jobs }} · {{ label('average') }}: {{ formatMS(stats.blocking_avg_ms) }} · P50: {{ formatMS(stats.blocking_p50_ms) }} · P95: {{ formatMS(stats.blocking_p95_ms) }} · {{ label('maximum') }}: {{ formatMS(stats.blocking_max_ms) }}</p>
+          <p class="mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('jobDuration') }}: P50 {{ formatMS(stats.job_p50_ms) }} · P95 {{ formatMS(stats.job_p95_ms) }}</p>
         </section>
         <section class="card p-5" data-test="cache-miss">
           <h2 class="text-lg font-semibold">{{ label('cacheMissRate') }}</h2>
@@ -107,8 +114,8 @@ watch(() => props.refreshKey, () => { void refresh() })
             <table class="w-full text-left text-sm">
               <thead class="text-gray-500 dark:text-dark-400"><tr><th class="p-2">{{ label('clientFingerprint') }}</th><th class="p-2">{{ label('targets') }}</th><th class="p-2">{{ label('modelCalls') }}</th><th class="p-2">{{ label('missRate') }}</th></tr></thead>
               <tbody>
-                <tr v-for="item in stats.cache_miss" :key="item.client" class="border-t border-gray-100 dark:border-dark-700">
-                  <td class="p-2">{{ label(item.client) }}</td><td class="p-2">{{ item.targets }}</td><td class="p-2">{{ item.model_calls }}</td>
+                <tr v-for="item in stats.cache_miss" :key="`${item.client}:${item.kind}`" class="border-t border-gray-100 dark:border-dark-700">
+                  <td class="p-2">{{ label(item.client) }} · {{ label(item.kind) }}</td><td class="p-2">{{ item.targets }}</td><td class="p-2">{{ item.model_calls }}</td>
                   <td class="p-2 font-semibold">{{ Math.round(item.miss_rate * 100) }}%</td>
                 </tr>
                 <tr v-if="!stats.cache_miss.length"><td colspan="4" class="p-6 text-center text-gray-500">{{ label('empty') }}</td></tr>
@@ -118,6 +125,13 @@ watch(() => props.refreshKey, () => { void refresh() })
         </section>
       </div>
     </template>
+    <section v-if="runtime?.retention" class="card space-y-3 p-5" data-test="retention-card">
+      <h2 class="text-lg font-semibold">{{ label('retentionRun') }}</h2>
+      <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('retentionRunHint') }}</p>
+      <p class="text-sm">{{ formatTime(runtime.retention.finished_at) }} · {{ label('retentionDays') }} {{ runtime.retention.days }} · {{ runtime.retention.duration_ms }} ms</p>
+      <p class="text-sm">{{ label('jobs') }} {{ runtime.retention.jobs }} · {{ label('reviews') }} {{ runtime.retention.reviews }} · {{ label('texts') }} {{ runtime.retention.texts }} · {{ label('probeAttempts') }} {{ runtime.retention.probe_attempts }}</p>
+      <p v-if="runtime.retention.error" class="text-sm text-red-600 dark:text-red-400">{{ runtime.retention.error }}</p>
+    </section>
     <section v-if="runtime" class="card space-y-4 p-5">
       <h2 class="text-lg font-semibold">{{ label('runtime') }}</h2>
       <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('runtimeHint') }}</p>

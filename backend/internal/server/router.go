@@ -1,6 +1,10 @@
 package server
 
 import (
+	"crypto/subtle"
+	"sync"
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"io/fs"
 	"net/http"
@@ -12,6 +16,35 @@ import (
 	"sub2api-enhance/internal/systemupdate"
 	audit "sub2api-enhance/internal/thirdpartypromptaudit"
 )
+
+// readonlyLimiter 是只读通道的每分钟请求上限，按令牌全局计数。
+const readonlyLimiterLimit = 60
+
+// readonlyGuard 校验只读令牌并做分钟级限流。
+func readonlyGuard(token string) gin.HandlerFunc {
+	var mu sync.Mutex
+	windowStart := time.Now()
+	hits := 0
+	return func(ctx *gin.Context) {
+		if subtle.ConstantTimeCompare([]byte(ctx.GetHeader("X-Enhance-Readonly-Token")), []byte(token)) != 1 {
+			ctx.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": "enhance_readonly_denied", "message": "只读令牌无效"})
+			return
+		}
+		mu.Lock()
+		if time.Since(windowStart) >= time.Minute {
+			windowStart, hits = time.Now(), 0
+		}
+		hits++
+		limited := hits > readonlyLimiterLimit
+		mu.Unlock()
+		if limited {
+			ctx.Header("Retry-After", "60")
+			ctx.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"code": "enhance_readonly_limited", "message": "只读接口请求过于频繁"})
+			return
+		}
+		ctx.Next()
+	}
+}
 
 func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy, client *sub2api.Client, assets fs.FS, quota *quotafollow.Handler, updates *systemupdate.Handler) (*gin.Engine, error) {
 	r := gin.New()
@@ -26,6 +59,12 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	})
 	auth := NewAuth(client, c.PublicOrigin)
 	r.POST("/enhance/api/v1/auth/bootstrap", auth.Bootstrap)
+	// 只读监控通道：独立令牌 + 简单限流，不依赖原版管理员会话。
+	if c.ReadonlyToken != "" {
+		readonly := r.Group("/enhance/api/v1/admin/third-party-prompt-audit/readonly", readonlyGuard(c.ReadonlyToken))
+		readonly.GET("/stats", handler.GetStats)
+		readonly.GET("/runtime", handler.GetRuntime)
+	}
 	group := r.Group("/enhance/api/v1/admin", auth.Require)
 	group.GET("/groups", handler.ListGroups)
 	group.GET("/session", func(c *gin.Context) { c.JSON(200, gin.H{"code": 0, "data": gin.H{"authenticated": true}}) })
@@ -64,12 +103,15 @@ func Router(c *config.Config, handler *audit.AdminHandler, proxy *ingress.Proxy,
 	a.GET("/jobs", handler.ListJobs)
 	a.GET("/jobs/:id", handler.GetJob)
 	a.GET("/jobs/:id/prompts", handler.GetJobPrompts)
+	a.GET("/jobs/export", handler.ExportJobs)
 	a.POST("/reaudits/preview", handler.PreviewReaudits)
 	a.POST("/reaudits", handler.CreateReaudits)
 	a.GET("/trust", handler.ListTrust)
 	a.POST("/trust", handler.TrustInstruction)
+	a.POST("/trust/batch", handler.TrustBatch)
 	a.DELETE("/trust/:hash", handler.UntrustInstruction)
 	a.GET("/breakers", handler.ListBreakers)
+	a.POST("/breakers/drill", handler.DrillBreaker)
 	a.POST("/breakers/:hash/confirm", handler.ConfirmBreaker)
 	a.POST("/actions/:id/retry", handler.RetryAction)
 	a.POST("/users/:id/enable-and-reset", handler.EnableAndReset)

@@ -61,6 +61,18 @@ func (r *Repository) RunRetention(ctx context.Context, days int) (RetentionResul
 	return result, nil
 }
 
+// RetentionRecord 记录最近一次保留期清理的结果，供运行概览展示。
+type RetentionRecord struct {
+	FinishedAt    time.Time `json:"finished_at"`
+	Days          int       `json:"days"`
+	Jobs          int64     `json:"jobs"`
+	ProbeAttempts int64     `json:"probe_attempts"`
+	Reviews       int64     `json:"reviews"`
+	Texts         int64     `json:"texts"`
+	DurationMS    int64     `json:"duration_ms"`
+	Error         string    `json:"error"`
+}
+
 // runRetention 每小时按最新已应用的保留天数清理一次；保存配置后的下一轮立即使用新值。
 func (s *Service) runRetention() {
 	defer s.wg.Done()
@@ -73,13 +85,20 @@ func (s *Service) runRetention() {
 		case <-ticker.C:
 		}
 		days := s.config.RetentionDays()
+		started := time.Now()
 		result, err := s.repo.RunRetention(s.ctx, days)
+		record := &RetentionRecord{FinishedAt: time.Now().UTC(), Days: days, Jobs: result.Jobs,
+			ProbeAttempts: result.ProbeAttempts, Reviews: result.Reviews, Texts: result.Texts,
+			DurationMS: time.Since(started).Milliseconds()}
 		if err != nil {
+			record.Error = err.Error()
+			s.recordRetention(record)
 			if s.ctx.Err() == nil {
 				s.noteError("retention_cleanup_failed", err)
 			}
 			continue
 		}
+		s.recordRetention(record)
 		logger.LegacyPrintf("third_party_prompt_audit", "审计记录保留期清理完成 retention_days=%d jobs=%d probe_attempts=%d reviews=%d texts=%d",
 			days, result.Jobs, result.ProbeAttempts, result.Reviews, result.Texts)
 	}

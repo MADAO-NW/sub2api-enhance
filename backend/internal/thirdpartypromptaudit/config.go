@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/mail"
+	"net/url"
 	"reflect"
 	"slices"
 	"strings"
@@ -55,7 +57,9 @@ var legacyDefaultPolicySHA256 = map[string]struct{}{
 }
 
 type ModelConfig struct {
-	ID             string         `json:"id"`
+	ID string `json:"id"`
+	// AllowSelfAudit 允许把审核节点指向本机/内网网关；默认拒绝，避免审核模型与被审模型同源。
+	AllowSelfAudit bool           `json:"allow_self_audit,omitempty"`
 	Name           string         `json:"name"`
 	Enabled        bool           `json:"enabled"`
 	BaseURL        string         `json:"base_url"`
@@ -403,6 +407,23 @@ func validateConfig(config Config, activating bool) error {
 	return nil
 }
 
+// privateNodeHost 判断审核节点是否指向本机或内网地址（含回环与私有网段）。
+func privateNodeHost(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
+
 func validateModel(model ModelConfig) error {
 	if model.Model == "" || model.Name == "" {
 		return errors.New("节点名称和模型名不能为空")
@@ -700,6 +721,16 @@ func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID in
 	normalizeModelNames(&input.Config)
 	normalizeRetention(&input.Config)
 	normalizeUserRuleModes(&input.Config)
+	// 审核节点指向本机/内网属于“自审”，会与被审模型同源，必须显式确认。
+	for _, model := range input.Config.Models {
+		if model.BaseURL == "" || model.AllowSelfAudit {
+			continue
+		}
+		if privateNodeHost(model.BaseURL) {
+			return PublicConfig{}, infraerrors.BadRequest("third_party_audit_self_audit",
+				"审核节点 "+model.Name+" 指向本机或内网地址，可能与业务模型同源；如确认这样使用，请为该节点勾选“允许自审”")
+		}
+	}
 	if err := validateConfig(input.Config, input.Config.Mode != "off"); err != nil {
 		return PublicConfig{}, infraerrors.BadRequest("third_party_audit_invalid_config", err.Error())
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -28,8 +29,8 @@ func TestBlockedTurnRejectsContinuationInAsyncMode(t *testing.T) {
 // Redis 读写失败时 async 放行、blocking 按不可用处理（决策 11）。
 func TestRedisFailureSemanticsFollowMode(t *testing.T) {
 	service := &Service{metrics: NewRuntimeMetrics()}
-	require.Equal(t, IngressDecisionAllow, service.redisFailure("async", "turn_key_unavailable", errors.New("NOPERM")).Kind)
-	require.Equal(t, IngressDecisionUnavailable, service.redisFailure("blocking", "turn_key_unavailable", errors.New("NOPERM")).Kind)
+	require.Equal(t, IngressDecisionAllow, service.redisFailure("async", "turn_key_unavailable", "turn", errors.New("NOPERM")).Kind)
+	require.Equal(t, IngressDecisionUnavailable, service.redisFailure("blocking", "turn_key_unavailable", "turn", errors.New("NOPERM")).Kind)
 }
 
 // 没有 Redis 时回合查询必须报错，不能静默当成未命中。
@@ -39,6 +40,16 @@ func TestTurnLookupWithoutRedisFails(t *testing.T) {
 	require.Error(t, err)
 	_, err = service.resolveResponseTurn(context.Background(), "resp")
 	require.Error(t, err)
+}
+
+// Redis 故障时本地兜底仍拦得住已阻断回合。
+func TestRedisFailureFallsBackToLocalBlockedTurn(t *testing.T) {
+	service := &Service{metrics: NewRuntimeMetrics(), blockedTurns: map[string]time.Time{}}
+	service.rememberBlockedTurn("turn-1")
+	decision := service.redisFailure("async", "turn_key_unavailable", "turn-1", errors.New("NOPERM"))
+	require.Equal(t, IngressDecisionBlock, decision.Kind)
+	other := service.redisFailure("async", "turn_key_unavailable", "turn-2", errors.New("NOPERM"))
+	require.Equal(t, IngressDecisionAllow, other.Kind)
 }
 
 // 续跑被拒绝只打运行日志，不写数据库、不产生任务。

@@ -44,6 +44,12 @@ type Service struct {
 	flightMu   sync.Mutex
 	flights    map[string]*reviewFlight
 	leaders    map[int64][]string
+	// retention 保存最近一次清理结果，供运行概览展示。
+	retentionMu sync.Mutex
+	retention   *RetentionRecord
+	// blockedTurns 是 Redis 故障时仍能拦住已阻断回合的进程内兜底缓存。
+	blockedMu    sync.Mutex
+	blockedTurns map[string]time.Time
 }
 
 // reviewFlight 合并同一 (内容哈希, 评估语义) 的并发审核：后到的任务等待并共享结论。
@@ -175,7 +181,7 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		if parsed.PreviousResponseID != "" {
 			resolved, err := s.resolveResponseTurn(ctx, parsed.PreviousResponseID)
 			if err != nil {
-				return s.redisFailure(mode, "response_mapping_unavailable", err)
+				return s.redisFailure(mode, "response_mapping_unavailable", turnKey, err)
 			}
 			if resolved != "" {
 				bound = resolved
@@ -183,7 +189,7 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		}
 		state, err := s.getTurn(ctx, bound)
 		if err != nil {
-			return s.redisFailure(mode, "turn_key_unavailable", err)
+			return s.redisFailure(mode, "turn_key_unavailable", bound, err)
 		}
 		if state != nil {
 			return s.boundDecision(state, mode, turnKey)
@@ -191,7 +197,7 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 	}
 	state, err := s.getTurn(ctx, turnKey)
 	if err != nil {
-		return s.redisFailure(mode, "turn_key_unavailable", err)
+		return s.redisFailure(mode, "turn_key_unavailable", turnKey, err)
 	}
 	if state != nil {
 		return s.boundDecision(state, mode, turnKey)
@@ -235,6 +241,9 @@ func (s *Service) Check(parent context.Context, request IntakeRequest) *IntakeDe
 		return result
 	}
 	s.rememberTurn(ctx, turnKey, job.ID, "done", string(completion.Decision))
+	if completion.Decision == DecisionBlock {
+		s.rememberBlockedTurn(turnKey)
+	}
 	result.Kind = gatewayKind(completion.Decision)
 	if result.Kind == IngressDecisionBlock {
 		result.ErrorCode = "third_party_audit_blocked"
@@ -265,8 +274,12 @@ func excludedByScope(snapshot ConfigSnapshot, request IntakeRequest) bool {
 }
 
 // redisFailure 处理回合键读写失败：async 放行并记运行日志，blocking 沿用不可用语义（决策 11）。
-func (s *Service) redisFailure(mode, code string, err error) *IntakeDecision {
+func (s *Service) redisFailure(mode, code, turnKey string, err error) *IntakeDecision {
 	s.noteError(code, err)
+	// Redis 不可用时用进程内兜底缓存仍然拦住已阻断回合，避免降级放行已判定违规的对话。
+	if s.isBlockedTurn(turnKey) {
+		return &IntakeDecision{Mode: mode, Kind: IngressDecisionBlock, ErrorCode: "third_party_audit_blocked", TurnKey: turnKey}
+	}
 	if mode == "async" {
 		return &IntakeDecision{Mode: mode, Kind: IngressDecisionAllow, ErrorCode: code}
 	}
@@ -687,6 +700,66 @@ func (s *Service) heartbeat(ctx context.Context, cancel context.CancelCauseFunc,
 		}
 	}()
 	return done
+}
+
+// recordRetention 记录最近一次保留期清理结果。
+func (s *Service) recordRetention(record *RetentionRecord) {
+	s.retentionMu.Lock()
+	defer s.retentionMu.Unlock()
+	s.retention = record
+}
+
+// retentionSnapshot 读取最近一次清理结果。
+func (s *Service) retentionSnapshot() *RetentionRecord {
+	s.retentionMu.Lock()
+	defer s.retentionMu.Unlock()
+	if s.retention == nil {
+		return nil
+	}
+	copied := *s.retention
+	return &copied
+}
+
+// rememberBlockedTurn 在内存里记录已阻断回合，Redis 不可用时作为降级兜底。
+func (s *Service) rememberBlockedTurn(turnKey string) {
+	if turnKey == "" {
+		return
+	}
+	s.blockedMu.Lock()
+	defer s.blockedMu.Unlock()
+	if s.blockedTurns == nil {
+		s.blockedTurns = make(map[string]time.Time)
+	}
+	now := time.Now()
+	for key, at := range s.blockedTurns {
+		if now.Sub(at) > turnKeyTTL {
+			delete(s.blockedTurns, key)
+		}
+	}
+	if len(s.blockedTurns) > 8192 {
+		for key := range s.blockedTurns {
+			delete(s.blockedTurns, key)
+			if len(s.blockedTurns) <= 4096 {
+				break
+			}
+		}
+	}
+	s.blockedTurns[turnKey] = now
+}
+
+// isBlockedTurn 判断回合是否在本地兜底缓存中被标记为阻断。
+func (s *Service) isBlockedTurn(turnKey string) bool {
+	s.blockedMu.Lock()
+	defer s.blockedMu.Unlock()
+	at, ok := s.blockedTurns[turnKey]
+	if !ok {
+		return false
+	}
+	if time.Since(at) > turnKeyTTL {
+		delete(s.blockedTurns, turnKey)
+		return false
+	}
+	return true
 }
 
 func (s *Service) notify() {

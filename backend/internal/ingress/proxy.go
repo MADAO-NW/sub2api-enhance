@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"sub2api-enhance/internal/sub2api"
 	audit "sub2api-enhance/internal/thirdpartypromptaudit"
@@ -259,10 +260,16 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 		p.forward(w, r, kind, body)
 		return
 	}
+	// 客户端未带请求 ID 时生成一个，并回写响应头，保证任务与日志可对账。
+	requestID := headerValue(r, "X-Request-Id")
+	if requestID == "" {
+		requestID = "enh-" + uuid.NewString()
+		w.Header().Set("X-Enhance-Request-Id", requestID)
+	}
 	decision := p.audit.Check(r.Context(), audit.IntakeRequest{
 		Parsed: parsed, UserID: identity.UserID, APIKeyID: identity.APIKeyID, GroupID: identity.GroupID,
 		Identity: audit.Identity{Username: identity.Username, UserEmail: identity.UserEmail, APIKeyName: identity.APIKeyName, GroupName: identity.GroupName, Endpoint: r.URL.Path},
-		Provider: identity.Platform, Model: parsed.Model, RequestID: headerValue(r, "X-Request-Id"),
+		Provider: identity.Platform, Model: parsed.Model, RequestID: requestID,
 	})
 	if !p.allow(w, kind, identity.APIKeyID, decision) {
 		return
