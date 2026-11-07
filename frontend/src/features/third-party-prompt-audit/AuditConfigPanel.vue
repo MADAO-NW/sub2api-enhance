@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import BaseDialog from '@/components/common/BaseDialog.vue'
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { thirdPartyPromptAuditAPI as api, type AuditConfig, type AuditModel, type AuditUser, type ModelAttempt, type Contract, type KeyUpdate, type ProbeResult, type SavedConfig, type UserRuleConfig } from '@/api/admin/third-party-prompt-audit'
 import { getAll } from '@/api/admin/groups'
 import type { AdminGroup } from '@/types'
@@ -313,6 +313,18 @@ async function probe(model: AuditModel) {
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { probing.value = probing.value.filter(id => id !== model.id) }
 }
+// 每 5 秒同步一次服务端配置；正在编辑或有未保存修改时跳过，避免覆盖草稿。
+async function refreshQuiet() {
+  if (dirty.value || saving.value || loading.value || document.visibilityState !== 'visible') return
+  try {
+    const [configResult, contractResult] = await Promise.all([api.getConfig(), api.getContract()])
+    saved.value = configResult
+    contract.value = contractResult
+    if (!dirty.value) restore()
+  } catch { /* 静默刷新失败不打扰当前操作 */ }
+}
+const autoTimer = window.setInterval(() => { void refreshQuiet() }, 5000)
+onUnmounted(() => window.clearInterval(autoTimer))
 onMounted(load)
 watch(() => props.refreshKey, () => { void load(true) })
 </script>

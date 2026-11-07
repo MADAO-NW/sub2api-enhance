@@ -1,5 +1,8 @@
 export default {
   "thirdPartyPromptAudit": {
+    "currentPrompt": "当前审核的提示词",
+    "viewPrompt": "查看提示词",
+    "currentPromptHint": "该任务当前轮实际送审的正文：稳定指令块与当前回合用户提示词分别独立审核。",
     "trustTab": "信任与熔断",
     "retentionDays": "记录保留天数",
     "retentionHint": "1–365 天，默认 30 天；每小时清理一次。",

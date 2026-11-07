@@ -172,6 +172,53 @@ func (r *Repository) JobDetail(ctx context.Context, id int64) (*JobDetail, error
 	return &JobDetail{Job: job, Targets: targets, Rounds: rounds, Attempts: attempts, Actions: actions}, nil
 }
 
+// JobPrompt 是任务列表弹窗展示的单个审核目标正文。
+type JobPrompt struct {
+	Order      int      `json:"order"`
+	Kind       string   `json:"kind"`
+	Hash       string   `json:"hash"`
+	Text       string   `json:"text"`
+	Bytes      int      `json:"bytes"`
+	Resolution string   `json:"resolution,omitempty"`
+	Decision   string   `json:"decision,omitempty"`
+	Reason     string   `json:"reason,omitempty"`
+	Score      *float64 `json:"score"`
+}
+
+// JobPrompts 只读取当前轮的审核目标正文，不加载调用流水与处置动作。
+func (r *Repository) JobPrompts(ctx context.Context, id int64) ([]JobPrompt, error) {
+	job, err := r.GetAuditJob(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	targets, err := r.LoadRoundTargets(ctx, job.ID, job.CurrentRound)
+	if err != nil {
+		return nil, err
+	}
+	reviewIDs := make([]int64, 0, len(targets))
+	for _, target := range targets {
+		if target.ReviewID != nil {
+			reviewIDs = append(reviewIDs, *target.ReviewID)
+		}
+	}
+	reviews, err := r.GetReviews(ctx, reviewIDs)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]JobPrompt, 0, len(targets))
+	for _, target := range targets {
+		item := JobPrompt{Order: target.Order, Kind: target.Kind, Hash: target.Hash, Text: target.Text, Bytes: target.Bytes,
+			Resolution: target.Resolution, Decision: string(target.Decision)}
+		if target.ReviewID != nil {
+			if review := reviews[*target.ReviewID]; review != nil {
+				item.Reason, item.Score = review.Reason, review.Score
+			}
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
 type reauditCandidate struct {
 	ID     int64
 	UserID int64

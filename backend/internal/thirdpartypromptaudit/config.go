@@ -792,9 +792,10 @@ func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID in
 		}
 	}
 	if len(newlyExcluded) > 0 {
-		if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_jobs SET
+		// 新加入不审核名单的用户：尚未发出首个模型调用的排队任务直接跳过，不消耗审核预算，也不触发处置。
+		if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.audit_jobs SET
 		 status='skipped',finished_at=clock_timestamp(),lease_until=NULL,failure_stage=NULL,last_error_code='user_excluded',last_error_message=$2,updated_at=clock_timestamp()
-		 WHERE user_id=ANY($1) AND status IN ('queued','retry') AND result_checkpoint IS NULL`, pq.Array(newlyExcluded), encodeStoredText(ErrUserExcluded.Error())); err != nil {
+		 WHERE user_id=ANY($1) AND status IN ('queued','retry') AND attempts=0`, pq.Array(newlyExcluded), encodeStoredText(ErrUserExcluded.Error())); err != nil {
 			return PublicConfig{}, err
 		}
 	}

@@ -214,7 +214,7 @@ func TestSavingNewExclusionTerminatesQueuedAndRetryJobs(t *testing.T) {
 	mock.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(configLockKey).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT value FROM sub2api_enhance.settings").WithArgs(SettingKey).WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(string(raw)))
 	mock.ExpectExec("INSERT INTO sub2api_enhance.settings").WithArgs(SettingKey, sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("UPDATE sub2api_enhance.third_party_prompt_audit_jobs").WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec("UPDATE sub2api_enhance.audit_jobs SET").WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectCommit()
 	storedNext := storedConfig{Config: next, Revision: 2, EncryptedKeys: map[string]string{"test-node": "encrypted-value"}}
 	nextRaw, err := json.Marshal(storedNext)

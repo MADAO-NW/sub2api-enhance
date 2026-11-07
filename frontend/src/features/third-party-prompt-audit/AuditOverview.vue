@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { thirdPartyPromptAuditAPI as api, type AuditFilter, type AuditRuntime, type AuditStats } from '@/api/admin/third-party-prompt-audit'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { formatMS, formatTime, timeRange, toLocalInput } from './viewModel'
@@ -32,6 +32,12 @@ async function refresh() {
   to.value = toLocalInput(new Date())
   await load()
 }
+// 每 5 秒按当前时间范围静默刷新；页面不可见或正在加载时跳过。
+const autoTimer = window.setInterval(() => {
+  if (document.visibilityState !== 'visible' || loading.value) return
+  void load()
+}, 5000)
+onUnmounted(() => window.clearInterval(autoTimer))
 onMounted(load)
 watch(() => props.refreshKey, () => { void refresh() })
 </script>

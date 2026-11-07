@@ -12,7 +12,7 @@ import type { AuditJob, BreakerEntry, JobDetail, SavedConfig, TrustEntry } from 
 const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(), saveConfig: vi.fn(), testAdminEmail: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(),
   listModels: vi.fn(), enableAndReset: vi.fn(), probeDetails: vi.fn(), probe: vi.fn(), userKeys: vi.fn(),
-  jobs: vi.fn(), job: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), trustList: vi.fn(), trust: vi.fn(), untrust: vi.fn(),
+  jobs: vi.fn(), job: vi.fn(), jobPrompts: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), trustList: vi.fn(), trust: vi.fn(), untrust: vi.fn(),
   breakerList: vi.fn(), confirmBreaker: vi.fn(), retryAction: vi.fn(), stats: vi.fn(), runtime: vi.fn(),
   showError: vi.fn(), showSuccess: vi.fn(),
 }))
@@ -81,6 +81,10 @@ beforeEach(() => {
   mocks.userKeys.mockResolvedValue([])
   mocks.jobs.mockResolvedValue({ items: [job()], total: 1, page: 1, page_size: 20 })
   mocks.job.mockResolvedValue(detail())
+  mocks.jobPrompts.mockResolvedValue({ targets: [
+    { order: 1, kind: 'instruction', hash: 'a'.repeat(64), text: '系统提示词正文', bytes: 12, resolution: 'cache', decision: 'pass', reason: '正常', score: 0.02 },
+    { order: 2, kind: 'user', hash: 'b'.repeat(64), text: '违规用户提示词', bytes: 20, resolution: 'model', decision: 'block', reason: '违规', score: 0.95 },
+  ] })
   mocks.preview.mockResolvedValue({ matched: 1, ready: 1, items: [{ job_id: 7, status: 'ready', reason: '' }] })
   mocks.reaudit.mockResolvedValue({ matched: 1, ready: 1, items: [{ job_id: 7, status: 'requeued', reason: '' }] })
   mocks.trustList.mockResolvedValue({ items: [], total: 0, page: 1, page_size: 20 })
@@ -130,6 +134,25 @@ describe('third-party prompt audit panels', () => {
     expect(text).toContain('alice')
     expect(text).toContain('block')
     expect(text).toContain('user')
+    wrapper.unmount()
+  })
+
+  it('opens the audited prompts of a row in a dialog and resets filters', async () => {
+    const wrapper = mount(AuditRecords, { global: { stubs } })
+    await flushPromises()
+    const viewButton = wrapper.findAll('button').find(button => button.text() === 'viewPrompt')
+    expect(viewButton).toBeTruthy()
+    await viewButton!.trigger('click')
+    await flushPromises()
+    expect(mocks.jobPrompts).toHaveBeenCalledWith(7)
+    expect(wrapper.text()).toContain('系统提示词正文')
+    expect(wrapper.text()).toContain('违规用户提示词')
+    // 重置按钮会清空条件并重新拉取列表。
+    const reset = wrapper.get('[data-test="reset-filters"]')
+    const before = mocks.jobs.mock.calls.length
+    await reset.trigger('click')
+    await flushPromises()
+    expect(mocks.jobs.mock.calls.length).toBeGreaterThan(before)
     wrapper.unmount()
   })
 

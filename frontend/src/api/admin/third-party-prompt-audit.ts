@@ -241,6 +241,18 @@ export interface AuditJob {
   updated_at: string
 }
 
+export interface JobPrompt {
+  order: number
+  kind: PromptKind
+  hash: string
+  text: string
+  bytes: number
+  resolution?: Resolution
+  decision?: AuditDecision
+  reason?: string
+  score: number | null
+}
+
 export interface JobDetail {
   job: AuditJob
   targets: JobTarget[]
@@ -371,6 +383,7 @@ export const thirdPartyPromptAuditAPI = {
     return (await apiClient.get<AuditPage<AuditJob>>(`${base}/jobs`, { params: { ...filter, ids: filter.ids?.join(','), page, page_size: pageSize } })).data
   },
   async job(id: number) { return (await apiClient.get<JobDetail>(`${base}/jobs/${id}`)).data },
+  async jobPrompts(id: number) { return (await apiClient.get<{ targets: JobPrompt[] }>(`${base}/jobs/${id}/prompts`)).data },
   async preview(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits/preview`, value)).data },
   async reaudit(value: ReauditRequest) { return (await apiClient.post<ReauditResult>(`${base}/reaudits`, value)).data },
   async trustList(page = 1, pageSize = 20) { return (await apiClient.get<AuditPage<TrustEntry>>(`${base}/trust`, { params: { page, page_size: pageSize } })).data },

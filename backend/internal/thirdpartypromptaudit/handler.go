@@ -280,6 +280,19 @@ func (h *AdminHandler) GetJob(c *gin.Context) {
 	response.Success(c, result)
 }
 
+func (h *AdminHandler) GetJobPrompts(c *gin.Context) {
+	id, ok := recordID(c)
+	if !ok {
+		return
+	}
+	result, err := h.repo.JobPrompts(c.Request.Context(), id)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, gin.H{"targets": result})
+}
+
 func (h *AdminHandler) RetryAction(c *gin.Context) {
 	id, ok := recordID(c)
 	if !ok {

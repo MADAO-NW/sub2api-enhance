@@ -1,5 +1,8 @@
 export default {
   "thirdPartyPromptAudit": {
+    "currentPrompt": "Audited prompts",
+    "viewPrompt": "View prompts",
+    "currentPromptHint": "Text sent to the audit model in the current round: stable instruction blocks and the current-turn user prompt are audited independently.",
     "trustTab": "Trust & breakers",
     "retentionDays": "Retention days",
     "retentionHint": "1–365 days, default 30; cleaned up hourly.",

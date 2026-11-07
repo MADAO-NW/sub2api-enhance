@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import Pagination from '@/components/common/Pagination.vue'
 import {
   thirdPartyPromptAuditAPI as api, type BreakerEntry, type TrustEntry,
@@ -19,22 +19,22 @@ const trusted = ref<TrustEntry[]>([])
 const trustPage = ref(1), trustTotal = ref(0)
 const loading = ref(false), pending = ref(''), error = ref('')
 
-async function loadBreakers() {
-  loading.value = true
-  error.value = ''
+async function loadBreakers(silent = false) {
+  if (!silent) { loading.value = true; error.value = '' }
+  else error.value = ''
   try {
     const result = await api.breakerList(status.value, breakerPage.value, 20)
     breakers.value = result.items
     breakerTotal.value = result.total
-  } catch (err) { error.value = extractApiErrorMessage(err, label('error')) }
-  finally { loading.value = false }
+  } catch (err) { if (!silent) error.value = extractApiErrorMessage(err, label('error')) }
+  finally { if (!silent) loading.value = false }
 }
-async function loadTrust() {
+async function loadTrust(silent = false) {
   try {
     const result = await api.trustList(trustPage.value, 20)
     trusted.value = result.items
     trustTotal.value = result.total
-  } catch (err) { error.value = extractApiErrorMessage(err, label('error')) }
+  } catch (err) { if (!silent) error.value = extractApiErrorMessage(err, label('error')) }
 }
 async function act(kind: 'trust' | 'confirm' | 'untrust', hash: string) {
   pending.value = hash + kind
@@ -52,6 +52,13 @@ function changeBreakerPage(value: number) { breakerPage.value = value; void load
 function changeTrustPage(value: number) { trustPage.value = value; void loadTrust() }
 watch(status, () => { breakerPage.value = 1; void loadBreakers() })
 watch(() => props.refreshKey, () => { void loadBreakers(); void loadTrust() })
+// 每 5 秒静默刷新熔断与信任列表；页面不可见、正在加载或有待完成操作时跳过。
+const autoTimer = window.setInterval(() => {
+  if (document.visibilityState !== 'visible' || loading.value || pending.value) return
+  void loadBreakers(true)
+  void loadTrust(true)
+}, 5000)
+onUnmounted(() => window.clearInterval(autoTimer))
 onMounted(() => { void loadBreakers(); void loadTrust() })
 </script>
 

@@ -3,7 +3,7 @@ import { computed, onUnmounted, reactive, ref, watch } from 'vue'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import Pagination from '@/components/common/Pagination.vue'
 import {
-  thirdPartyPromptAuditAPI as api, type AuditFilter, type AuditJob, type ReauditRequest, type ReauditResult,
+  thirdPartyPromptAuditAPI as api, type AuditFilter, type AuditJob, type JobPrompt, type ReauditRequest, type ReauditResult,
 } from '@/api/admin/third-party-prompt-audit'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
@@ -24,22 +24,33 @@ const draftReuse = ref<'allow' | 'force'>('allow')
 const previewPage = ref(1), previewLoading = ref(false), submitted = ref(false)
 const previewItems = computed(() => preview.value?.items.slice((previewPage.value - 1) * 20, previewPage.value * 20) ?? [])
 const states = ['queued', 'processing', 'retry', 'done', 'failed', 'skipped']
+const promptJobID = ref<number | null>(null)
+const promptTargets = ref<JobPrompt[]>([])
+const promptLoading = ref(false)
 let generation = 0
+// 列表每 5 秒静默刷新一次；打开弹窗或正在加载时跳过，避免打断操作。
+const autoTimer = window.setInterval(() => {
+  if (document.visibilityState !== 'visible') return
+  if (loading.value || detailID.value !== null || promptJobID.value !== null || previewRequest.value !== null) return
+  void load(true)
+}, 5000)
 
-async function load() {
+async function load(silent = false) {
   const current = ++generation
-  loading.value = true
-  rows.value = []
-  total.value = 0
-  selected.value = []
-  error.value = ''
+  if (!silent) {
+    loading.value = true
+    rows.value = []
+    total.value = 0
+    selected.value = []
+    error.value = ''
+  }
   try {
     const result = await api.jobs(applied.value, page.value, pageSize.value)
     if (current === generation) { rows.value = result.items; total.value = result.total }
   } catch (err) {
-    if (current === generation) error.value = extractApiErrorMessage(err, label('error'))
+    if (current === generation && !silent) error.value = extractApiErrorMessage(err, label('error'))
   } finally {
-    if (current === generation) loading.value = false
+    if (current === generation && !silent) loading.value = false
   }
 }
 function apply() {
@@ -91,6 +102,28 @@ function closePreview() {
   submitted.value = false
   draftReuse.value = 'allow'
 }
+async function openPrompts(id: number) {
+  promptJobID.value = id
+  promptTargets.value = []
+  promptLoading.value = true
+  try {
+    promptTargets.value = (await api.jobPrompts(id)).targets
+  } catch (err) {
+    app.showError(extractApiErrorMessage(err, label('error')))
+    promptJobID.value = null
+  } finally {
+    promptLoading.value = false
+  }
+}
+function resetFilters() {
+  for (const key of Object.keys(filters)) delete filters[key as keyof AuditFilter]
+  from.value = ''
+  to.value = ''
+  applied.value = {}
+  page.value = 1
+  selected.value = []
+  void load()
+}
 function changePage(value: number) { page.value = value; void load() }
 function changeSize(value: number) { pageSize.value = value; page.value = 1; void load() }
 watch(() => props.initialFilter, value => {
@@ -105,7 +138,10 @@ watch(() => props.initialFilter, value => {
   void load()
 }, { immediate: true })
 watch(() => props.refreshKey, () => { void load() })
-onUnmounted(() => { generation++ })
+onUnmounted(() => {
+  window.clearInterval(autoTimer)
+  generation++
+})
 </script>
 
 <template>
@@ -123,6 +159,7 @@ onUnmounted(() => { generation++ })
       </div>
       <div class="flex flex-wrap gap-3">
         <button class="btn btn-primary" :disabled="loading">{{ label(loading ? 'loading' : 'apply') }}</button>
+        <button type="button" class="btn btn-secondary" :disabled="loading" data-test="reset-filters" @click="resetFilters">{{ label('reset') }}</button>
         <button type="button" class="btn btn-secondary" :disabled="loading || !selected.length" @click="openPreview(true)">{{ label('reauditSelected') }} ({{ selected.length }})</button>
         <button type="button" class="btn btn-secondary" :disabled="loading || !total" @click="openPreview(false)">{{ label('reauditFilter') }} ({{ total }})</button>
       </div>
@@ -138,6 +175,7 @@ onUnmounted(() => { generation++ })
             <th class="p-3">{{ label('platform') }} / {{ label('model') }}</th>
             <th class="p-3">{{ label('status') }} / {{ label('decision') }}</th>
             <th class="p-3">{{ label('targets') }}</th>
+            <th class="p-3">{{ label('currentPrompt') }}</th>
             <th class="p-3">{{ label('auditDuration') }}</th>
             <th class="p-3">{{ label('detail') }}</th>
           </tr></thead>
@@ -172,16 +210,34 @@ onUnmounted(() => { generation++ })
                 <p v-if="row.violation_counted">{{ label('violationCounted') }}</p>
                 <p v-if="row.disable_counted">{{ label('disableCounted') }}</p>
               </td>
+              <td class="p-3"><button class="btn btn-secondary btn-sm whitespace-nowrap" data-test="view-prompt" @click="openPrompts(row.id)">{{ label('viewPrompt') }}</button></td>
               <td class="whitespace-nowrap p-3">{{ formatMS(row.blocking_wait_ms) }}</td>
               <td class="p-3"><button class="btn btn-secondary btn-sm whitespace-nowrap" @click="detailID = row.id">{{ label('detail') }}</button></td>
             </tr>
-            <tr v-if="!loading && !rows.length"><td colspan="8" class="p-10 text-center text-gray-500">{{ label('empty') }}</td></tr>
+            <tr v-if="!loading && !rows.length"><td colspan="9" class="p-10 text-center text-gray-500">{{ label('empty') }}</td></tr>
           </tbody>
         </table>
       </div>
       <Pagination :page="page" :page-size="pageSize" :page-size-options="[20, 50, 100, 200]" :total="total" @update:page="changePage" @update:page-size="changeSize" />
     </div>
     <AuditDetail :id="detailID" :refresh-key="refreshKey" @close="detailID = null" @changed="load" @reaudit-created="emit('reaudit-created', $event)" />
+    <BaseDialog :show="promptJobID !== null" :title="`${label('currentPrompt')} #${promptJobID ?? ''}`" width="wide" :close-on-click-outside="true" @close="promptJobID = null">
+      <p v-if="promptLoading" role="status">{{ label('loading') }}</p>
+      <div v-else class="space-y-4">
+        <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('currentPromptHint') }}</p>
+        <article v-for="target in promptTargets" :key="target.order" class="space-y-2 rounded-xl bg-gray-50 p-4 dark:bg-dark-900">
+          <div class="flex flex-wrap items-center gap-3 text-sm">
+            <strong>#{{ target.order }} · {{ label(target.kind) }}</strong>
+            <span>{{ target.bytes }} B</span>
+            <span v-if="target.resolution">{{ label('resolution') }}: {{ label(target.resolution) }}</span>
+            <span v-if="target.decision">{{ label(target.decision) }}<template v-if="target.score !== null"> · {{ target.score }}</template></span>
+          </div>
+          <pre class="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white p-3 text-xs dark:bg-dark-950">{{ target.text || '—' }}</pre>
+          <p v-if="target.reason" class="text-xs text-gray-500 dark:text-dark-400">{{ target.reason }}</p>
+        </article>
+        <p v-if="!promptTargets.length" class="text-sm text-gray-500">{{ label('empty') }}</p>
+      </div>
+    </BaseDialog>
     <BaseDialog :show="previewRequest !== null" :title="label('preview')" width="wide" :show-close-button="!previewLoading" :close-on-escape="!previewLoading" :close-on-click-outside="!previewLoading" @close="closePreview">
       <div class="space-y-4">
         <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('previewHint') }}</p>
