@@ -114,6 +114,8 @@ func (s *Service) Start(parent context.Context) error {
 	go s.run()
 	go s.runHealthProbes()
 	go s.runRetention()
+	// 启动即写一次指标快照，避免重启后趋势表要等一小时。
+	go s.collectHourlyMetrics()
 	return err
 }
 
