@@ -664,6 +664,8 @@ export const thirdPartyPromptAuditAPI = {
   async enableAndReset(id: number) { return (await apiClient.post<{ action_id: number; execution_status: string; escalation_cleared: boolean }>(`${base}/users/${id}/enable-and-reset`)).data },
   async clearEscalation(id: number) { return (await apiClient.post<{ user_id: number; action_id: number }>(`${base}/users/${id}/clear-escalation`)).data },
   async retryAction(id: number) { return (await apiClient.post(`${base}/actions/${id}/retry`)).data },
+  // skipNotification 跳过一条投递失败的通知，不再重试发送。
+  async skipNotification(id: number) { return (await apiClient.post(`${base}/actions/${id}/skip-notification`)).data },
   async samples(params: { kind?: string; expected?: string }, page = 1, pageSize = 20) {
     return (await apiClient.get<AuditPage<Sample>>(`${base}/samples`, { params: { ...params, page, page_size: pageSize } })).data
   },

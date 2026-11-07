@@ -118,6 +118,39 @@ func (r *Repository) RetryAction(ctx context.Context, id int64) error {
 	}
 	return tx.Commit()
 }
+
+// SkipNotification 跳过一条投递失败的通知：状态置 not_required，不再重试发送。
+// 只允许 failed；投递历史、动作本身与业务快照都保留，另外在快照里记录跳过人与时间。
+// 状态已被并发处理时返回 ErrLeaseLost，由入口转成“状态已经改变，请刷新后重试”。
+func (r *Repository) SkipNotification(ctx context.Context, id, actorID int64) error {
+	var status string
+	err := r.db.QueryRowContext(ctx, `SELECT notification_status FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions WHERE id=$1`, id).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if status != "failed" {
+		return ErrLeaseLost
+	}
+	result, err := r.db.ExecContext(ctx, `UPDATE sub2api_enhance.third_party_prompt_audit_enforcement_actions
+ SET notification_status='not_required',
+  business_snapshot=(business_snapshot::jsonb || jsonb_build_object('notification_skipped', jsonb_build_object('by',$2::bigint,'at',to_jsonb(clock_timestamp()))))::text,
+  updated_at=clock_timestamp()
+ WHERE id=$1 AND notification_status='failed'`, id, actorID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
 func (r *Repository) ListActions(ctx context.Context, userID, rootID int64) ([]Action, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT `+actionColumns+` FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions WHERE user_id=$1 AND
 	 (job_id=$2 OR action_type='counter_reset') ORDER BY id`, userID, rootID)

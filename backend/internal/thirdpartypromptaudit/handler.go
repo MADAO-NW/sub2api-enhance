@@ -365,6 +365,20 @@ func (h *AdminHandler) RetryAction(c *gin.Context) {
 	response.Success(c, gin.H{"id": id})
 }
 
+// SkipActionNotification 跳过一条投递失败的通知，不再重试发送。
+func (h *AdminHandler) SkipActionNotification(c *gin.Context) {
+	id, ok := recordID(c)
+	if !ok {
+		return
+	}
+	if err := h.repo.SkipNotification(c.Request.Context(), id, adminActor(c)); err != nil {
+		respondError(c, err)
+		return
+	}
+	middleware.SetAuditExtra(c, map[string]any{"result": "success", "action_id": id, "operation": "skip_notification"})
+	response.Success(c, gin.H{"id": id})
+}
+
 func (h *AdminHandler) PreviewReaudits(c *gin.Context) {
 	var input ReauditRequest
 	if err := bindStrict(c, &input); err != nil {

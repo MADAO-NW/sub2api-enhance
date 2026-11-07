@@ -216,6 +216,26 @@ func TestInboxCountsLimitNotificationFailuresToWindow(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+// 跳过投递失败的通知：只对 failed 生效，置为 not_required 并在快照里记录跳过人；
+// 已处理或不存在时分别返回 ErrLeaseLost / ErrNotFound，避免把他人刚处理的通知再改一次。
+func TestSkipNotificationOnlySkipsFailedDeliveries(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	repo := NewRepository(db)
+	mock.ExpectQuery(`SELECT notification_status FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions WHERE id=\$1`).WithArgs(int64(27)).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("failed"))
+	mock.ExpectExec(`SET notification_status='not_required'`).WithArgs(int64(27), int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
+	require.NoError(t, repo.SkipNotification(context.Background(), 27, 1))
+	mock.ExpectQuery(`SELECT notification_status FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions WHERE id=\$1`).WithArgs(int64(27)).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("sent"))
+	require.ErrorIs(t, repo.SkipNotification(context.Background(), 27, 1), ErrLeaseLost)
+	mock.ExpectQuery(`SELECT notification_status FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions WHERE id=\$1`).WithArgs(int64(28)).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}))
+	require.ErrorIs(t, repo.SkipNotification(context.Background(), 28, 1), ErrNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 // 待处理工作台只报真正的节点异常：未验证与未启用不算异常，时间取最近一次观测。
 func TestUnhealthyNodeEntriesSkipsUnverifiedNodes(t *testing.T) {
 	observed := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)

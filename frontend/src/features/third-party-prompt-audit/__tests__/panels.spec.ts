@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(), saveConfig: vi.fn(), testAdminEmail: vi.fn(), getContract: vi.fn(), groups: vi.fn(), users: vi.fn(),
   listModels: vi.fn(), enableAndReset: vi.fn(), probeDetails: vi.fn(), probe: vi.fn(), configImpact: vi.fn(),
   jobs: vi.fn(), job: vi.fn(), jobPrompts: vi.fn(), templateChurn: vi.fn(), metricsHistory: vi.fn(), preview: vi.fn(), reaudit: vi.fn(), trustList: vi.fn(), trust: vi.fn(), untrust: vi.fn(),
-  breakerList: vi.fn(), similarBlocks: vi.fn(), similarPair: vi.fn(), confirmBreaker: vi.fn(), retryAction: vi.fn(), stats: vi.fn(), runtime: vi.fn(), exportJobs: vi.fn(), exportUserData: vi.fn(), deleteUserData: vi.fn(),
+  breakerList: vi.fn(), similarBlocks: vi.fn(), similarPair: vi.fn(), confirmBreaker: vi.fn(), retryAction: vi.fn(), skipNotification: vi.fn(), stats: vi.fn(), runtime: vi.fn(), exportJobs: vi.fn(), exportUserData: vi.fn(), deleteUserData: vi.fn(),
   inbox: vi.fn(), actions: vi.fn(), riskUsers: vi.fn(), cost: vi.fn(), clearEscalation: vi.fn(),
   samples: vi.fn(), createSample: vi.fn(), updateSample: vi.fn(), deleteSample: vi.fn(),
   replays: vi.fn(), replay: vi.fn(), startReplay: vi.fn(),
@@ -142,6 +142,7 @@ beforeEach(() => {
     candidate: 'd'.repeat(64), candidate_text: '共享指令块\n' + '相同内容\n'.repeat(120) + '结尾\n夹带的新指令', distance: 2 })
   mocks.confirmBreaker.mockResolvedValue({ hash: 'c'.repeat(64) })
   mocks.retryAction.mockResolvedValue({})
+  mocks.skipNotification.mockResolvedValue({})
   mocks.stats.mockResolvedValue({
     from: '2026-09-05T00:00:00Z', to: '2026-09-06T00:00:00Z', timezone: 'Asia/Shanghai', mode: '',
     jobs: 12, orphan_jobs: 1, reaudit_jobs: 2, failed_jobs: 3, decisions: { pass: 8, review: 1, block: 3 },
@@ -522,6 +523,20 @@ describe('third-party prompt audit panels', () => {
     await wrapper.get('[data-test="inbox-category-action_failed"]').trigger('click')
     await flushPromises()
     expect(mocks.actions).toHaveBeenLastCalledWith({ execution_status: 'failed,unknown' }, 1, 20)
+    wrapper.unmount()
+  })
+
+  // 通知投递失败可以跳过：确认后调用跳过接口，不再重试发送并刷新工作台。
+  it('skips a failed notification after confirmation', async () => {
+    const wrapper = mount(AuditInbox, { global: { stubs } })
+    await flushPromises()
+    await wrapper.get('[data-test="inbox-skip-notification"]').trigger('click')
+    await flushPromises()
+    const calls = mocks.inbox.mock.calls.length
+    await wrapper.get('[data-test="confirm-skip-notification"]').trigger('click')
+    await flushPromises()
+    expect(mocks.skipNotification).toHaveBeenCalledWith(6)
+    expect(mocks.inbox.mock.calls.length).toBeGreaterThan(calls)
     wrapper.unmount()
   })
 

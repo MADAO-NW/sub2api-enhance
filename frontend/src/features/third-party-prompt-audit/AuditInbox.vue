@@ -2,8 +2,9 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Pagination from '@/components/common/Pagination.vue'
+import BaseDialog from '@/components/common/BaseDialog.vue'
 import {
-  thirdPartyPromptAuditAPI as api, type ActionFilter, type ActionRecord, type Inbox, type InboxCategoryKey,
+  thirdPartyPromptAuditAPI as api, type ActionFilter, type ActionRecord, type Inbox, type InboxCategoryKey, type InboxEntry,
 } from '@/api/admin/third-party-prompt-audit'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
@@ -18,6 +19,7 @@ const emit = defineEmits<{
   (event: 'changed'): void
   (event: 'loaded', total: number): void
 }>()
+const confirmSkip = ref<InboxEntry | null>(null)
 const label = useAuditLabels(), app = useAppStore()
 const { t } = useI18n()
 // inboxRefreshInterval 是工作台静默刷新间隔；页签角标直接使用本页加载到的总数，不再重复请求。
@@ -92,6 +94,21 @@ async function retry(id: number) {
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { pending.value = '' }
 }
+
+// skipNotification 跳过一条投递失败的通知：不再重试发送，并从待处理里消失。
+async function skipNotification() {
+  const item = confirmSkip.value
+  if (!item?.id) return
+  pending.value = `skip-${item.id}`
+  try {
+    await api.skipNotification(item.id)
+    confirmSkip.value = null
+    app.showSuccess(label('notificationSkipped'))
+    emit('changed')
+    await load()
+  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { pending.value = '' }
+}
 function openJob(jobID: number | null | undefined) {
   if (!jobID) return
   emit('inspect-jobs', { ids: [jobID] })
@@ -155,6 +172,8 @@ onMounted(() => { void load() })
             <span v-if="item.detail" class="break-all text-gray-500 dark:text-dark-400">{{ item.detail }}</span>
             <button v-if="category.key === 'action_failed' || category.key === 'notification_failed'" class="btn btn-secondary btn-sm"
               :disabled="pending === `retry-${item.id}` || !item.id" data-test="inbox-retry" @click="retry(item.id ?? 0)">{{ label('retryNow') }}</button>
+            <button v-if="category.key === 'notification_failed'" class="btn btn-secondary btn-sm"
+              :disabled="pending === `skip-${item.id}` || !item.id" data-test="inbox-skip-notification" @click="confirmSkip = item">{{ label('skipNotification') }}</button>
             <button v-if="item.job_id" class="btn btn-secondary btn-sm" data-test="inbox-view-job" @click="openJob(item.job_id)">{{ label('viewJob') }}</button>
             <button v-if="category.key === 'breaker_pending' && item.hash" class="btn btn-secondary btn-sm" @click="emit('open-trust', item.hash!)">{{ label('trustTab') }}</button>
             <button v-if="category.key === 'node_unhealthy' && item.detail" class="btn btn-secondary btn-sm" @click="emit('open-config', item.detail!)">{{ label('config') }}</button>
@@ -219,5 +238,10 @@ onMounted(() => { void load() })
       <Pagination :page="actionPage" :page-size="actionSize" :page-size-options="[20, 50]" :total="actionTotal"
         @update:page="changePage" @update:page-size="changeSize" />
     </section>
+    <BaseDialog :show="confirmSkip !== null" :title="label('skipNotification')" :close-on-click-outside="true" @close="confirmSkip = null">
+      <p class="text-sm">{{ label('skipNotificationHint') }}</p>
+      <p v-if="confirmSkip" class="mt-2 text-sm text-gray-500 dark:text-dark-400">#{{ confirmSkip.id }} · {{ confirmSkip.username || '—' }}</p>
+      <template #footer><div class="flex gap-3"><button class="btn btn-primary" :disabled="pending !== ''" data-test="confirm-skip-notification" @click="skipNotification">{{ label('confirmSave') }}</button><button class="btn btn-secondary" @click="confirmSkip = null">{{ label('cancelChanges') }}</button></div></template>
+    </BaseDialog>
   </div>
 </template>
