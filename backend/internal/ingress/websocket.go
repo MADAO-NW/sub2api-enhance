@@ -17,12 +17,12 @@ import (
 // websocket 只透传 Responses 的 WebSocket 会话，逐条审核 response.create 并登记响应 ID。
 func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *requestContext) {
 	if protocol(r.URL.Path) != "responses" {
-		writeError(w, "responses", http.StatusServiceUnavailable, "unsupported_websocket", "该 WebSocket 协议尚不支持审核")
+		writeError(w, "responses", http.StatusServiceUnavailable, "unsupported_websocket", auditDeniedMessage(audit.IngressDecisionUnavailable, state.requestID))
 		return
 	}
 	identity, err := p.identity.Resolve(r.Context(), r, state.clientIP)
 	if err != nil && p.audit.ModeForUser(identity.UserID) == "blocking" {
-		writeError(w, "responses", http.StatusServiceUnavailable, "eligibility_unknown", "身份暂不可验证")
+		writeError(w, "responses", http.StatusServiceUnavailable, "eligibility_unknown", auditDeniedMessage(audit.IngressDecisionUnavailable, state.requestID))
 		return
 	}
 	u := *p.upstream
@@ -134,11 +134,11 @@ func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *request
 			return
 		}
 		if eventType(raw) == "response.create" {
-			decision := p.auditMessage(ctx, r, identity, raw)
+			decision := p.auditMessage(ctx, r, identity, raw, state.requestID)
 			if decision != nil && decision.Kind != audit.IngressDecisionAllow && decision.Kind != audit.IngressDecisionFlag &&
 				!(decision.Mode == "async" && decision.Kind == audit.IngressDecisionUnavailable) {
 				p.audit.RejectContinuation(decision, identity.APIKeyID, decision.ErrorCode)
-				sendError(decision.ErrorCode, auditDeniedMessage(decision.Kind))
+				sendError(decision.ErrorCode, auditDeniedMessage(decision.Kind, decisionReference(decision, state.requestID)))
 				continue
 			}
 			if decision != nil && decision.TurnKey != "" {
@@ -155,7 +155,7 @@ func (p *Proxy) websocket(w http.ResponseWriter, r *http.Request, state *request
 }
 
 // auditMessage 把一条 WebSocket 业务消息按 Responses 协议解析后交给审核服务。
-func (p *Proxy) auditMessage(ctx context.Context, r *http.Request, identity sub2api.Identity, raw []byte) *audit.IntakeDecision {
+func (p *Proxy) auditMessage(ctx context.Context, r *http.Request, identity sub2api.Identity, raw []byte, requestID string) *audit.IntakeDecision {
 	parsed, err := audit.ParsePrompt("responses_websocket", bytes.NewReader(raw), audit.DetectClient(r.Header))
 	if err != nil {
 		if strings.Contains(err.Error(), "不是可审核的生成请求") {
@@ -169,7 +169,7 @@ func (p *Proxy) auditMessage(ctx context.Context, r *http.Request, identity sub2
 	return p.audit.Check(ctx, audit.IntakeRequest{
 		Parsed: parsed, UserID: identity.UserID, APIKeyID: identity.APIKeyID, GroupID: identity.GroupID,
 		Identity: audit.Identity{Username: identity.Username, UserEmail: identity.UserEmail, APIKeyName: identity.APIKeyName, GroupName: identity.GroupName, Endpoint: r.URL.Path},
-		Provider: identity.Platform, Model: parsed.Model,
+		Provider: identity.Platform, Model: parsed.Model, RequestID: requestID,
 	})
 }
 

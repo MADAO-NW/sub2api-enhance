@@ -10,6 +10,9 @@ type EnforcementState struct {
 	DisableViolationCount   int64      `json:"disable_violation_count"`
 	DisableResetAt          *time.Time `json:"disable_reset_at"`
 	LastJobID               *int64     `json:"last_job_id"`
+	// EscalatedAt 非空表示该用户已自动加严为同步审核。
+	EscalatedAt    *time.Time `json:"escalated_at"`
+	EscalatedJobID *int64     `json:"escalated_job_id"`
 }
 
 type EnforcementUser struct {
@@ -60,28 +63,54 @@ type Action struct {
 	UpdatedAt          time.Time        `json:"updated_at"`
 }
 
-// decideEnforcement 同时返回提醒和停用动作；原版账号停用仍只适用于普通用户。
-func decideEnforcement(state EnforcementState, user EnforcementUser, eligible, triggerBlock bool, config Config, window []Decision) (EnforcementState, []string) {
-	next := state
-	if !eligible {
+// enforcementInput 汇总一次裁决所需的规则、用户状态与类别处置级别。
+type enforcementInput struct {
+	State        EnforcementState
+	User         EnforcementUser
+	Eligible     bool
+	TriggerBlock bool
+	// Mode 是本任务冻结的处理方式，用于判断加严是否从异步开始。
+	Mode        string
+	Config      Config
+	Window      []Decision
+	Disposition string
+}
+
+// decideEnforcement 同时返回提醒、加严和停用动作；原版账号停用仍只适用于普通用户。
+func decideEnforcement(input enforcementInput) (EnforcementState, []string) {
+	next := input.State
+	if !input.Eligible {
 		return next, nil
 	}
-	actions := make([]string, 0, 2)
-	if config.Warning.Enabled {
+	actions := make([]string, 0, 3)
+	if input.Config.Warning.Enabled {
 		violations := 0
-		for _, decision := range window {
+		for _, decision := range input.Window {
 			if decision == DecisionBlock {
 				violations++
 			}
 		}
-		if violations < config.Warning.Limit {
+		if violations < input.Config.Warning.Limit {
 			next.WarningArmed = true
-		} else if next.WarningArmed && triggerBlock {
+		} else if next.WarningArmed && input.TriggerBlock {
 			next.WarningArmed = false
 			actions = append(actions, "warning")
+			// 自动加严只对异步审核用户生效，且同一用户只加严一次。
+			if input.Config.EscalateOnWarning && input.Mode == "async" && next.EscalatedAt == nil {
+				actions = append(actions, "escalation")
+			}
 		}
 	}
-	if user.Role == "user" && config.Disable.Enabled && user.Status == "active" && triggerBlock && next.DisableViolationCount >= config.Disable.Limit {
+	disable := input.User.Role == "user" && input.Config.Disable.Enabled && input.User.Status == "active" && input.TriggerBlock &&
+		next.DisableViolationCount >= input.Config.Disable.Limit
+	if input.Disposition == CategoryDispositionImmediateDisable {
+		// 标记为立即停用的类别不必等累计达到全局阈值。
+		disable = input.User.Role == "user" && input.Config.Disable.Enabled && input.User.Status == "active" && input.TriggerBlock
+	}
+	if input.Disposition == CategoryDispositionNoticeOnly {
+		disable = false
+	}
+	if disable {
 		actions = append(actions, "disable")
 	}
 	return next, actions

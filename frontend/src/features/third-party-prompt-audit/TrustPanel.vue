@@ -1,15 +1,16 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import Pagination from '@/components/common/Pagination.vue'
 import {
-  thirdPartyPromptAuditAPI as api, type BreakerEntry, type DrillResult, type TrustEntry,
+  thirdPartyPromptAuditAPI as api, type BreakerEntry, type SimilarBlock, type TrustEntry,
 } from '@/api/admin/third-party-prompt-audit'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { formatTime } from './viewModel'
 import { useAuditLabels } from './labels'
+import TextDiff from './TextDiff.vue'
 
-const props = withDefaults(defineProps<{ refreshKey?: number; active?: boolean }>(), { refreshKey: 0, active: true })
+const props = withDefaults(defineProps<{ refreshKey?: number; active?: boolean; focusHash?: string }>(), { refreshKey: 0, active: true, focusHash: '' })
 const emit = defineEmits<{ (event: 'changed'): void }>()
 const label = useAuditLabels(), app = useAppStore()
 const status = ref<'tripped' | 'trusted' | 'confirmed' | ''>('tripped')
@@ -19,17 +20,11 @@ const breakerPage = ref(1), breakerTotal = ref(0)
 const trusted = ref<TrustEntry[]>([])
 const trustPage = ref(1), trustTotal = ref(0)
 const loading = ref(false), pending = ref(''), error = ref('')
-// 熔断演练：用假哈希走一遍判定，不写任何业务表。
-const drillHash = ref('')
-const drill = ref<DrillResult | null>(null)
-const drilling = ref(false)
-async function runDrill() {
-  if (drillHash.value.length !== 64) { app.showError(label('drillHashInvalid')); return }
-  drilling.value = true
-  try { drill.value = await api.drillBreaker(drillHash.value) }
-  catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
-  finally { drilling.value = false }
-}
+// 相似块按熔断块缓存；每个相似块只提供自己的信任/确认按钮，不做按相似度批量信任。
+const similar = reactive<Record<string, SimilarBlock[]>>({})
+const similarOpen = ref<string[]>([])
+const similarSelected = reactive<Record<string, string>>({})
+const similarLoading = ref('')
 
 async function loadBreakers(silent = false) {
   if (!silent) { loading.value = true; error.value = '' }
@@ -48,6 +43,24 @@ async function loadTrust(silent = false) {
     trustTotal.value = result.total
   } catch (err) { if (!silent) error.value = extractApiErrorMessage(err, label('error')) }
 }
+async function loadSimilar(hash: string) {
+  similarLoading.value = hash
+  try { similar[hash] = (await api.similarBlocks(hash)).items }
+  catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { similarLoading.value = '' }
+}
+async function toggleSimilar(item: BreakerEntry) {
+  if (similarOpen.value.includes(item.hash)) { similarOpen.value = similarOpen.value.filter(hash => hash !== item.hash); return }
+  similarOpen.value = [...similarOpen.value, item.hash]
+  if (!similar[item.hash]) await loadSimilar(item.hash)
+}
+function selectSimilar(hash: string, target: string) {
+  similarSelected[hash] = similarSelected[hash] === target ? '' : target
+}
+function comparePreview(hash: string): SimilarBlock | null {
+  const selected = similarSelected[hash]
+  return selected ? (similar[hash] ?? []).find(item => item.hash === selected) ?? null : null
+}
 async function act(kind: 'trust' | 'confirm' | 'untrust', hash: string) {
   pending.value = hash + kind
   try {
@@ -56,6 +69,7 @@ async function act(kind: 'trust' | 'confirm' | 'untrust', hash: string) {
     else await api.untrust(hash)
     app.showSuccess(label('saved'))
     emit('changed')
+    delete similar[hash]
     await Promise.all([loadBreakers(), loadTrust()])
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { pending.value = '' }
@@ -68,6 +82,16 @@ watch(search, () => {
   window.clearTimeout(searchTimer)
   searchTimer = window.setTimeout(() => { breakerPage.value = 1; trustPage.value = 1; void loadBreakers(); void loadTrust() }, 300)
 })
+// 从待处理工作台跳到本页时，直接定位到该熔断块。
+watch(() => props.focusHash, hash => {
+  if (!hash) return
+  status.value = ''
+  search.value = hash
+  if (!similarOpen.value.includes(hash)) {
+    similarOpen.value = [...similarOpen.value, hash]
+    if (!similar[hash]) void loadSimilar(hash)
+  }
+}, { immediate: true })
 watch(() => props.refreshKey, () => { void loadBreakers(); void loadTrust() })
 // 每 5 秒静默刷新熔断与信任列表；页面不可见、正在加载或有待完成操作时跳过。
 const autoTimer = window.setInterval(() => {
@@ -110,40 +134,60 @@ onMounted(() => { void loadBreakers(); void loadTrust() })
             <th class="p-2">{{ label('actions') }}</th>
           </tr></thead>
           <tbody>
-            <tr v-for="item in breakers" :key="item.hash" class="border-t border-gray-100 align-top dark:border-dark-700">
-              <td class="max-w-xl p-2">
-                <p class="break-all font-mono text-xs text-gray-500">{{ item.hash }}</p>
-                <pre class="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words text-xs">{{ item.preview }}</pre>
-              </td>
-              <td class="p-2">{{ label('breaker' + item.status.charAt(0).toUpperCase() + item.status.slice(1)) }}</td>
-              <td class="p-2">{{ item.distinct_users }}<span v-if="item.user_ids?.length" class="mt-1 block text-xs text-gray-500">#{{ item.user_ids.join(' #') }}</span><span v-if="item.similar" class="mt-1 block text-xs text-amber-700">{{ label('similarBlocks') }}: {{ item.similar }}</span></td>
-              <td class="whitespace-nowrap p-2">{{ formatTime(item.tripped_at) }}</td>
-              <td class="space-y-2 p-2">
-                <template v-if="item.status === 'tripped'">
-                  <button class="btn btn-secondary btn-sm" :disabled="pending === item.hash + 'trust'" @click="act('trust', item.hash)">{{ label('trust') }}</button>
-                  <button class="btn btn-secondary btn-sm" :disabled="pending === item.hash + 'confirm'" @click="act('confirm', item.hash)">{{ label('confirmViolation') }}</button>
-                </template>
-                <button v-else-if="item.status === 'trusted'" class="btn btn-secondary btn-sm" :disabled="pending === item.hash + 'untrust'" @click="act('untrust', item.hash)">{{ label('untrust') }}</button>
-                <span v-else class="text-xs text-gray-500">{{ label('breakerConfirmedHint') }}</span>
-              </td>
-            </tr>
+            <template v-for="item in breakers" :key="item.hash">
+              <tr class="border-t border-gray-100 align-top dark:border-dark-700">
+                <td class="max-w-xl p-2">
+                  <p class="break-all font-mono text-xs text-gray-500">{{ item.hash }}</p>
+                  <pre class="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words text-xs">{{ item.preview }}</pre>
+                </td>
+                <td class="p-2">{{ label('breaker' + item.status.charAt(0).toUpperCase() + item.status.slice(1)) }}</td>
+                <td class="p-2">{{ item.distinct_users }}<span v-if="item.user_ids?.length" class="mt-1 block text-xs text-gray-500">#{{ item.user_ids.join(' #') }}</span>
+                  <button v-if="item.similar" type="button" class="mt-1 block text-xs text-amber-700 underline dark:text-amber-400" data-test="similar-toggle" @click="toggleSimilar(item)">
+                    {{ label('similarBlocksExpand') }} {{ item.similar }}
+                  </button></td>
+                <td class="whitespace-nowrap p-2">{{ formatTime(item.tripped_at) }}</td>
+                <td class="space-y-2 p-2">
+                  <template v-if="item.status === 'tripped'">
+                    <button class="btn btn-secondary btn-sm" :disabled="pending === item.hash + 'trust'" @click="act('trust', item.hash)">{{ label('trust') }}</button>
+                    <button class="btn btn-secondary btn-sm" :disabled="pending === item.hash + 'confirm'" @click="act('confirm', item.hash)">{{ label('confirmViolation') }}</button>
+                  </template>
+                  <button v-else-if="item.status === 'trusted'" class="btn btn-secondary btn-sm" :disabled="pending === item.hash + 'untrust'" @click="act('untrust', item.hash)">{{ label('untrust') }}</button>
+                  <span v-else class="text-xs text-gray-500">{{ label('breakerConfirmedHint') }}</span>
+                </td>
+              </tr>
+              <tr v-if="similarOpen.includes(item.hash)" class="border-t border-gray-100 bg-gray-50 dark:border-dark-700 dark:bg-dark-900">
+                <td colspan="5" class="space-y-3 p-4">
+                  <p v-if="similarLoading === item.hash" role="status">{{ label('loading') }}</p>
+                  <template v-else>
+                    <p v-if="!(similar[item.hash] ?? []).length" class="text-sm text-gray-500">{{ label('similarEmpty') }}</p>
+                    <div v-for="candidate in similar[item.hash] ?? []" :key="candidate.hash" class="rounded-lg border border-gray-200 p-3 dark:border-dark-700">
+                      <div class="flex flex-wrap items-center gap-3 text-sm">
+                        <span class="break-all font-mono text-xs text-gray-500">{{ candidate.hash }}</span>
+                        <span>{{ label('similarDistance') }}: {{ candidate.distance }}</span>
+                        <span>{{ candidate.bytes }} B</span>
+                        <span>{{ candidate.distinct_users }} · {{ label('distinctUsers') }}</span>
+                        <span v-if="candidate.breaker_status">{{ label('breaker' + candidate.breaker_status.charAt(0).toUpperCase() + candidate.breaker_status.slice(1)) }}</span>
+                        <span :class="candidate.trusted ? 'text-green-700 dark:text-green-400' : 'text-gray-500'">{{ label(candidate.trusted ? 'breakerTrusted' : 'similarNotTrusted') }}</span>
+                        <button type="button" class="btn btn-ghost btn-sm" data-test="similar-compare" @click="selectSimilar(item.hash, candidate.hash)">{{ label('compareWithBreaker') }}</button>
+                        <button v-if="!candidate.trusted && candidate.breaker_status !== 'confirmed'" class="btn btn-secondary btn-sm"
+                          :disabled="pending === candidate.hash + 'trust'" data-test="similar-trust" @click="act('trust', candidate.hash)">{{ label('trust') }}</button>
+                        <button v-if="candidate.breaker_status === 'tripped'" class="btn btn-secondary btn-sm"
+                          :disabled="pending === candidate.hash + 'confirm'" data-test="similar-confirm" @click="act('confirm', candidate.hash)">{{ label('confirmViolation') }}</button>
+                      </div>
+                      <pre class="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words text-xs" data-test="similar-preview">{{ candidate.preview }}</pre>
+                      <div v-if="comparePreview(item.hash)?.hash === candidate.hash" class="mt-3" data-test="similar-diff">
+                        <TextDiff :left="item.preview" :right="candidate.preview" />
+                      </div>
+                    </div>
+                  </template>
+                </td>
+              </tr>
+            </template>
             <tr v-if="!loading && !breakers.length"><td colspan="5" class="p-8 text-center text-gray-500">{{ label('empty') }}</td></tr>
           </tbody>
         </table>
       </div>
       <Pagination :page="breakerPage" :page-size="20" :page-size-options="[20, 50]" :total="breakerTotal" @update:page="changeBreakerPage" />
-    </section>
-    <section class="card space-y-3 p-5" data-test="breaker-drill">
-      <h2 class="text-lg font-semibold">{{ label('breakerDrill') }}</h2>
-      <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('breakerDrillHint') }}</p>
-      <div class="flex flex-wrap items-end gap-3">
-        <label class="space-y-2 text-sm"><span>{{ label('instructionBlock') }}</span><input v-model="drillHash" class="input w-96 font-mono" :placeholder="label('drillHashPlaceholder')" /></label>
-        <button class="btn btn-secondary" :disabled="drilling || drillHash.length !== 64" @click="runDrill">{{ label(drilling ? 'loading' : 'runDrill') }}</button>
-      </div>
-      <div v-if="drill" class="space-y-1 text-sm">
-        <p>{{ label('threshold') }}: {{ drill.threshold }} · {{ drill.tripped ? label('drillTripped') : label('drillNotTripped') }}</p>
-        <p v-for="(step, index) in drill.steps" :key="index">{{ step }}</p>
-      </div>
     </section>
     <section class="card space-y-4 p-5">
       <div>

@@ -222,10 +222,10 @@ func TestRetentionKeepsEnforcementMarksBreakersAndTrust(t *testing.T) {
 	mock.ExpectExec(`row_number\(\) OVER \(PARTITION BY r.hash,r.eval_hash`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`DELETE FROM sub2api_enhance.prompt_reviews WHERE id IN \(SELECT r.id`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectExec(`DELETE FROM sub2api_enhance.prompt_texts`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 4))
+	mock.ExpectExec(`DELETE FROM sub2api_enhance.policy_replays`).WithArgs(30, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 2))
 	repo := NewRepository(db)
 	result, err := repo.RunRetention(context.Background(), 30)
-	require.NoError(t, err)
-	require.Equal(t, RetentionResult{Jobs: retentionBatchSize + 3, ProbeAttempts: 1, ReviewDuplicates: 1, Reviews: 2, Texts: 4}, result)
+	require.Equal(t, RetentionResult{Jobs: retentionBatchSize + 3, ProbeAttempts: 1, ReviewDuplicates: 1, Reviews: 2, Texts: 4, Replays: 2}, result)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

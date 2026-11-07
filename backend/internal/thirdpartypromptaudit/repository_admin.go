@@ -37,6 +37,9 @@ func validateFilter(filter Filter) error {
 	if filter.From != nil && filter.To != nil && !filter.From.Before(*filter.To) {
 		return errors.New("开始时间必须早于结束时间")
 	}
+	if filter.Category != "" && !validCategoryCode(filter.Category) {
+		return errors.New("类别筛选无效，必须形如 R01")
+	}
 	return nil
 }
 
@@ -81,6 +84,10 @@ func filterSQL(filter Filter, includeTime bool) (string, []any) {
 	}
 	if filter.Model != "" {
 		appendValue("j.model", filter.Model)
+	}
+	if filter.Category != "" {
+		args = append(args, filter.Category)
+		clauses = append(clauses, "j.trigger_categories && ARRAY[$"+itoa(len(args))+"]::text[]")
 	}
 	if includeTime {
 		if filter.From != nil {
@@ -185,6 +192,7 @@ type JobPrompt struct {
 	Reason     string   `json:"reason,omitempty"`
 	Score      *float64 `json:"score"`
 	Trusted    bool     `json:"trusted"`
+	Sampled    bool     `json:"sampled"`
 }
 
 // JobPrompts 只读取当前轮的审核目标正文，不加载调用流水与处置动作。
@@ -207,10 +215,36 @@ func (r *Repository) JobPrompts(ctx context.Context, id int64) ([]JobPrompt, err
 	if err != nil {
 		return nil, err
 	}
+	hashes := make([]string, 0, len(targets))
+	for _, target := range targets {
+		hashes = append(hashes, target.Hash)
+	}
+	sampled := make(map[string]bool, len(hashes))
+	if len(hashes) > 0 {
+		sampleRows, err := r.db.QueryContext(ctx, `SELECT hash FROM sub2api_enhance.policy_samples WHERE hash=ANY($1)`, pq.Array(hashes))
+		if err != nil {
+			return nil, err
+		}
+		for sampleRows.Next() {
+			var hash string
+			if err := sampleRows.Scan(&hash); err != nil {
+				_ = sampleRows.Close()
+				return nil, err
+			}
+			sampled[hash] = true
+		}
+		if err := sampleRows.Err(); err != nil {
+			_ = sampleRows.Close()
+			return nil, err
+		}
+		if err := sampleRows.Close(); err != nil {
+			return nil, err
+		}
+	}
 	items := make([]JobPrompt, 0, len(targets))
 	for _, target := range targets {
 		item := JobPrompt{Order: target.Order, Kind: target.Kind, Hash: target.Hash, Text: target.Text, Bytes: target.Bytes,
-			Resolution: target.Resolution, Decision: string(target.Decision), Trusted: target.Trusted}
+			Resolution: target.Resolution, Decision: string(target.Decision), Trusted: target.Trusted, Sampled: sampled[target.Hash]}
 		if target.ReviewID != nil {
 			if review := reviews[*target.ReviewID]; review != nil {
 				item.Reason, item.Score = review.Reason, review.Score
@@ -232,9 +266,6 @@ type reauditCandidate struct {
 }
 
 func (r *Repository) reauditCandidates(ctx context.Context, request ReauditRequest) ([]reauditCandidate, error) {
-	if request.ReuseMode != "" && request.ReuseMode != ReuseModeAllow && request.ReuseMode != ReuseModeForce {
-		return nil, errors.New("复核复用方式无效")
-	}
 	if err := validateFilter(request.Filter); err != nil {
 		return nil, err
 	}
@@ -263,24 +294,36 @@ func (r *Repository) PreviewReaudits(ctx context.Context, request ReauditRequest
 	if err != nil {
 		return nil, err
 	}
+	return r.previewWithCandidates(ctx, candidates)
+}
+
+// previewWithCandidates 计算预览结果与预计真实调用数。
+func (r *Repository) previewWithCandidates(ctx context.Context, candidates []reauditCandidate) (*ReauditResult, error) {
 	result := &ReauditResult{Matched: int64(len(candidates)), Items: []ReauditItem{}}
+	readyIDs := make([]int64, 0, len(candidates))
 	for _, candidate := range candidates {
 		item := ReauditItem{JobID: candidate.ID, Status: "ready", userID: candidate.UserID}
 		if !candidate.Ready {
 			item.Status, item.Reason = "skipped", candidate.Reason
 		} else {
 			result.Ready++
+			readyIDs = append(readyIDs, candidate.ID)
 		}
 		result.Items = append(result.Items, item)
+	}
+	if len(readyIDs) > 0 {
+		// 估算真实调用量：按目标内容去重，并排除已信任的指令块。
+		if err := r.db.QueryRowContext(ctx, `SELECT count(DISTINCT t.hash) FROM sub2api_enhance.audit_job_targets t
+ JOIN sub2api_enhance.audit_jobs j ON j.id=t.job_id AND t.round=j.current_round
+ WHERE t.job_id=ANY($1) AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.prompt_trust pt WHERE pt.hash=t.hash)`, pq.Array(readyIDs)).Scan(&result.EstimatedTargets); err != nil {
+			return nil, err
+		}
 	}
 	return result, nil
 }
 
 // CreateReaudits 在同一任务上追加新一轮：复制当前轮目标，重新审核本身不触发新的处置。
 func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest, snapshot ConfigSnapshot, actorID int64) (*ReauditResult, error) {
-	if request.ReuseMode == "" {
-		request.ReuseMode = ReuseModeAllow
-	}
 	result, err := r.PreviewReaudits(ctx, request)
 	if err != nil {
 		return nil, err
@@ -304,7 +347,7 @@ func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest,
 			item.Status, item.Reason = "failed", err.Error()
 			continue
 		}
-		err = r.appendRound(ctx, item.JobID, actorID, request.ReuseMode, snapshot.Revision, string(encoded))
+		err = r.appendRound(ctx, item.JobID, actorID, snapshot.Revision, string(encoded))
 		switch {
 		case err == nil:
 			item.Status = "requeued"
@@ -320,7 +363,8 @@ func (r *Repository) CreateReaudits(ctx context.Context, request ReauditRequest,
 }
 
 // appendRound 追加一轮目标并让任务重新排队；任务状态不是已结束时报 ErrLeaseLost。
-func (r *Repository) appendRound(ctx context.Context, jobID, actorID int64, reuseMode string, revision int64, configSnapshot string) error {
+// 重新审核统一使用 fresh 语义，reuse_after 记录本次发起时间。
+func (r *Repository) appendRound(ctx context.Context, jobID, actorID int64, revision int64, configSnapshot string) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -345,9 +389,9 @@ func (r *Repository) appendRound(ctx context.Context, jobID, actorID int64, reus
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.audit_jobs SET current_round=$2,current_run_kind='reaudit',current_requested_by=$3,
- reuse_mode=$4,config_revision=$5,config_snapshot=$6,status='queued',attempts=0,max_attempts=$7,next_attempt_at=clock_timestamp(),
+ reuse_mode='fresh',reuse_after=clock_timestamp(),config_revision=$4,config_snapshot=$5,status='queued',attempts=0,max_attempts=$6,next_attempt_at=clock_timestamp(),
  lease_until=NULL,failure_stage=NULL,last_error_code=NULL,last_error_message=NULL,started_at=NULL,finished_at=NULL,updated_at=clock_timestamp()
- WHERE id=$1`, jobID, next, actorID, reuseMode, revision, configSnapshot, MaxEvaluationAttempts); err != nil {
+ WHERE id=$1`, jobID, next, actorID, revision, configSnapshot, MaxEvaluationAttempts); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -426,11 +470,16 @@ func (r *Repository) DeleteUserData(ctx context.Context, userID int64) (int64, e
    AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.audit_jobs j JOIN sub2api_enhance.audit_job_targets t ON t.job_id=j.id WHERE t.review_id=r.id)`); err != nil {
 		return count, err
 	}
+	// 样本会引用文本，按用户删除时先删该用户的样本，再清理不再被引用的文本。
+	if err := r.DeleteSamplesForUser(ctx, tx, userID); err != nil {
+		return count, err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sub2api_enhance.prompt_texts p
  WHERE NOT EXISTS (SELECT 1 FROM sub2api_enhance.audit_job_targets t WHERE t.hash=p.hash)
    AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.prompt_reviews r WHERE r.hash=p.hash)
    AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.prompt_trust pt WHERE pt.hash=p.hash)
-   AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.instruction_breakers b WHERE b.hash=p.hash)`); err != nil {
+   AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.instruction_breakers b WHERE b.hash=p.hash)
+   AND NOT EXISTS (SELECT 1 FROM sub2api_enhance.policy_samples s WHERE s.hash=p.hash)`); err != nil {
 		return count, err
 	}
 	if err := tx.Commit(); err != nil {

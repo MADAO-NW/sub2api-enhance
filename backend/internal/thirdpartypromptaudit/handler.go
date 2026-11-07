@@ -193,7 +193,7 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 
 func filterFromQuery(c *gin.Context) (Filter, error) {
 	filter := Filter{Status: c.Query("status"), Decision: Decision(c.Query("decision")), RunKind: c.Query("run_kind"),
-		Mode: c.Query("mode"), Platform: c.Query("platform"), RequestID: c.Query("request_id"), Model: c.Query("model")}
+		Mode: c.Query("mode"), Platform: c.Query("platform"), RequestID: c.Query("request_id"), Model: c.Query("model"), Category: c.Query("category")}
 	for _, field := range []struct {
 		name   string
 		target **int64
@@ -418,21 +418,6 @@ func (h *AdminHandler) ListBreakers(c *gin.Context) {
 	response.Success(c, result)
 }
 
-// DrillBreaker 用假哈希演示“只计一次 + 熔断”判定，不写任何业务表。
-func (h *AdminHandler) DrillBreaker(c *gin.Context) {
-	var input TrustRequest
-	if err := bindStrict(c, &input); err != nil {
-		response.BadRequest(c, "演练请求无效："+err.Error())
-		return
-	}
-	result, err := DrillBreaker(input.Hash)
-	if err != nil {
-		respondError(c, err)
-		return
-	}
-	response.Success(c, result)
-}
-
 // TrustBatch 批量信任指令块，返回成功信任的哈希。
 func (h *AdminHandler) TrustBatch(c *gin.Context) {
 	var input struct {
@@ -611,5 +596,301 @@ func (h *AdminHandler) EnableAndReset(c *gin.Context) {
 		respondError(c, err)
 		return
 	}
-	response.Accepted(c, gin.H{"action_id": actionID, "execution_status": "pending"})
+	// 启用并重置同时解除自动加严；未加严时无需额外动作。
+	escalationCleared := false
+	if _, err := h.repo.ClearEscalation(c.Request.Context(), id, adminActor(c)); err == nil {
+		h.config.SetEscalation(id, false)
+		escalationCleared = true
+	} else if !errors.Is(err, ErrNotFound) {
+		respondError(c, err)
+		return
+	}
+	response.Accepted(c, gin.H{"action_id": actionID, "execution_status": "pending", "escalation_cleared": escalationCleared})
+}
+
+// ConfigImpact 计算草稿配置保存后对全库审核缓存的影响；只读，不保存配置。
+func (h *AdminHandler) ConfigImpact(c *gin.Context) {
+	var draft Config
+	if err := bindStrict(c, &draft); err != nil {
+		response.BadRequest(c, "配置影响请求无效："+err.Error())
+		return
+	}
+	impact, err := h.config.Impact(c.Request.Context(), draft)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, impact)
+}
+
+// actionFilterFromQuery 解析处置动作列表的筛选条件。
+func actionFilterFromQuery(c *gin.Context) (ActionFilter, error) {
+	filter := ActionFilter{ExecutionStatus: c.Query("execution_status"), NotificationStatus: c.Query("notification_status"), ActionType: c.Query("action_type")}
+	if value := c.Query("user_id"); value != "" {
+		id, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || id <= 0 {
+			return filter, errors.New("user_id 必须为正整数")
+		}
+		filter.UserID = &id
+	}
+	for _, field := range []struct {
+		name   string
+		target **time.Time
+	}{{"from", &filter.From}, {"to", &filter.To}} {
+		if value := c.Query(field.name); value != "" {
+			at, err := time.Parse(time.RFC3339Nano, value)
+			if err != nil {
+				return filter, fmt.Errorf("%s 必须为含时区的时间", field.name)
+			}
+			*field.target = &at
+		}
+	}
+	return filter, nil
+}
+
+// ListActions 返回处置动作的分页列表，可按执行与通知状态、类型、用户和时间筛选。
+func (h *AdminHandler) ListActions(c *gin.Context) {
+	filter, err := actionFilterFromQuery(c)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	page, size, err := paginationQuery(c)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	result, err := h.repo.ListActionRecords(c.Request.Context(), filter, page, size)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+// GetInbox 返回待处理工作台的只读聚合。
+func (h *AdminHandler) GetInbox(c *gin.Context) {
+	result, err := h.service.Inbox(c.Request.Context())
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+// ListRiskUsers 返回时间范围内的用户风险榜。
+func (h *AdminHandler) ListRiskUsers(c *gin.Context) {
+	from, err := time.Parse(time.RFC3339Nano, c.Query("from"))
+	if err != nil {
+		response.BadRequest(c, "from 必须为含时区的时间")
+		return
+	}
+	to, err := time.Parse(time.RFC3339Nano, c.Query("to"))
+	if err != nil || !from.Before(to) {
+		response.BadRequest(c, "to 必须晚于 from，并包含时区")
+		return
+	}
+	page, size, err := paginationQuery(c)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	sortKey := c.DefaultQuery("sort", "blocks")
+	if sortKey != "blocks" && sortKey != "violations" && sortKey != "last_block_at" {
+		response.BadRequest(c, "排序方式无效")
+		return
+	}
+	result, err := h.repo.RiskUsers(c.Request.Context(), RiskUserQuery{From: from, To: to, Keyword: c.Query("keyword"),
+		Sort: sortKey, Page: page, PageSize: size})
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+// GetCostStats 返回审核成本看板：按分桶、节点、调用类型与阶段聚合的调用与 token。
+func (h *AdminHandler) GetCostStats(c *gin.Context) {
+	from, err := time.Parse(time.RFC3339Nano, c.Query("from"))
+	if err != nil {
+		response.BadRequest(c, "from 必须为含时区的时间")
+		return
+	}
+	to, err := time.Parse(time.RFC3339Nano, c.Query("to"))
+	if err != nil || !from.Before(to) {
+		response.BadRequest(c, "to 必须晚于 from，并包含时区")
+		return
+	}
+	bucket := c.DefaultQuery("bucket", "day")
+	if bucket != "day" && bucket != "hour" {
+		response.BadRequest(c, "bucket 只能是 day 或 hour")
+		return
+	}
+	timezone := c.Query("timezone")
+	if timezone == "" {
+		response.BadRequest(c, "请指定统计时区")
+		return
+	}
+	if _, err := time.LoadLocation(timezone); err != nil {
+		response.BadRequest(c, "统计时区无效")
+		return
+	}
+	nodeNames := map[string]string{}
+	if snapshot, err := h.config.Active(); err == nil {
+		for _, model := range snapshot.Models {
+			nodeNames[model.ID] = model.Name
+		}
+	}
+	result, err := h.repo.CostStats(c.Request.Context(), CostQuery{From: from, To: to, Bucket: bucket, Timezone: timezone}, nodeNames)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+// ListSimilarBlocks 返回与指定指令块相似（汉明距离不超过阈值）的块。
+func (h *AdminHandler) ListSimilarBlocks(c *gin.Context) {
+	hash := c.Param("hash")
+	if len(hash) != 64 {
+		response.BadRequest(c, "指令块哈希无效")
+		return
+	}
+	result, err := h.repo.SimilarBlocks(c.Request.Context(), hash)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, gin.H{"items": result})
+}
+
+// CreateSample 把一个任务目标加入误判样本集；hash 由后端从任务目标读取。
+func (h *AdminHandler) CreateSample(c *gin.Context) {
+	var input SampleInput
+	if err := bindStrict(c, &input); err != nil {
+		response.BadRequest(c, "样本请求无效："+err.Error())
+		return
+	}
+	if input.JobID <= 0 || input.TargetOrder <= 0 {
+		response.BadRequest(c, "样本必须引用有效的任务与目标序号")
+		return
+	}
+	sample, err := h.repo.CreateSample(c.Request.Context(), input, adminActor(c))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	middleware.SetAuditExtra(c, map[string]any{"result": "success", "sample_id": sample.ID, "hash": sample.Hash})
+	response.Success(c, sample)
+}
+
+// ListSamples 返回分页的误判样本。
+func (h *AdminHandler) ListSamples(c *gin.Context) {
+	page, size, err := paginationQuery(c)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	result, err := h.repo.ListSamples(c.Request.Context(), c.Query("kind"), c.Query("expected"), page, size)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+// UpdateSample 修改样本的期望结论与备注。
+func (h *AdminHandler) UpdateSample(c *gin.Context) {
+	id, ok := recordID(c)
+	if !ok {
+		return
+	}
+	var input struct {
+		Expected string `json:"expected" binding:"required,oneof=pass block"`
+		Note     string `json:"note" binding:"max=500"`
+	}
+	if err := bindStrict(c, &input); err != nil {
+		response.BadRequest(c, "样本更新请求无效："+err.Error())
+		return
+	}
+	if err := h.repo.UpdateSample(c.Request.Context(), id, input.Expected, input.Note); err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, gin.H{"id": id})
+}
+
+// DeleteSample 删除一个误判样本。
+func (h *AdminHandler) DeleteSample(c *gin.Context) {
+	id, ok := recordID(c)
+	if !ok {
+		return
+	}
+	if err := h.repo.DeleteSample(c.Request.Context(), id); err != nil {
+		respondError(c, err)
+		return
+	}
+	middleware.SetAuditExtra(c, map[string]any{"result": "success", "sample_id": id})
+	response.Success(c, gin.H{"id": id})
+}
+
+// StartPolicyReplay 用草稿配置回放误判样本；不建任务、不写审核结果。
+func (h *AdminHandler) StartPolicyReplay(c *gin.Context) {
+	var input PolicyReplayRequest
+	if err := bindStrict(c, &input); err != nil {
+		response.BadRequest(c, "政策回放请求无效："+err.Error())
+		return
+	}
+	replay, err := h.service.StartPolicyReplay(c.Request.Context(), input, adminActor(c))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	middleware.SetAuditExtra(c, map[string]any{"result": "success", "replay_id": replay.ID, "samples": len(replay.SampleIDs)})
+	response.Accepted(c, replay)
+}
+
+// ListPolicyReplays 返回最近的政策回放记录。
+func (h *AdminHandler) ListPolicyReplays(c *gin.Context) {
+	limit, err := strconv.Atoi(c.DefaultQuery("limit", "20"))
+	if err != nil || limit <= 0 || limit > 100 {
+		response.BadRequest(c, "limit 必须为 1 至 100 的整数")
+		return
+	}
+	items, err := h.repo.ListReplays(c.Request.Context(), limit)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, gin.H{"items": items})
+}
+
+// GetPolicyReplay 返回一次回放的进度与结果。
+func (h *AdminHandler) GetPolicyReplay(c *gin.Context) {
+	id, ok := recordID(c)
+	if !ok {
+		return
+	}
+	replay, err := h.repo.GetReplay(c.Request.Context(), id)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	response.Success(c, replay)
+}
+
+// ClearEscalation 解除用户的自动加严；只记录动作，不发通知。
+func (h *AdminHandler) ClearEscalation(c *gin.Context) {
+	id, ok := recordID(c)
+	if !ok {
+		return
+	}
+	actionID, err := h.repo.ClearEscalation(c.Request.Context(), id, adminActor(c))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	h.config.SetEscalation(id, false)
+	middleware.SetAuditExtra(c, map[string]any{"result": "success", "user_id": id, "action_id": actionID})
+	response.Success(c, gin.H{"user_id": id, "action_id": actionID})
 }

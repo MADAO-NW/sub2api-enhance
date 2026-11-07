@@ -31,14 +31,15 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 	require.Equal(t, 0.5, *defaults.ReviewThreshold)
 	require.Equal(t, 0.8, *defaults.BlockThreshold)
 	require.Equal(t, WarningConfig{Window: 10, Limit: 2}, defaults.Warning)
-	require.Equal(t, DisableConfig{Limit: 1}, defaults.Disable)
+	require.Equal(t, DisableConfig{Limit: 3}, defaults.Disable)
 	require.Empty(t, defaults.UserRules)
 	require.Equal(t, RetentionDefaultDays, defaults.RetentionDays)
 	require.Equal(t, 0.5, publicDefaults.ReviewThreshold)
 	require.Equal(t, 0.8, publicDefaults.BlockThreshold)
 	require.Equal(t, 10, publicDefaults.WarningWindow)
 	require.Equal(t, 2, publicDefaults.WarningLimit)
-	require.EqualValues(t, 1, publicDefaults.DisableLimit)
+	require.EqualValues(t, 3, publicDefaults.DisableLimit)
+	require.EqualValues(t, instructionBreakerUserThreshold, publicConfig(storedConfig{}).BreakerUserThreshold)
 	model := testConfig().Models[0]
 	require.Equal(t, 300000, publicConfig(storedConfig{}).ModelDefaults.TimeoutMS)
 	require.Equal(t, 4, publicConfig(storedConfig{}).ModelDefaults.MaxConcurrency)
@@ -72,17 +73,23 @@ func TestRetentionDefaultsAndLegacyFieldsAreIgnored(t *testing.T) {
 	require.Equal(t, RetentionDefaultDays, zero.RetentionDays)
 }
 
-func TestUserRuleOverridesOnlyTheSelectedUsersDecisionAndActions(t *testing.T) {
+func TestUserRuleOverridesOnlyModeAndThresholds(t *testing.T) {
 	config := testConfig()
-	config.UserRules = []UserRuleConfig{{UserID: 7, Mode: "blocking", ReviewThreshold: 0.2, BlockThreshold: 0.4, Aggregation: "all_block", Warning: WarningConfig{Enabled: true, Window: 5, Limit: 2}, Disable: DisableConfig{Enabled: true, Limit: 9}}}
+	// 旧配置里残留的 aggregation/warning/disable 键必须被忽略。
+	raw := `{"user_id":7,"mode":"blocking","review_threshold":0.2,"block_threshold":0.4,
+		"aggregation":"all_block","warning":{"enabled":true,"window":5,"limit":2},"disable":{"enabled":true,"limit":9}}`
+	var rule UserRuleConfig
+	require.NoError(t, json.Unmarshal([]byte(raw), &rule))
+	config.UserRules = []UserRuleConfig{rule}
 	require.NoError(t, validateConfig(config, true))
 	effective := effectiveConfigForUser(config, 7)
 	require.Equal(t, 0.2, *effective.ReviewThreshold)
 	require.Equal(t, 0.4, *effective.BlockThreshold)
 	require.Equal(t, "blocking", effective.Mode)
-	require.Equal(t, "all_block", effective.Aggregation)
-	require.Equal(t, WarningConfig{Enabled: true, Window: 5, Limit: 2}, effective.Warning)
-	require.Equal(t, DisableConfig{Enabled: true, Limit: 9}, effective.Disable)
+	// 聚合、提醒与停用一律取全局配置。
+	require.Equal(t, config.Aggregation, effective.Aggregation)
+	require.Equal(t, config.Warning, effective.Warning)
+	require.Equal(t, config.Disable, effective.Disable)
 	require.Nil(t, effective.UserRules)
 	inherited := effectiveConfigForUser(config, 8)
 	require.Equal(t, *config.BlockThreshold, *inherited.BlockThreshold)
@@ -111,7 +118,7 @@ func TestGlobalOffAndExcludedUsersSkipAudit(t *testing.T) {
 
 func TestPerUserModeRespectsGlobalOffAndFreezesEvaluationCredentials(t *testing.T) {
 	config := testConfig()
-	config.UserRules = []UserRuleConfig{{UserID: 7, Mode: "blocking", ReviewThreshold: 0.2, BlockThreshold: 0.4, Aggregation: "any_block", Warning: WarningConfig{Window: 10, Limit: 3}, Disable: DisableConfig{Limit: 5}}}
+	config.UserRules = []UserRuleConfig{{UserID: 7, Mode: "blocking", ReviewThreshold: 0.2, BlockThreshold: 0.4}}
 	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config, Revision: 4}, Keys: map[string]string{"test-node": "first-key"}}}
 	require.Equal(t, "blocking", manager.EffectiveModeForUser(7))
 	require.Equal(t, "async", manager.EffectiveModeForUser(8))
@@ -143,22 +150,23 @@ func TestEvaluationBindingUsesLatestNodeGeneration(t *testing.T) {
 	require.NotContains(t, keys, "test-node")
 }
 
-func TestUserWarningRuleHashDoesNotResetOtherUsers(t *testing.T) {
+func TestWarningRuleHashUsesGlobalRulesForEveryUser(t *testing.T) {
 	config := testConfig()
-	globalHash, err := warningRuleHash(config, 5, 8)
+	globalHash, err := warningRuleHash(config, 5)
 	require.NoError(t, err)
-	config.UserRules = []UserRuleConfig{{UserID: 7, Mode: "blocking", ReviewThreshold: 0.2, BlockThreshold: 0.4, Aggregation: "any_block", Warning: WarningConfig{Enabled: true, Window: 5, Limit: 2}, Disable: DisableConfig{Limit: 9}}}
-	otherHash, err := warningRuleHash(config, 5, 8)
+	config.UserRules = []UserRuleConfig{{UserID: 7, Mode: "blocking", ReviewThreshold: 0.2, BlockThreshold: 0.4}}
+	sameHash, err := warningRuleHash(config, 5)
 	require.NoError(t, err)
-	require.Equal(t, globalHash, otherHash)
-	userHash, err := warningRuleHash(config, 5, 7)
+	require.Equal(t, globalHash, sameHash)
+	config.Warning = WarningConfig{Enabled: true, Window: 5, Limit: 2}
+	changedHash, err := warningRuleHash(config, 6)
 	require.NoError(t, err)
-	require.NotEqual(t, globalHash, userHash)
+	require.NotEqual(t, globalHash, changedHash)
 }
 
 func TestUserRulesRequireUniqueUsersAndCompleteValidRules(t *testing.T) {
 	config := testConfig()
-	rule := UserRuleConfig{UserID: 7, Mode: "async", ReviewThreshold: 0.2, BlockThreshold: 0.4, Aggregation: "any_block", Warning: WarningConfig{Window: 3, Limit: 1}, Disable: DisableConfig{Limit: 2}}
+	rule := UserRuleConfig{UserID: 7, Mode: "async", ReviewThreshold: 0.2, BlockThreshold: 0.4}
 	config.UserRules = []UserRuleConfig{rule, rule}
 	require.ErrorContains(t, validateConfig(config, true), "不重复")
 	config.UserRules = []UserRuleConfig{rule}
@@ -241,7 +249,7 @@ func TestRequestWithoutTargetsCreatesNoJob(t *testing.T) {
 // 入口按用户规则选择模式，后台请求不能占用同步等待。
 func TestUserModeIsChosenAtIntakeAndBackgroundDowngrades(t *testing.T) {
 	config := testConfig()
-	config.UserRules = []UserRuleConfig{{UserID: 7, Mode: "blocking", ReviewThreshold: 0.5, BlockThreshold: 0.8, Aggregation: "any_block", Warning: WarningConfig{Window: 10, Limit: 3}, Disable: DisableConfig{Limit: 5}}}
+	config.UserRules = []UserRuleConfig{{UserID: 7, Mode: "blocking", ReviewThreshold: 0.5, BlockThreshold: 0.8}}
 	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: config}}}
 	service := &Service{config: manager, closing: true, metrics: NewRuntimeMetrics()}
 	parsed := &ParsedRequest{TurnFingerprint: "turn"}

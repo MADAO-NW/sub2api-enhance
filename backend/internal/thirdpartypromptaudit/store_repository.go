@@ -15,11 +15,13 @@ import (
 // auditJobColumns 是任务列表与详情共用的投影；展示用户名优先读取当前用户资料。
 const auditJobColumns = `j.id,j.user_id,j.api_key_id,j.group_id,j.identity_snapshot,j.platform,j.request_id,j.model,j.protocol,j.client_fingerprint,j.mode,
 j.turn_fingerprint,j.orphan_continuation,j.status,COALESCE(j.decision,'') AS decision,j.current_round,j.current_run_kind,j.current_requested_by,j.reuse_mode,
-COALESCE(j.trigger_hash,'') AS trigger_hash,COALESCE(j.trigger_kind,'') AS trigger_kind,j.enforcement_eligible,j.violation_counted,j.disable_counted,
+COALESCE(j.trigger_hash,'') AS trigger_hash,COALESCE(j.trigger_kind,'') AS trigger_kind,COALESCE(j.trigger_categories,'{}') AS trigger_categories,j.reuse_after,j.enforcement_eligible,j.violation_counted,j.disable_counted,
 j.config_revision,j.config_snapshot,j.attempts,j.max_attempts,j.claim_generation,j.lease_until,j.next_attempt_at,COALESCE(j.failure_stage,'') AS failure_stage,
 COALESCE(j.last_error_code,'') AS last_error_code,COALESCE(j.last_error_message,'') AS last_error_message,j.blocking_wait_ms,
 COALESCE((EXTRACT(EPOCH FROM (j.finished_at-j.created_at))*1000)::bigint,0) AS duration_ms,
 COALESCE((EXTRACT(EPOCH FROM (j.finished_at-j.started_at))*1000)::bigint,0) AS processing_ms,j.started_at,j.finished_at,j.created_at,j.updated_at,
+EXISTS(SELECT 1 FROM sub2api_enhance.audit_job_targets st JOIN sub2api_enhance.policy_samples ss ON ss.hash=st.hash
+ WHERE st.job_id=j.id AND st.round=j.current_round) AS sampled,
 COALESCE(NULLIF(display_user.username,''),j.identity_snapshot::json->>'username','') AS display_username,
 COALESCE(NULLIF(display_user.email,''),j.identity_snapshot::json->>'user_email','') AS display_email,
 (SELECT count(*) FROM sub2api_enhance.audit_job_targets t WHERE t.job_id=j.id AND t.round=j.current_round) AS target_count`
@@ -376,9 +378,17 @@ func scanReview(row rowScanner) (*PromptReview, error) {
 }
 
 // FindReusableReview 读取同一内容、同一评估语义下最新的可复用审核结果。
-func (r *Repository) FindReusableReview(ctx context.Context, hash, evalHash string) (*PromptReview, error) {
-	review, err := scanReview(r.db.QueryRowContext(ctx, `SELECT `+reviewColumns+` FROM sub2api_enhance.prompt_reviews
- WHERE hash=$1 AND eval_hash=$2 AND reusable ORDER BY created_at DESC,id DESC LIMIT 1`, hash, evalHash))
+// FindReusableReview 读取同一内容、同一评估语义下最新的可复用审核结果。
+// createdAfter 非空时只返回该时间之后产生的结论，供重新审核使用。
+func (r *Repository) FindReusableReview(ctx context.Context, hash, evalHash string, createdAfter *time.Time) (*PromptReview, error) {
+	query := `SELECT ` + reviewColumns + ` FROM sub2api_enhance.prompt_reviews
+ WHERE hash=$1 AND eval_hash=$2 AND reusable`
+	args := []any{hash, evalHash}
+	if createdAfter != nil {
+		args = append(args, *createdAfter)
+		query += ` AND created_at>=$3`
+	}
+	review, err := scanReview(r.db.QueryRowContext(ctx, query+` ORDER BY created_at DESC,id DESC LIMIT 1`, args...))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -427,10 +437,11 @@ func (r *Repository) SaveReview(ctx context.Context, job *AuditJob, review *Prom
 }
 
 // ResolveTarget 记录目标结论；成功目标即使任务最终失败也不会被撤销。
+// ResolveTarget 记录目标结论与类别；成功目标即使任务最终失败也不会被撤销。
 func (r *Repository) ResolveTarget(ctx context.Context, job *AuditJob, target *JobTarget) error {
-	result, err := r.db.ExecContext(ctx, `UPDATE sub2api_enhance.audit_job_targets SET resolution=$5,review_id=$6,decision=$7,error_code=NULL,error_message=NULL,resolved_at=clock_timestamp()
+	result, err := r.db.ExecContext(ctx, `UPDATE sub2api_enhance.audit_job_targets SET resolution=$5,review_id=$6,decision=$7,categories=$8,error_code=NULL,error_message=NULL,resolved_at=clock_timestamp()
  WHERE job_id=$1 AND round=$3 AND target_order=$4 AND `+leaseValidSQL,
-		job.ID, job.ClaimGeneration, target.Round, target.Order, target.Resolution, target.ReviewID, target.Decision)
+		job.ID, job.ClaimGeneration, target.Round, target.Order, target.Resolution, target.ReviewID, target.Decision, pq.Array(target.Categories))
 	return checkLeaseUpdate(result, err)
 }
 
@@ -444,7 +455,7 @@ func (r *Repository) FailTarget(ctx context.Context, job *AuditJob, target *JobT
 
 // ListRounds 返回任务的全部成功审核轮次。
 func (r *Repository) ListRounds(ctx context.Context, jobID int64) ([]JobRound, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT round,run_kind,requested_by,reuse_mode,decision,COALESCE(trigger_hash,''),COALESCE(trigger_kind,''),config_revision,started_at,finished_at
+	rows, err := r.db.QueryContext(ctx, `SELECT round,run_kind,requested_by,reuse_mode,decision,COALESCE(trigger_hash,''),COALESCE(trigger_kind,''),COALESCE(trigger_categories,'{}'),config_revision,started_at,finished_at
  FROM sub2api_enhance.audit_job_rounds WHERE job_id=$1 ORDER BY round`, jobID)
 	if err != nil {
 		return nil, err
@@ -454,7 +465,7 @@ func (r *Repository) ListRounds(ctx context.Context, jobID int64) ([]JobRound, e
 	for rows.Next() {
 		var item JobRound
 		var decision string
-		if err := rows.Scan(&item.Round, &item.RunKind, &item.RequestedBy, &item.ReuseMode, &decision, &item.TriggerHash, &item.TriggerKind, &item.ConfigRevision, &item.StartedAt, &item.FinishedAt); err != nil {
+		if err := rows.Scan(&item.Round, &item.RunKind, &item.RequestedBy, &item.ReuseMode, &decision, &item.TriggerHash, &item.TriggerKind, pq.Array(&item.TriggerCategories), &item.ConfigRevision, &item.StartedAt, &item.FinishedAt); err != nil {
 			return nil, err
 		}
 		item.Decision = Decision(decision)

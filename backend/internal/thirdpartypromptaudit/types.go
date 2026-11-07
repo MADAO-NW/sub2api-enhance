@@ -12,10 +12,12 @@ const SettingKey = "third_party_prompt_audit_config"
 // MaxEvaluationAttempts 是每个新任务的模型评估预算，结果补写不消耗该预算。
 const MaxEvaluationAttempts = 3
 
-// ReuseModeAllow 和 ReuseModeForce 控制当前审核轮次是否读取历史审核结果与并发复用。
+// 审核轮次的复用方式：允许复用历史结论、只复用本次重审发起之后产生的结论。
+// force 只保留给升级前的历史轮次展示。
 const (
 	ReuseModeAllow = "allow"
 	ReuseModeForce = "force"
+	ReuseModeFresh = "fresh"
 )
 
 // 审核轮次类型：原始请求与管理员发起的重新审核。
@@ -104,6 +106,8 @@ type Filter struct {
 	Platform  string     `json:"platform,omitempty"`
 	RequestID string     `json:"request_id,omitempty"`
 	Model     string     `json:"model,omitempty"`
+	// Category 按触发目标的违规类别筛选，如 R07。
+	Category string `json:"category,omitempty"`
 }
 
 type Page[T any] struct {
@@ -114,8 +118,7 @@ type Page[T any] struct {
 }
 
 type ReauditRequest struct {
-	ReuseMode string `json:"reuse_mode" binding:"omitempty,oneof=allow force"`
-	Filter    Filter `json:"filter"`
+	Filter Filter `json:"filter"`
 }
 
 type ReauditItem struct {
@@ -126,7 +129,9 @@ type ReauditItem struct {
 }
 
 type ReauditResult struct {
-	Matched int64         `json:"matched"`
-	Ready   int64         `json:"ready"`
-	Items   []ReauditItem `json:"items"`
+	Matched int64 `json:"matched"`
+	Ready   int64 `json:"ready"`
+	// EstimatedTargets 是就绪任务按哈希去重、排除已信任指令块后的目标数，用于估算真实调用量。
+	EstimatedTargets int64         `json:"estimated_targets"`
+	Items            []ReauditItem `json:"items"`
 }

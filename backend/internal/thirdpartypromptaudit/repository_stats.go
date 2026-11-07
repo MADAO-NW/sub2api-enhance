@@ -2,7 +2,10 @@ package thirdpartypromptaudit
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -51,6 +54,8 @@ type Stats struct {
 	ProcessingP50MS *float64         `json:"processing_p50_ms"`
 	ProcessingP95MS *float64         `json:"processing_p95_ms"`
 	CacheMiss       []ClientMissRate `json:"cache_miss"`
+	// CategoryRecognition 是 block/review 目标中 reason 能解析出类别的比例，按节点模型分组。
+	CategoryRecognition []CategoryRecognition `json:"category_recognition"`
 }
 
 // ClientChurn 是某客户端指令块的变更情况：请求越多、唯一哈希越多，说明内容越不稳定。
@@ -179,5 +184,73 @@ func (r *Repository) Stats(ctx context.Context, query StatsQuery) (*Stats, error
 		}
 		stats.CacheMiss = append(stats.CacheMiss, item)
 	}
-	return stats, missRows.Err()
+	if err := missRows.Err(); err != nil {
+		return nil, err
+	}
+	recognition, err := r.categoryRecognition(ctx, query.From, query.To)
+	if err != nil {
+		return nil, err
+	}
+	stats.CategoryRecognition = recognition
+	return stats, nil
+}
+
+// CategoryRecognition 是某个节点模型的类别识别率。
+type CategoryRecognition struct {
+	ModelID    string  `json:"model_id"`
+	Total      int64   `json:"total"`
+	Recognized int64   `json:"recognized"`
+	Rate       float64 `json:"rate"`
+}
+
+// categoryRecognition 统计 block/review 目标中节点结论能解析出类别编号的比例。
+// 识别率偏低说明政策或节点没有遵循 reason 的“违规/R编号：…”格式。
+func (r *Repository) categoryRecognition(ctx context.Context, from, to time.Time) ([]CategoryRecognition, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT r.node_results FROM sub2api_enhance.audit_job_targets t
+ JOIN sub2api_enhance.audit_jobs j ON j.id=t.job_id
+ JOIN sub2api_enhance.prompt_reviews r ON r.id=t.review_id
+ WHERE j.created_at>=$1 AND j.created_at<$2 AND t.decision IN ('block','review')`, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	type counter struct{ total, recognized int64 }
+	counters := make(map[string]*counter)
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var nodes []NodeResult
+		if err := json.Unmarshal(raw, &nodes); err != nil {
+			return nil, err
+		}
+		for _, node := range nodes {
+			if node.Skipped || node.Error != nil || node.Confidence == nil {
+				continue
+			}
+			item := counters[node.ModelID]
+			if item == nil {
+				item = &counter{}
+				counters[node.ModelID] = item
+			}
+			item.total++
+			if len(reasonCategories(node.Reason, nil)) > 0 {
+				item.recognized++
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	items := make([]CategoryRecognition, 0, len(counters))
+	for modelID, item := range counters {
+		entry := CategoryRecognition{ModelID: modelID, Total: item.total, Recognized: item.recognized}
+		if item.total > 0 {
+			entry.Rate = float64(item.recognized) / float64(item.total)
+		}
+		items = append(items, entry)
+	}
+	slices.SortFunc(items, func(a, b CategoryRecognition) int { return strings.Compare(a.ModelID, b.ModelID) })
+	return items, nil
 }

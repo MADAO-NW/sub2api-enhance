@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import BaseDialog from '@/components/common/BaseDialog.vue'
-import { thirdPartyPromptAuditAPI as api, type AuditAction, type JobDetail, type JobTarget, type ModelAttempt } from '@/api/admin/third-party-prompt-audit'
+import { thirdPartyPromptAuditAPI as api, type AuditAction, type JobDetail, type JobTarget, type ModelAttempt, type SampleExpected } from '@/api/admin/third-party-prompt-audit'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
-import { formatMS, formatTime } from './viewModel'
+import { categoryList, formatMS, formatTime } from './viewModel'
 import { useAuditLabels } from './labels'
 import NodeDecision from './NodeDecision.vue'
 
@@ -13,7 +13,7 @@ const emit = defineEmits<{ (event: 'close'): void; (event: 'changed'): void; (ev
 const label = useAuditLabels(), app = useAppStore()
 const detail = ref<JobDetail | null>(null)
 const loading = ref(false), pending = ref(false), error = ref('')
-const reuseMode = ref<'allow' | 'force'>('allow')
+const sampling = ref('')
 let generation = 0
 const job = computed(() => detail.value?.job)
 const pretty = (value: unknown) => JSON.stringify(value, null, 2)
@@ -63,11 +63,22 @@ async function toggleTrust(target: JobTarget) {
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { pending.value = false }
 }
+// 加入误判样本集：hash 与类型由后端按任务目标解析，这里只提交任务、目标序号与期望结论。
+async function addSample(target: JobTarget, expected: SampleExpected) {
+  if (!props.id) return
+  sampling.value = `${target.order}:${expected}`
+  try {
+    await api.createSample({ job_id: props.id, target_order: target.order, expected })
+    target.sampled = true
+    app.showSuccess(label('sampleAdded'))
+  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { sampling.value = '' }
+}
 async function reaudit() {
   if (!props.id) return
   pending.value = true
   try {
-    const result = await api.reaudit({ reuse_mode: reuseMode.value, filter: { ids: [props.id] } })
+    const result = await api.reaudit({ filter: { ids: [props.id] } })
     const ids = result.items.flatMap(item => ['requeued', 'already_running'].includes(item.status) ? [item.job_id] : [])
     if (ids.length) {
       app.showSuccess(label('createdJobs'))
@@ -80,6 +91,10 @@ async function reaudit() {
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { pending.value = false }
 }
+// 轮次历史里 fresh 显示为“重新审核”，旧的 allow/force 保留原文案。
+function reuseLabel(mode: string): string {
+  return mode === 'fresh' ? 'reuseFresh' : mode === 'force' ? 'reuseForce' : 'reuseAllow'
+}
 watch(() => [props.id, props.refreshKey], load, { immediate: true })
 </script>
 
@@ -89,9 +104,6 @@ watch(() => [props.id, props.refreshKey], load, { immediate: true })
     <p v-if="error" role="alert" class="text-red-600 dark:text-red-400">{{ error }}</p>
     <div v-if="detail && job" class="space-y-6">
       <div class="flex flex-wrap items-center gap-3">
-        <label class="flex items-center gap-2 text-sm"><span>{{ label('reauditReuseMode') }}</span>
-          <select v-model="reuseMode" class="input w-auto"><option value="allow">{{ label('reuseAllow') }}</option><option value="force">{{ label('reuseForce') }}</option></select>
-        </label>
         <button class="btn btn-secondary" :disabled="pending" @click="reaudit">{{ label(pending ? 'loading' : 'reaudit') }}</button>
       </div>
       <section class="space-y-3">
@@ -104,6 +116,7 @@ watch(() => [props.id, props.refreshKey], load, { immediate: true })
         </div>
         <p class="break-words text-sm">{{ job.identity.username }} · {{ job.identity.user_email }} · {{ job.identity.api_key_name }} · {{ job.identity.group_name }}</p>
         <p class="break-all text-sm text-gray-500 dark:text-dark-400">{{ label('requestID') }}: {{ job.request_id || '—' }} · {{ job.identity.endpoint }} · {{ job.protocol }} · {{ job.model }}</p>
+        <p class="text-sm">{{ label('category') }}: <span v-for="category in categoryList(job.trigger_categories)" :key="category" class="mr-2 inline-block rounded bg-gray-100 px-2 py-0.5 text-xs dark:bg-dark-700">{{ category }}</span><span v-if="!categoryList(job.trigger_categories).length" class="text-gray-500">{{ label('uncategorized') }}</span></p>
         <p class="text-sm">{{ label('created') }}: {{ formatTime(job.created_at) }} · {{ label('attempts') }}: {{ job.attempts }} / {{ job.max_attempts }} · {{ label('clientFingerprint') }}: {{ job.client_fingerprint }}</p>
         <p v-if="job.orphan_continuation" class="text-sm text-amber-700 dark:text-amber-400">{{ label('orphanContinuation') }}</p>
         <p class="text-sm">{{ label('enforcement') }}: {{ job.enforcement_eligible ? label('eligible') : label('notEligible') }}<span v-if="job.violation_counted"> · {{ label('violationCounted') }}</span><span v-if="job.disable_counted"> · {{ label('disableCounted') }}</span></p>
@@ -122,7 +135,10 @@ watch(() => [props.id, props.refreshKey], load, { immediate: true })
             <span class="break-all font-mono text-xs text-gray-500">{{ target.hash }}</span>
             <span v-if="target.resolution">{{ label('resolution') }}: {{ label('resolution_' + target.resolution) }}</span>
             <strong v-if="target.decision" :class="target.decision === 'block' ? 'text-red-600 dark:text-red-400' : target.decision === 'review' ? 'text-amber-700 dark:text-amber-400' : ''">{{ label(target.decision) }}</strong>
+            <span v-if="target.sampled" class="text-xs text-primary-600 dark:text-primary-400" data-test="target-sampled">{{ label('sampledMark') }}</span>
             <button v-if="target.kind === 'instruction'" class="btn btn-secondary btn-sm" :disabled="pending" @click="toggleTrust(target)">{{ label(target.trusted ? 'untrust' : 'trust') }}</button>
+            <button class="btn btn-secondary btn-sm" :disabled="sampling === `${target.order}:pass`" data-test="detail-sample-pass" @click="addSample(target, 'pass')">{{ label('addSamplePass') }}</button>
+            <button class="btn btn-secondary btn-sm" :disabled="sampling === `${target.order}:block`" data-test="detail-sample-block" @click="addSample(target, 'block')">{{ label('addSampleBlock') }}</button>
           </div>
           <p v-if="target.error_code" class="text-sm text-red-600 dark:text-red-400">{{ target.error_code }} · {{ target.error_message }}</p>
           <details open><summary class="cursor-pointer text-sm font-medium">{{ label('auditedText') }}</summary>
@@ -152,7 +168,7 @@ watch(() => [props.id, props.refreshKey], load, { immediate: true })
       <section v-if="detail.rounds.length" class="space-y-3 border-t border-gray-200 pt-5 dark:border-dark-700">
         <h3 class="font-semibold">{{ label('roundHistory') }}</h3>
         <article v-for="round in detail.rounds" :key="round.round" class="rounded-lg border border-gray-100 p-3 text-sm dark:border-dark-700">
-          <p><strong>{{ label('auditRound') }} {{ round.round }}</strong> · {{ label(round.run_kind) }} · {{ label(round.decision) }} · {{ label(round.reuse_mode === 'force' ? 'reuseForce' : 'reuseAllow') }} · {{ label('trigger') }}: {{ round.trigger_kind ? label(round.trigger_kind) : '—' }}</p>
+          <p><strong>{{ label('auditRound') }} {{ round.round }}</strong> · {{ label(round.run_kind) }} · {{ label(round.decision) }} · {{ label(reuseLabel(round.reuse_mode)) }} · {{ label('trigger') }}: {{ round.trigger_kind ? label(round.trigger_kind) : '—' }}<span v-if="round.trigger_categories?.length"> · {{ categoryList(round.trigger_categories).join(', ') }}</span></p>
           <p class="mt-1 text-gray-500">{{ formatTime(round.started_at) }} — {{ formatTime(round.finished_at) }}<span v-if="round.requested_by"> · {{ label('userID') }} {{ round.requested_by }}</span><span v-if="round.config_revision"> · {{ label('revision') }} {{ round.config_revision }}</span></p>
         </article>
       </section>

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,9 +38,10 @@ type Proxy struct {
 }
 
 type requestContext struct {
-	clientIP string
-	turnKey  string
-	started  time.Time
+	clientIP  string
+	turnKey   string
+	requestID string
+	started   time.Time
 }
 
 type contextKey struct{}
@@ -178,11 +180,24 @@ func writeError(w http.ResponseWriter, protocol string, status int, code, messag
 }
 
 // auditDeniedMessage 向调用方说明同步审核未转发请求，同时避免泄露审核策略和模型原始理由。
-func auditDeniedMessage(kind audit.IngressDecisionKind) string {
+// reference 是给用户和排障用的参考编号：有任务用 #任务 ID，无任务用请求 ID。
+func auditDeniedMessage(kind audit.IngressDecisionKind, reference string) string {
+	message := "增强审核暂时无法完成，当前为同步审核模式，原请求未转发。请稍后重试，或联系管理员。"
 	if kind == audit.IngressDecisionBlock {
-		return "请求内容未通过第三方模型提示词审核，增强服务已阻止转发。请调整输入后重试，或联系管理员复核。"
+		message = "请求内容未通过第三方模型提示词审核，增强服务已阻止转发。请调整输入后重试，或联系管理员复核。"
 	}
-	return "增强审核暂时无法完成，当前为同步审核模式，原请求未转发。请稍后重试，或联系管理员。"
+	if reference != "" {
+		message += "参考编号：" + reference + "。"
+	}
+	return message
+}
+
+// decisionReference 返回入口拒绝时的参考编号。
+func decisionReference(d *audit.IntakeDecision, requestID string) string {
+	if d != nil && d.JobID > 0 {
+		return "#" + strconv.FormatInt(d.JobID, 10)
+	}
+	return requestID
 }
 
 // Serve 接收的 clientIP 必须由配置了可信代理范围的 Gin 得到。
@@ -193,6 +208,13 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 		p.http.ServeHTTP(w, r)
 		return
 	}
+	// 客户端未带请求 ID 时生成一个；无论来源都回写响应头，保证任务与日志可对账。
+	requestID := headerValue(r, "X-Request-Id")
+	if requestID == "" {
+		requestID = "enh-" + uuid.NewString()
+	}
+	w.Header().Set("X-Enhance-Request-Id", requestID)
+	state.requestID = requestID
 	if websocket.IsWebSocketUpgrade(r) {
 		p.websocket(w, r, state)
 		return
@@ -228,7 +250,7 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 	if identityErr != nil {
 		// 身份解析失败：blocking 沿用 eligibility_unknown 拒绝，async 直接转发且不落库（决策 12）。
 		if p.audit.ModeForUser(identity.UserID) == "blocking" {
-			writeError(w, kind, http.StatusServiceUnavailable, "eligibility_unknown", "身份暂不可验证，当前为同步审核模式，请求未转发")
+			writeError(w, kind, http.StatusServiceUnavailable, "eligibility_unknown", auditDeniedMessage(audit.IngressDecisionUnavailable, requestID))
 			return
 		}
 		p.forward(w, r, kind, body)
@@ -236,7 +258,7 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 	}
 	if parsedProtocol == "unsupported" {
 		if p.audit.ModeForUser(identity.UserID) == "blocking" {
-			writeError(w, kind, http.StatusServiceUnavailable, "eligibility_unknown", "该协议尚不支持审核，当前为同步审核模式，请求未转发")
+			writeError(w, kind, http.StatusServiceUnavailable, "eligibility_unknown", auditDeniedMessage(audit.IngressDecisionUnavailable, requestID))
 			return
 		}
 		p.forward(w, r, kind, body)
@@ -254,24 +276,18 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, clientIP string) {
 			return
 		}
 		if p.audit.ModeForUser(identity.UserID) == "blocking" {
-			writeError(w, kind, http.StatusServiceUnavailable, "input_parse_failed", "请求无法按协议解析，当前为同步审核模式，请求未转发")
+			writeError(w, kind, http.StatusServiceUnavailable, "input_parse_failed", auditDeniedMessage(audit.IngressDecisionUnavailable, requestID))
 			return
 		}
 		p.forward(w, r, kind, body)
 		return
-	}
-	// 客户端未带请求 ID 时生成一个，并回写响应头，保证任务与日志可对账。
-	requestID := headerValue(r, "X-Request-Id")
-	if requestID == "" {
-		requestID = "enh-" + uuid.NewString()
-		w.Header().Set("X-Enhance-Request-Id", requestID)
 	}
 	decision := p.audit.Check(r.Context(), audit.IntakeRequest{
 		Parsed: parsed, UserID: identity.UserID, APIKeyID: identity.APIKeyID, GroupID: identity.GroupID,
 		Identity: audit.Identity{Username: identity.Username, UserEmail: identity.UserEmail, APIKeyName: identity.APIKeyName, GroupName: identity.GroupName, Endpoint: r.URL.Path},
 		Provider: identity.Platform, Model: parsed.Model, RequestID: requestID,
 	})
-	if !p.allow(w, kind, identity.APIKeyID, decision) {
+	if !p.allow(w, kind, identity.APIKeyID, decision, requestID) {
 		return
 	}
 	if decision != nil {
@@ -300,7 +316,7 @@ func headerValue(r *http.Request, name string) string {
 }
 
 // allow 决定是否继续转发：异步审核不可用时不阻断原请求。
-func (p *Proxy) allow(w http.ResponseWriter, kind string, apiKeyID int64, d *audit.IntakeDecision) bool {
+func (p *Proxy) allow(w http.ResponseWriter, kind string, apiKeyID int64, d *audit.IntakeDecision, requestID string) bool {
 	if d == nil || d.Kind == audit.IngressDecisionAllow || d.Kind == audit.IngressDecisionFlag ||
 		(d.Mode == "async" && d.Kind == audit.IngressDecisionUnavailable) {
 		return true
@@ -310,7 +326,7 @@ func (p *Proxy) allow(w http.ResponseWriter, kind string, apiKeyID int64, d *aud
 		status = http.StatusForbidden
 		p.audit.RejectContinuation(d, apiKeyID, d.ErrorCode)
 	}
-	writeError(w, kind, status, d.ErrorCode, auditDeniedMessage(d.Kind))
+	writeError(w, kind, status, d.ErrorCode, auditDeniedMessage(d.Kind, decisionReference(d, requestID)))
 	return false
 }
 

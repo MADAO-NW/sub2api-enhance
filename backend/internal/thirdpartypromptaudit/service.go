@@ -63,6 +63,8 @@ type reviewFlight struct {
 	done    chan struct{}
 	outcome *reviewOutcome
 	failure *AuditError
+	// started 是发起方开始真实调用的时间，重新审核只加入发起之后的 flight。
+	started time.Time
 }
 
 // SetRedisStore 在服务对外启动前装配回合键与响应映射。
@@ -111,6 +113,12 @@ func (s *Service) Start(parent context.Context) error {
 	}
 	s.wg.Add(3)
 	s.running.Store(true)
+	if err := s.config.LoadEscalation(s.ctx); err != nil {
+		s.noteError("escalation_load_failed", err)
+	}
+	if err := s.repo.InterruptRunningReplays(s.ctx); err != nil {
+		s.noteError("replay_interrupt_failed", err)
+	}
 	go s.run()
 	go s.runHealthProbes()
 	go s.runRetention()
@@ -490,6 +498,8 @@ func (s *Service) processJob(parent context.Context, job *AuditJob, foreground b
 			return nil, s.finishFailure(ctx, job, reviewFailure)
 		}
 		target.Resolution, target.Decision = outcome.resolution, outcome.review.Decision
+		// 目标类别按本任务冻结的阈值从节点结果重新计算，缓存复用同样适用。
+		target.Categories = targetCategories(outcome.review.Nodes, job.Config.Config, target.Decision)
 		reviewID := outcome.review.ID
 		target.ReviewID = &reviewID
 		if err := s.repo.ResolveTarget(ctx, job, target); err != nil {
@@ -505,7 +515,7 @@ func (s *Service) processJob(parent context.Context, job *AuditJob, foreground b
 		job.BlockingWaitMS = &wait
 	}
 	persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
-	completion, err := s.repo.CompleteAuditJob(persistCtx, job, foreground && ctx.Err() == nil)
+	completion, err := s.repo.CompleteAuditJob(persistCtx, job, foreground && ctx.Err() == nil, s.config.PublicOrigin())
 	persistCancel()
 	s.metrics.ObserveEvaluation(started, time.Now())
 	if err != nil {
@@ -519,24 +529,26 @@ func (s *Service) processJob(parent context.Context, job *AuditJob, foreground b
 		return nil, failure
 	}
 	s.metrics.Success(time.Now())
+	if completion.Escalated {
+		// 加严集合只驻留内存；数据库状态已在同一事务内提交。
+		s.config.SetEscalation(job.UserID, true)
+	}
 	s.notify()
-	logger.LegacyPrintf("third_party_prompt_audit", "审核任务完成 job_id=%d round=%d decision=%s trigger_kind=%s violation_counted=%t tripped_breakers=%v",
-		job.ID, completion.Round, completion.Decision, completion.TriggerKind, completion.ViolationCounted, completion.TrippedBreakers)
+	logger.LegacyPrintf("third_party_prompt_audit", "审核任务完成 job_id=%d round=%d decision=%s trigger_kind=%s violation_counted=%t escalated=%t tripped_breakers=%v",
+		job.ID, completion.Round, completion.Decision, completion.TriggerKind, completion.ViolationCounted, completion.Escalated, completion.TrippedBreakers)
 	return completion, nil
 }
 
 // reviewWithInflightReuse 合并同一 (内容哈希, 评估语义) 的并发审核；等待方不占节点并发位。
 func (s *Service) reviewWithInflightReuse(ctx context.Context, job *AuditJob, target *JobTarget, keys map[string]string) (*reviewOutcome, *AuditError) {
-	if job.ReuseMode == ReuseModeForce {
-		return s.evaluator.Review(ctx, job, target, keys)
-	}
 	evalHash, err := evaluationHash(job.Config, target.Kind)
 	if err != nil {
 		return nil, &AuditError{Code: "evaluation_hash_failed", Stage: "config", Message: err.Error()}
 	}
 	key := target.Hash + "\x00" + evalHash
 	s.flightMu.Lock()
-	if flight := s.flights[key]; flight != nil {
+	// 重新审核只加入本次重审发起之后开始的 flight，否则自己作为发起方真实调用。
+	if flight := s.flights[key]; flight != nil && reusableFlight(job, flight) {
 		s.flightMu.Unlock()
 		select {
 		case <-flight.done:
@@ -549,7 +561,7 @@ func (s *Service) reviewWithInflightReuse(ctx context.Context, job *AuditJob, ta
 			return nil, requestFailure(ctx.Err())
 		}
 	}
-	flight := &reviewFlight{done: make(chan struct{})}
+	flight := &reviewFlight{done: make(chan struct{}), started: time.Now()}
 	s.flights[key] = flight
 	s.leaders[job.ID] = append(s.leaders[job.ID], key)
 	s.flightMu.Unlock()
@@ -916,12 +928,7 @@ func (s *Service) Probe(ctx context.Context, input ProbeRequest) (result ProbeRe
 
 // CreateReaudits 在同一任务上追加一轮审核；重新审核本身不触发新处置。
 func (s *Service) CreateReaudits(ctx context.Context, request ReauditRequest, actorID int64) (*ReauditResult, error) {
-	if request.ReuseMode == "" {
-		request.ReuseMode = ReuseModeAllow
-	}
-	if request.ReuseMode != ReuseModeAllow && request.ReuseMode != ReuseModeForce {
-		return nil, errors.New("复核复用方式无效")
-	}
+	// 重新审核统一使用 fresh 语义：只复用本次发起之后产生的结论。
 	snapshot, err := s.config.Active()
 	if err != nil {
 		return nil, err
@@ -934,4 +941,10 @@ func (s *Service) CreateReaudits(ctx context.Context, request ReauditRequest, ac
 		s.notify()
 	}
 	return result, err
+}
+
+// reusableFlight 判断当前重审是否可以加入已有并发调用：业务请求始终可以，
+// fresh 轮次只能加入重审发起之后开始的调用。
+func reusableFlight(job *AuditJob, flight *reviewFlight) bool {
+	return job.ReuseAfter == nil || !flight.started.Before(*job.ReuseAfter)
 }

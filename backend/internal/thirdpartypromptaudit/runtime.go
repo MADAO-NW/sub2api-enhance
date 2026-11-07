@@ -102,6 +102,8 @@ type RuntimeSnapshot struct {
 	Redis             RedisRuntime             `json:"redis"`
 	// Retention 是最近一次保留期清理的结果。
 	Retention *RetentionRecord `json:"retention,omitempty"`
+	// FailureRate 是最近一次失败率检查结果，供运行诊断与待处理工作台使用。
+	FailureRate *FailureRateSnapshot `json:"failure_rate,omitempty"`
 }
 
 func (s *Service) Runtime(ctx context.Context) RuntimeSnapshot {
@@ -119,16 +121,16 @@ func (s *Service) Runtime(ctx context.Context) RuntimeSnapshot {
 		result.Revision = s.config.active.Stored.Revision
 		result.WarningEnabled = s.config.active.Stored.Warning.Enabled
 		result.DisableEnabled = s.config.active.Stored.Disable.Enabled
-		for _, rule := range s.config.active.Stored.UserRules {
-			result.WarningEnabled = result.WarningEnabled || rule.Warning.Enabled
-			result.DisableEnabled = result.DisableEnabled || rule.Disable.Enabled
-		}
+
 	}
 	if s.config.loadError != nil {
 		result.ConfigError = s.config.loadError.Error()
 	}
 	s.config.mu.RUnlock()
 	result.Retention = s.retentionSnapshot()
+	if failure, err := s.repo.FailureRate(ctx); err == nil {
+		result.FailureRate = failure
+	}
 	if snapshot, err := s.config.Active(); err == nil {
 		result.Scheduler = s.evaluator.nodeScheduler().runtime(snapshot.Models)
 	} else {

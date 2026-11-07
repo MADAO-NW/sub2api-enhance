@@ -1,32 +1,35 @@
 <script setup lang="ts">
 import { computed, onUnmounted, reactive, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import Pagination from '@/components/common/Pagination.vue'
 import {
-  thirdPartyPromptAuditAPI as api, type AuditFilter, type AuditJob, type JobPrompt, type ReauditRequest, type ReauditResult,
+  thirdPartyPromptAuditAPI as api, type AuditFilter, type AuditJob, type JobPrompt, type ReauditRequest, type ReauditResult, type SampleExpected,
 } from '@/api/admin/third-party-prompt-audit'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import AuditDetail from './AuditDetail.vue'
-import { formatMS, formatTime, toLocalInput } from './viewModel'
+import { categoryFilter, categoryList, formatMS, formatTime, jobQueryFilter, toLocalInput } from './viewModel'
 import { useAuditLabels } from './labels'
 
-const props = withDefaults(defineProps<{ initialFilter?: AuditFilter; refreshKey?: number; active?: boolean }>(), { refreshKey: 0, active: true })
+const props = withDefaults(defineProps<{ initialFilter?: AuditFilter; initialJobID?: number | null; refreshKey?: number; active?: boolean }>(), { initialJobID: null, refreshKey: 0, active: true })
 const emit = defineEmits<{ (event: 'reaudit-created', ids: number[]): void }>()
 const label = useAuditLabels(), app = useAppStore()
+const { t } = useI18n()
 const filters = reactive<AuditFilter>({}), applied = ref<AuditFilter>({})
+const requestQuery = ref('')
+const categoryQuery = ref('')
 const from = ref(''), to = ref('')
 const rows = ref<AuditJob[]>([])
 const page = ref(1), pageSize = ref(20), total = ref(0), selected = ref<number[]>([])
-const loading = ref(false), error = ref(''), detailID = ref<number | null>(null)
+const loading = ref(false), error = ref(''), detailID = ref<number | null>(props.initialJobID)
 const previewRequest = ref<ReauditRequest | null>(null), preview = ref<ReauditResult | null>(null)
-const draftReuse = ref<'allow' | 'force'>('allow')
 const previewPage = ref(1), previewLoading = ref(false), submitted = ref(false)
 const previewItems = computed(() => preview.value?.items.slice((previewPage.value - 1) * 20, previewPage.value * 20) ?? [])
 const states = ['queued', 'processing', 'retry', 'done', 'failed', 'skipped']
 const promptJobID = ref<number | null>(null)
 const promptTargets = ref<JobPrompt[]>([])
-const promptLoading = ref(false)
+const promptLoading = ref(false), sampling = ref('')
 // 正文按任务缓存，重复打开同一行不再请求。
 const promptCache = new Map<number, JobPrompt[]>()
 // 快捷筛选：裁决与失败状态一键过滤。
@@ -84,7 +87,13 @@ async function load(silent = false) {
   }
 }
 function apply() {
+  // “任务 ID / 请求 ID”：#开头按任务 ID，其余按请求 ID；类别必须是 R01–R99。
+  const query = jobQueryFilter(requestQuery.value)
+  if (query.ids?.[0] === 0) { error.value = label('requestIDHint'); return }
+  const category = categoryFilter(categoryQuery.value)
+  if (category.invalid) { error.value = label('categoryInvalid'); return }
   const next = Object.fromEntries(Object.entries(filters).filter(([, value]) => value !== '' && value != null)) as AuditFilter
+  Object.assign(next, query, category)
   if (from.value) next.from = new Date(from.value).toISOString()
   if (to.value) next.to = new Date(to.value).toISOString()
   if (next.from && next.to && new Date(next.from) >= new Date(next.to)) { error.value = label('invalidRange'); return }
@@ -93,8 +102,7 @@ function apply() {
   void load()
 }
 function openPreview(useSelection: boolean) {
-  draftReuse.value = 'allow'
-  previewRequest.value = { reuse_mode: draftReuse.value, filter: JSON.parse(JSON.stringify({ ...applied.value, ...(useSelection ? { ids: selected.value } : {}) })) as AuditFilter }
+  previewRequest.value = { filter: JSON.parse(JSON.stringify({ ...applied.value, ...(useSelection ? { ids: selected.value } : {}) })) as AuditFilter }
   preview.value = null
   submitted.value = false
   previewPage.value = 1
@@ -103,7 +111,7 @@ function openPreview(useSelection: boolean) {
 async function runPreview() {
   if (!previewRequest.value) return
   previewLoading.value = true
-  try { preview.value = await api.preview({ ...previewRequest.value, reuse_mode: draftReuse.value }) }
+  try { preview.value = await api.preview(previewRequest.value) }
   catch (err) { app.showError(extractApiErrorMessage(err, label('error'))); previewRequest.value = null }
   finally { previewLoading.value = false }
 }
@@ -111,7 +119,7 @@ async function submit() {
   if (!previewRequest.value || !preview.value?.ready) return
   previewLoading.value = true
   try {
-    preview.value = await api.reaudit({ ...previewRequest.value, reuse_mode: draftReuse.value })
+    preview.value = await api.reaudit(previewRequest.value)
     submitted.value = true
     previewPage.value = 1
     const failures = preview.value.items.filter(item => item.status === 'failed').length
@@ -130,7 +138,6 @@ function closePreview() {
   previewRequest.value = null
   preview.value = null
   submitted.value = false
-  draftReuse.value = 'allow'
 }
 const promptTrusting = ref(false)
 const exporting = ref(false)
@@ -144,6 +151,17 @@ async function togglePromptTrust(target: JobPrompt) {
     app.showSuccess(label('saved'))
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { promptTrusting.value = false }
+}
+// 加入误判样本集：hash 与类型由后端从任务目标读取，这里只提交任务、目标序号与期望。
+async function addSample(jobID: number | null, target: JobPrompt, expected: SampleExpected) {
+  if (!jobID) return
+  sampling.value = `${target.order}:${expected}`
+  try {
+    await api.createSample({ job_id: jobID, target_order: target.order, expected })
+    target.sampled = true
+    app.showSuccess(label('sampleAdded'))
+  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
+  finally { sampling.value = '' }
 }
 async function copyPrompt(target: JobPrompt) {
   try { await navigator.clipboard.writeText(target.text ?? ''); app.showSuccess(label('copied')) }
@@ -201,6 +219,8 @@ async function openPrompts(id: number) {
 }
 function resetFilters() {
   for (const key of Object.keys(filters)) delete filters[key as keyof AuditFilter]
+  requestQuery.value = ''
+  categoryQuery.value = ''
   from.value = ''
   to.value = ''
   applied.value = {}
@@ -210,7 +230,7 @@ function resetFilters() {
 }
 function changePage(value: number) { page.value = value; void load() }
 function changeSize(value: number) { pageSize.value = value; page.value = 1; void load() }
-watch(() => props.initialFilter, value => {
+function syncInitialFilter(value: AuditFilter | undefined) {
   for (const key of Object.keys(filters)) delete filters[key as keyof AuditFilter]
   Object.assign(filters, value ?? {})
   applied.value = { ...value }
@@ -218,9 +238,14 @@ watch(() => props.initialFilter, value => {
   delete filters.to
   from.value = value?.from ? toLocalInput(new Date(value.from)) : ''
   to.value = value?.to ? toLocalInput(new Date(value.to)) : ''
+  // 概览与用户页的筛选可能直接带任务 ID 或类别。
+  requestQuery.value = value?.request_id ?? (value?.ids?.length ? `#${value.ids[0]}` : '')
+  categoryQuery.value = value?.category ?? ''
   page.value = 1
   void load()
-}, { immediate: true })
+}
+watch(() => props.initialFilter, value => { syncInitialFilter(value) }, { immediate: true })
+watch(() => props.initialJobID, value => { if (value) detailID.value = value })
 watch(() => props.refreshKey, () => { void load() })
 onUnmounted(() => {
   window.clearTimeout(autoTimer)
@@ -232,7 +257,10 @@ onUnmounted(() => {
   <div class="audit-records space-y-5">
     <form class="card space-y-4 p-5" @submit.prevent="apply">
       <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <label class="space-y-1 text-sm"><span>{{ label('requestID') }}</span><input v-model="filters.request_id" class="input" /></label>
+        <label class="space-y-1 text-sm"><span>{{ label('requestOrJobID') }}</span><input v-model="requestQuery" class="input" :placeholder="label('requestIDHint')" data-test="request-id" /></label>
+        <label class="space-y-1 text-sm"><span>{{ label('category') }}</span><input v-model="categoryQuery" class="input" :placeholder="label('categoryHint')" list="audit-categories" data-test="category-filter" />
+          <datalist id="audit-categories"><option v-for="code in ['R01', 'R02', 'R03', 'R04', 'R05', 'R06', 'R07', 'R08', 'R09', 'R10', 'R11', 'R12', 'R13', 'R14']" :key="code" :value="code" /></datalist>
+        </label>
         <label class="space-y-1 text-sm"><span>{{ label('decision') }}</span><select v-model="filters.decision" class="input"><option value="">{{ label('all') }}</option><option v-for="item in ['pass', 'review', 'block']" :key="item" :value="item">{{ label(item) }}</option></select></label>
         <label class="space-y-1 text-sm"><span>{{ label('status') }}</span><select v-model="filters.status" class="input"><option value="">{{ label('all') }}</option><option v-for="item in states" :key="item" :value="item">{{ label(item) }}</option></select></label>
         <label class="space-y-1 text-sm"><span>{{ label('mode') }}</span><select v-model="filters.mode" class="input"><option value="">{{ label('all') }}</option><option value="async">{{ label('async') }}</option><option value="blocking">{{ label('blocking') }}</option></select></label>
@@ -263,6 +291,7 @@ onUnmounted(() => {
             <th class="p-3">{{ label('identity') }}</th>
             <th class="p-3">{{ label('platform') }} / {{ label('model') }}</th>
             <th class="p-3">{{ label('status') }} / {{ label('decision') }}</th>
+            <th class="p-3">{{ label('trigger') }}</th>
             <th class="p-3">{{ label('targets') }}</th>
             <th class="p-3">{{ label('currentPrompt') }}</th>
             <th class="p-3">{{ label('auditDuration') }}</th>
@@ -275,6 +304,7 @@ onUnmounted(() => {
                 <p>{{ formatTime(row.created_at) }}</p>
                 <p class="mt-1 text-xs text-gray-500">#{{ row.id }} · {{ label(row.current_run_kind) }} · {{ label('auditRound') }} {{ row.current_round }}</p>
                 <p class="mt-1 max-w-64 whitespace-normal break-all text-xs text-gray-500">{{ label('requestID') }}: {{ row.request_id || '—' }}</p>
+                <p v-if="row.sampled" class="mt-1 text-xs text-primary-600 dark:text-primary-400" data-test="sampled-mark">{{ label('sampledMark') }}</p>
               </td>
               <td class="min-w-48 max-w-80 break-words p-3">
                 <p>(#{{ row.user_id }})<span v-if="row.display_username" class="ml-1">{{ row.display_username }}</span></p>
@@ -289,10 +319,14 @@ onUnmounted(() => {
               <td class="min-w-40 p-3">
                 <p>{{ label(row.status) }}</p>
                 <strong v-if="row.decision" :class="row.decision === 'block' ? 'text-red-600 dark:text-red-400' : row.decision === 'review' ? 'text-amber-700 dark:text-amber-400' : ''">{{ label(row.decision) }}</strong>
-                <p v-if="row.trigger_kind" class="mt-1 text-xs text-gray-500">{{ label('trigger') }}: {{ label(row.trigger_kind) }}</p>
                 <p v-if="row.last_error_code" class="mt-1 break-all text-xs text-red-600 dark:text-red-400"><span v-if="row.failure_stage">{{ label(row.failure_stage) }} · </span>{{ row.last_error_code }}<span v-if="row.last_error_message"> · {{ row.last_error_message }}</span></p>
                 <p v-if="row.status === 'retry'" class="mt-1 text-xs">{{ label('nextRetry') }} {{ formatTime(row.next_attempt_at) }}</p>
                 <p class="mt-1 text-xs">{{ label('attempts') }} {{ row.attempts }} / {{ row.max_attempts }}</p>
+              </td>
+              <td class="p-3 text-xs">
+                <p v-if="row.trigger_kind">{{ label(row.trigger_kind) }}</p>
+                <p v-for="category in categoryList(row.trigger_categories)" :key="category" class="mt-1 inline-block rounded bg-gray-100 px-2 py-0.5 dark:bg-dark-700">{{ category }}</p>
+                <p v-if="!categoryList(row.trigger_categories).length" class="mt-1 text-gray-500">{{ label('uncategorized') }}</p>
               </td>
               <td class="p-3 text-xs">
                 <p>{{ label('targets') }}: {{ row.target_count }}</p>
@@ -303,7 +337,7 @@ onUnmounted(() => {
               <td class="whitespace-nowrap p-3">{{ formatMS(row.processing_ms) }}<span class="mt-1 block text-xs text-gray-500">{{ label('totalDuration') }} {{ formatMS(row.duration_ms) }}</span><span v-if="row.blocking_wait_ms !== null" class="mt-1 block text-xs text-gray-500">{{ label('blockingWait') }} {{ formatMS(row.blocking_wait_ms) }}</span></td>
               <td class="p-3"><button class="btn btn-secondary btn-sm whitespace-nowrap" @click="detailID = row.id">{{ label('detail') }}</button></td>
             </tr>
-            <tr v-if="!loading && !rows.length"><td colspan="9" class="p-10 text-center text-gray-500">{{ label('empty') }}</td></tr>
+            <tr v-if="!loading && !rows.length"><td colspan="10" class="p-10 text-center text-gray-500">{{ label('empty') }}</td></tr>
           </tbody>
         </table>
       </div>
@@ -320,9 +354,12 @@ onUnmounted(() => {
             <span>{{ target.bytes }} B</span>
             <span v-if="target.resolution">{{ label('resolution') }}: {{ label('resolution_' + target.resolution) }}</span>
             <span v-if="target.decision">{{ label(target.decision) }}<template v-if="target.score !== null"> · {{ target.score }}</template></span>
+            <span v-if="target.sampled" class="text-xs text-primary-600 dark:text-primary-400" data-test="target-sampled">{{ label('sampledMark') }}</span>
             <button v-if="target.kind === 'instruction'" class="btn btn-secondary btn-sm" :disabled="promptTrusting" data-test="trust-target" @click="togglePromptTrust(target)">{{ label(target.trusted ? 'untrust' : 'trust') }}</button>
             <button class="btn btn-secondary btn-sm" data-test="copy-prompt" @click="copyPrompt(target)">{{ label('copyText') }}</button>
             <button class="btn btn-secondary btn-sm" data-test="download-prompt" @click="downloadPrompt(target, promptJobID)">{{ label('downloadText') }}</button>
+            <button class="btn btn-secondary btn-sm" :disabled="sampling === `${target.order}:pass`" data-test="sample-pass" @click="addSample(promptJobID, target, 'pass')">{{ label('addSamplePass') }}</button>
+            <button class="btn btn-secondary btn-sm" :disabled="sampling === `${target.order}:block`" data-test="sample-block" @click="addSample(promptJobID, target, 'block')">{{ label('addSampleBlock') }}</button>
           </div>
           <pre class="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white p-3 text-xs dark:bg-dark-950">{{ target.text || '—' }}</pre>
           <p v-if="target.reason" class="text-xs text-gray-500 dark:text-dark-400">{{ target.reason }}</p>
@@ -333,14 +370,10 @@ onUnmounted(() => {
     <BaseDialog :show="previewRequest !== null" :title="label('preview')" width="wide" :show-close-button="!previewLoading" :close-on-escape="!previewLoading" :close-on-click-outside="!previewLoading" @close="closePreview">
       <div class="space-y-4">
         <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('previewHint') }}</p>
-        <fieldset class="space-y-2">
-          <legend class="text-sm font-medium">{{ label('reauditReuseMode') }}</legend>
-          <label class="flex items-start gap-2 text-sm"><input v-model="draftReuse" type="radio" value="allow" @change="runPreview" /><span>{{ label('reuseAllow') }}<span class="block text-xs text-gray-500">{{ label('reuseAllowHint') }}</span></span></label>
-          <label class="flex items-start gap-2 text-sm"><input v-model="draftReuse" type="radio" value="force" @change="runPreview" /><span>{{ label('reuseForce') }}<span class="block text-xs text-gray-500">{{ label('reuseForceHint') }}</span></span></label>
-        </fieldset>
         <p v-if="previewLoading" role="status">{{ label('loading') }}</p>
         <template v-if="preview">
           <p>{{ label('matched') }}: {{ preview.matched }} · {{ label('ready') }}: {{ preview.ready }}</p>
+          <p class="rounded-xl bg-gray-50 p-3 text-sm dark:bg-dark-900" data-test="estimated-targets">{{ t('admin.thirdPartyPromptAudit.estimatedTargets', { count: preview.estimated_targets }) }}</p>
           <div class="max-h-96 overflow-auto">
             <div v-for="item in previewItems" :key="item.job_id" class="border-t border-gray-100 py-3 text-sm dark:border-dark-700">
               <span>Job #{{ item.job_id }} → {{ label(item.status === 'requeued' ? 'submitted' : item.status) }}</span>

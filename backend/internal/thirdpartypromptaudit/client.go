@@ -25,6 +25,9 @@ const probeActorContext probeContextKey = 0
 // healthProbeContext 标识服务自动发起的低频节点恢复探测。
 const healthProbeContext probeContextKey = 1
 
+// replayContext 把政策回放 ID 绑定到调用流水，便于回放结果与调用对账。
+const replayContext probeContextKey = 2
+
 // attemptStore 抽象真实模型调用流水的持久化，测试实现与 Repository 共用同一流程。
 type attemptStore interface {
 	PrepareModelAttempt(ctx context.Context, job *AuditJob, attempt *ModelAttempt) error
@@ -134,6 +137,9 @@ func (c *ModelClient) call(ctx context.Context, job *AuditJob, model ModelConfig
 			attempt.CallKind = "health_probe"
 		}
 		metadata["actor_user_id"] = ctx.Value(probeActorContext)
+		if replayID, ok := ctx.Value(replayContext).(int64); ok && replayID > 0 {
+			metadata["replay_id"] = replayID
+		}
 	} else {
 		jobID, round, evaluation := job.ID, job.CurrentRound, max(job.Attempts, 1)
 		attempt.JobID, attempt.AuditRound, attempt.EvaluationRound, attempt.CallKind = &jobID, round, &evaluation, "audit"

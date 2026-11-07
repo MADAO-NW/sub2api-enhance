@@ -1,17 +1,20 @@
 <script setup lang="ts">
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfigPolicySection from './ConfigPolicySection.vue'
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { thirdPartyPromptAuditAPI as api, type AuditConfig, type AuditModel, type AuditUser, type ModelAttempt, type Contract, type KeyUpdate, type ProbeResult, type SavedConfig, type UserRuleConfig } from '@/api/admin/third-party-prompt-audit'
+import SamplesPanel from './SamplesPanel.vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { thirdPartyPromptAuditAPI as api, type AuditConfig, type AuditModel, type AuditUser, type ConfigImpact, type ModelAttempt, type Contract, type KeyUpdate, type ProbeResult, type SavedConfig, type UserRuleConfig } from '@/api/admin/third-party-prompt-audit'
 import { getAll } from '@/api/admin/groups'
 import type { AdminGroup } from '@/types'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
-import { configUpdate, editableConfig, formatTime } from './viewModel'
+import { configUpdate, editableConfig, formatTime, parametersText, parseParameters } from './viewModel'
 import { useAuditLabels } from './labels'
 
-const props = withDefaults(defineProps<{ refreshKey?: number; active?: boolean }>(), { refreshKey: 0, active: true })
+const props = withDefaults(defineProps<{ refreshKey?: number; active?: boolean; focusNodeID?: string }>(), { refreshKey: 0, active: true, focusNodeID: '' })
 const label = useAuditLabels()
+const { t } = useI18n()
 const app = useAppStore()
 const saved = ref<SavedConfig | null>(null)
 const draft = ref<AuditConfig | null>(null)
@@ -29,20 +32,16 @@ async function showProbeDetails(id: number) {
 }
 const probing = ref<string[]>([])
 const listingModels = ref<string[]>([])
-const resetting = ref(false)
 const testingAdminEmail = ref(false)
-const selectedResetUserID = ref<number | null>(null)
-// 用户数据管理：导出与删除（删除只清理审计数据，保留处置/信任/熔断记录）。
-const confirmDeleteUser = ref<number | null>(null)
-const userDataBusy = ref(false)
 const selectedRuleUserID = ref<number | null>(null)
 const probeInputKind = ref('text')
 const probeProtocol = ref('openai_responses')
 const probeScenario = ref('coercive_adult_fiction')
 const customProbeInput = ref('')
 const structuredProbeInput = ref('')
-const providersJSON = ref('')
-const providersJSONError = ref('')
+// 节点高级参数就地解析：每个节点一份 JSON 文本与错误信息。
+const parameterTexts = reactive<Record<string, string>>({})
+const parameterErrors = reactive<Record<string, string>>({})
 const expandedModelIDs = ref<string[]>([])
 const loading = ref(false)
 const saving = ref(false)
@@ -64,9 +63,7 @@ const probeInput = computed({
   }
 })
 const dirty = computed(() => !!saved.value && !!draft.value && (JSON.stringify(draft.value) !== JSON.stringify(editableConfig(saved.value)) || Object.values(keys).some(key => key.action !== 'keep')))
-const resetUsers = computed(() => users.value.filter(user => user.role === 'user'))
 const ruleUsers = computed(() => users.value.filter(user => !(draft.value?.user_rules ?? []).some(rule => rule.user_id === user.id)))
-const selectedResetUser = computed(() => users.value.find(user => user.id === selectedResetUserID.value) ?? null)
 const auditUser = (id: number) => users.value.find(user => user.id === id)
 const userRoleLabel = (role: string) => label(role === 'admin' ? 'userAdmin' : role === 'user' ? 'userRegular' : role)
 const userStatusLabel = (status: string) => label(status === 'active' ? 'userActive' : status === 'disabled' ? 'userDisabled' : status)
@@ -78,6 +75,47 @@ const blockPercent = computed({
   get: () => draft.value?.block_threshold == null ? '' : draft.value.block_threshold * 100,
   set: (value: number | '') => { if (draft.value) draft.value.block_threshold = value === '' ? null : value / 100 }
 })
+const parameterInvalid = computed(() => Object.keys(parameterErrors).length > 0)
+// 停用阈值低于指令块熔断阈值时，被误判的共享指令块会先停用第一个用户。
+const disableWarning = computed(() => {
+  const threshold = saved.value?.breaker_user_threshold ?? 0
+  if (!draft.value?.disable.enabled || threshold <= 0 || draft.value.disable.limit >= threshold) return ''
+  return t('admin.thirdPartyPromptAudit.disableThresholdWarning', { threshold })
+})
+
+// 类别处置规则：键为 R01 形式，值为 immediate_disable / notice_only。
+const categoryRuleRows = computed(() => Object.entries(draft.value?.category_rules ?? {}).map(([code, disposition]) => ({ code, disposition })))
+function addCategoryRule() {
+  if (!draft.value) return
+  let index = 1
+  let code = `R${String(index).padStart(2, '0')}`
+  while (draft.value.category_rules[code]) {
+    index++
+    code = `R${String(index).padStart(2, '0')}`
+  }
+  draft.value.category_rules[code] = 'notice_only'
+}
+function updateCategoryCode(oldCode: string, event: Event) {
+  const input = event.target as HTMLInputElement
+  const next = input.value.trim().toUpperCase()
+  if (!draft.value) return
+  const collision = next !== oldCode && draft.value.category_rules[next] !== undefined
+  if (!/^R\d{2}$/.test(next) || collision) {
+    input.value = oldCode
+    return
+  }
+  const disposition = draft.value.category_rules[oldCode]
+  delete draft.value.category_rules[oldCode]
+  draft.value.category_rules[next] = disposition
+  input.value = next
+}
+function updateCategoryDisposition(code: string, event: Event) {
+  if (!draft.value) return
+  draft.value.category_rules[code] = (event.target as HTMLSelectElement).value
+}
+function removeCategoryRule(code: string) {
+  if (draft.value) delete draft.value.category_rules[code]
+}
 const probeExample = computed(() => {
   switch (probeProtocol.value) {
     case 'openai_chat_completions': return '{"messages":[{"role":"user","content":"Explain this project structure."}]}'
@@ -99,62 +137,27 @@ function restore() {
   for (const id of Object.keys(keys)) delete keys[id]
   for (const id of Object.keys(modelOptions)) delete modelOptions[id]
   for (const id of Object.keys(modelListErrors)) delete modelListErrors[id]
+  for (const id of Object.keys(parameterTexts)) delete parameterTexts[id]
+  for (const id of Object.keys(parameterErrors)) delete parameterErrors[id]
   for (const model of draft.value.models) {
     keys[model.id] = { model_id: model.id, action: 'keep', api_key: '' }
     modelOptions[model.id] = model.model ? [model.model] : []
+    parameterTexts[model.id] = parametersText(model.parameters)
   }
-  refreshProvidersJSON()
 }
 
-function refreshProvidersJSON() {
-  if (!draft.value) return
-  providersJSON.value = JSON.stringify({ $schemaVersion: 1, providers: draft.value.models.map(model => ({
-    id: model.id, type: 'openai-chat-completions', enabled: model.enabled, baseUrl: model.base_url,
-    apiModel: model.model, timeoutMs: model.timeout_ms, maxConcurrency: model.max_concurrency, parameters: model.parameters ?? {}
-  })) }, null, 2)
-  providersJSONError.value = ''
-}
-
-function applyProvidersJSON() {
-  if (!draft.value) return
-  try {
-    const document = JSON.parse(providersJSON.value) as { $schemaVersion?: number; providers?: unknown[] }
-    if (document.$schemaVersion !== 1 || !Array.isArray(document.providers)) throw new Error(label('providersJSONShape'))
-    const previousKeys = { ...keys }
-    const ids = new Set<string>()
-    const models = document.providers.map(value => {
-      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(label('providersJSONShape'))
-      const provider = value as Record<string, unknown>
-      if (provider.type !== 'openai-chat-completions') throw new Error(label('providersJSONType'))
-	  if (provider.enabled !== undefined && typeof provider.enabled !== 'boolean') throw new Error(label('providersJSONShape'))
-	  if (typeof provider.baseUrl !== 'string' || typeof provider.apiModel !== 'string') throw new Error(label('providersJSONShape'))
-	  if (provider.id !== undefined && typeof provider.id !== 'string') throw new Error(label('providersJSONShape'))
-      const id = typeof provider.id === 'string' && provider.id ? provider.id : crypto.randomUUID()
-      if (ids.has(id)) throw new Error(label('providersJSONDuplicate'))
-      ids.add(id)
-      const parameters = provider.parameters ?? {}
-      if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) throw new Error(label('providersJSONParameters'))
-      for (const reserved of ['model', 'messages', 'stream']) if (reserved in (parameters as Record<string, unknown>)) throw new Error(`${label('providersJSONReserved')}: ${reserved}`)
-      const timeout = Number(provider.timeoutMs)
-      if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new Error(label('providersJSONTimeout'))
-	  const maxConcurrency = Number(provider.maxConcurrency ?? saved.value?.model_defaults.max_concurrency)
-	  if (!Number.isSafeInteger(maxConcurrency) || maxConcurrency <= 0) throw new Error(label('providersJSONConcurrency'))
-      return { id, name: '', enabled: provider.enabled !== false, base_url: String(provider.baseUrl ?? ''), model: String(provider.apiModel ?? ''),
-		timeout_ms: timeout, max_concurrency: maxConcurrency, parameters: parameters as Record<string, unknown> }
-    })
-    for (const id of Object.keys(keys)) delete keys[id]
-    for (const id of Object.keys(modelOptions)) delete modelOptions[id]
-    for (const id of Object.keys(modelListErrors)) delete modelListErrors[id]
-    for (const model of models) {
-      keys[model.id] = previousKeys[model.id] ?? { model_id: model.id, action: 'keep', api_key: '' }
-      modelOptions[model.id] = model.model ? [model.model] : []
-    }
-    draft.value.models = models
-    syncModelNames()
-    refreshProvidersJSON()
-  } catch (err) {
-    providersJSONError.value = err instanceof Error ? err.message : label('providersJSONInvalid')
+// updateParameters 就地解析节点高级参数；非 JSON 对象或覆盖固定字段时禁止保存。
+function updateParameters(id: string, text: string) {
+  parameterTexts[id] = text
+  const model = draft.value?.models.find(item => item.id === id)
+  if (!model) return
+  const result = parseParameters(text)
+  if (result.error) {
+    parameterErrors[id] = result.field ? `${label(result.error)}: ${result.field}` : label(result.error)
+    return
   }
+  delete parameterErrors[id]
+  model.parameters = result.value ?? {}
 }
 function updateKey(modelID: string, value: string) {
   keys[modelID] = { model_id: modelID, action: value ? 'replace' : 'keep', api_key: value }
@@ -190,6 +193,7 @@ function addModel() {
 	expandedModelIDs.value.push(id)
   keys[id] = { model_id: id, action: 'keep', api_key: '' }
   modelOptions[id] = []
+  parameterTexts[id] = parametersText({})
 }
 function setModelExpanded(id: string, expanded: boolean) {
   expandedModelIDs.value = expanded ? Array.from(new Set([...expandedModelIDs.value, id])) : expandedModelIDs.value.filter(value => value !== id)
@@ -231,6 +235,15 @@ watch(() => draft.value?.disable.enabled, enabled => {
   if (draft.value && saved.value && enabled && draft.value.disable.limit < 1) draft.value.disable.limit = saved.value.rule_defaults.disable_limit
 })
 watch(() => draft.value?.models.map(model => model.model), syncModelNames, { deep: true })
+// 从待处理工作台跳转时直接展开该节点卡片。
+watch(() => props.focusNodeID, id => {
+  if (!id || !draft.value?.models.some(model => model.id === id)) return
+  setModelExpanded(id, true)
+  void nextTick(() => {
+    const element = document.querySelector<HTMLElement>(`[data-model-id="${id}"]`)
+    if (element && typeof element.scrollIntoView === 'function') element.scrollIntoView({ block: 'center' })
+  })
+}, { immediate: true })
 function moveModel(index: number, direction: number) {
   const models = draft.value?.models
   if (!models || index + direction < 0 || index + direction >= models.length) return
@@ -244,8 +257,11 @@ function removeModel(id: string) {
   delete modelOptions[id]
   delete modelListErrors[id]
   delete probes[id]
+  delete parameterTexts[id]
+  delete parameterErrors[id]
   syncModelNames()
 }
+// 专属规则只覆盖处理方式与两个阈值；聚合、提醒与停用一律跟随全局。
 function addUserRule() {
   if (!draft.value || !saved.value || !selectedRuleUserID.value) return
   const user = auditUser(selectedRuleUserID.value)
@@ -255,16 +271,6 @@ function addUserRule() {
     mode: draft.value.mode === 'blocking' ? 'blocking' : 'async',
     review_threshold: draft.value.review_threshold ?? saved.value.rule_defaults.review_threshold,
     block_threshold: draft.value.block_threshold ?? saved.value.rule_defaults.block_threshold,
-    aggregation: draft.value.aggregation,
-    warning: {
-      enabled: draft.value.warning.enabled,
-      window: draft.value.warning.window > 0 ? draft.value.warning.window : saved.value.rule_defaults.warning_window,
-      limit: draft.value.warning.limit > 0 ? draft.value.warning.limit : saved.value.rule_defaults.warning_limit
-    },
-    disable: {
-      enabled: user.role === 'user' && draft.value.disable.enabled,
-      limit: draft.value.disable.limit > 0 ? draft.value.disable.limit : saved.value.rule_defaults.disable_limit
-    }
   })
   selectedRuleUserID.value = null
 }
@@ -275,41 +281,6 @@ function updateRuleThreshold(rule: UserRuleConfig, field: 'review_threshold' | '
   const value = Number((event.target as HTMLInputElement).value)
   rule[field] = Number.isFinite(value) ? value / 100 : 0
 }
-async function exportUserData() {
-  if (!selectedResetUserID.value) return
-  userDataBusy.value = true
-  try {
-    const blob = await api.exportUserData(selectedResetUserID.value)
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = `user-${selectedResetUserID.value}-third-party-prompt-audit.csv`
-    link.click()
-    URL.revokeObjectURL(url)
-  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
-  finally { userDataBusy.value = false }
-}
-async function removeUserData() {
-  const userID = confirmDeleteUser.value
-  if (!userID) return
-  userDataBusy.value = true
-  try {
-    const result = await api.deleteUserData(userID)
-    app.showSuccess(`${label('userDataDeleted')}: ${result.deleted_jobs}`)
-    confirmDeleteUser.value = null
-  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
-  finally { userDataBusy.value = false }
-}
-async function resetCounter() {
-  if (!selectedResetUserID.value) return
-  resetting.value = true
-  try {
-    const result = await api.enableAndReset(selectedResetUserID.value)
-    app.showSuccess(`${label('actionSubmitted')} #${result.action_id}`)
-    users.value = await api.users()
-  } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
-  finally { resetting.value = false }
-}
 async function testAdminEmail() {
   if (!saved.value?.admin_email || draft.value?.admin_email !== saved.value.admin_email || testingAdminEmail.value) return
   testingAdminEmail.value = true
@@ -319,9 +290,15 @@ async function testAdminEmail() {
   } catch (err) { app.showError(extractApiErrorMessage(err, label('error'))) }
   finally { testingAdminEmail.value = false }
 }
-// 保存前列出将要变更的字段，避免误改政策或阈值。
+// 保存前列出将要变更的字段，并估算这次保存对全库审核缓存的影响。
 const showDiff = ref(false)
 const pendingChanges = ref<string[]>([])
+const impact = ref<ConfigImpact | null>(null)
+const impactLoading = ref(false)
+const impactFailed = ref(false)
+const impactMessage = computed(() => impact.value && impact.value.instruction_changed
+  ? t('admin.thirdPartyPromptAudit.cacheImpactInstruction', { hours: impact.value.window_hours, count: impact.value.recent_instruction_blocks })
+  : '')
 // 旧版政策需显式勾选确认，后端才接受保存。
 const legacyConfirmed = ref(false)
 const legacyPolicy = computed(() => !!draft.value && /audit_stage|intent_binding|effective_behavior/.test(draft.value.audit_prompt))
@@ -344,12 +321,19 @@ function describeDiff(): string[] {
   }
   return changes
 }
-function save() {
+async function save() {
   if (!draft.value || !saved.value) return
+  if (parameterInvalid.value) { app.showError(Object.values(parameterErrors)[0] ?? label('nodeParametersInvalid')); return }
   pendingChanges.value = describeDiff()
   if (pendingChanges.value.length === 0) return
   legacyConfirmed.value = false
   showDiff.value = true
+  impact.value = null
+  impactFailed.value = false
+  impactLoading.value = true
+  try { impact.value = await api.configImpact(draft.value) }
+  catch { impactFailed.value = true }
+  finally { impactLoading.value = false }
 }
 async function confirmSave() {
   showDiff.value = false
@@ -430,7 +414,9 @@ watch(() => props.refreshKey, () => { void load(true) })
             <div v-if="contract" class="min-w-0 space-y-2"><h3 class="text-sm font-medium">{{ label('contract') }} · {{ contract.version }}</h3><pre class="max-h-96 overflow-auto whitespace-pre-wrap rounded-xl bg-gray-50 p-4 text-sm dark:bg-dark-900" data-test="fixed-contract">{{ contract.output_contract }}</pre></div>
           </div>
         </section>
-
+        <section class="card p-5 sm:p-6" data-test="samples-section">
+          <SamplesPanel :config="draft" :saved="saved" :active="active" :refresh-key="refreshKey" />
+        </section>
         <section class="card space-y-5 p-5 sm:p-6">
 		  <div class="flex flex-wrap items-center justify-between gap-4"><h2 class="text-lg font-semibold">{{ label('models') }}</h2><div class="flex flex-wrap gap-2"><button type="button" class="btn btn-ghost" @click="setAllModelsExpanded(true)">{{ label('expandAll') }}</button><button type="button" class="btn btn-ghost" @click="setAllModelsExpanded(false)">{{ label('collapseAll') }}</button><button type="button" class="btn btn-secondary" @click="addModel">{{ label('addModel') }}</button></div></div>
 		  <details v-for="(model, index) in draft.models" :key="model.id" class="rounded-xl border border-gray-200 p-4 dark:border-dark-600" data-test="model-card" :open="expandedModelIDs.includes(model.id)" @toggle="setModelExpanded(model.id, ($event.target as HTMLDetailsElement).open)">
@@ -446,6 +432,12 @@ watch(() => props.refreshKey, () => { void load(true) })
             <p class="text-sm"><span class="text-gray-500 dark:text-dark-400">{{ label('name') }}：</span>{{ model.name || label('chooseModel') }}</p>
             <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('timeoutHint') }}</p>
             <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('nodeConcurrencyHint') }}</p>
+            <label class="block space-y-2"><span class="text-sm">{{ label('nodeParameters') }}</span>
+              <textarea :value="parameterTexts[model.id] ?? ''" class="input min-h-24 font-mono text-xs" spellcheck="false" data-test="node-parameters"
+                @input="updateParameters(model.id, ($event.target as HTMLTextAreaElement).value)" />
+              <span class="block text-xs text-gray-500 dark:text-dark-400">{{ label('nodeParametersHint') }}</span>
+            </label>
+            <p v-if="parameterErrors[model.id]" class="text-sm text-red-600 dark:text-red-400" role="alert" data-test="node-parameters-error">{{ parameterErrors[model.id] }}</p>
             <label v-if="keys[model.id]" class="block space-y-2"><span class="text-sm">{{ label('credential') }} · {{ label(saved.has_api_keys[model.id] ? 'keyPresent' : 'keyAbsent') }}</span><input :value="keys[model.id]?.api_key" class="input" type="password" autocomplete="new-password" :placeholder="label(saved.has_api_keys[model.id] ? 'keyKeepHint' : 'keyInputHint')" @input="updateKey(model.id, ($event.target as HTMLInputElement).value)" /></label>
             <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('keyHint') }} · {{ label('modelID') }}: {{ model.id }}</p>
             <div class="flex flex-wrap gap-3"><button type="button" class="btn btn-secondary" :disabled="!model.base_url || listingModels.includes(model.id)" @click="listModels(model)">{{ label(listingModels.includes(model.id) ? 'loading' : 'loadModels') }}</button><button type="button" class="btn btn-secondary" :disabled="!model.model || probing.includes(model.id)" @click="probe(model)">{{ label(probing.includes(model.id) ? 'loading' : 'probe') }}</button></div>
@@ -459,13 +451,6 @@ watch(() => props.refreshKey, () => { void load(true) })
 			</div>
 			</div>
 		  </details>
-          <details class="rounded-xl border border-gray-200 p-4 dark:border-dark-600">
-            <summary class="cursor-pointer font-semibold">{{ label('providersJSON') }}</summary>
-            <p class="my-3 text-sm text-gray-500 dark:text-dark-400">{{ label('providersJSONHint') }}</p>
-            <textarea v-model="providersJSON" class="input min-h-80 font-mono text-xs" spellcheck="false" data-test="providers-json" />
-            <p v-if="providersJSONError" class="mt-2 text-sm text-red-600 dark:text-red-400">{{ providersJSONError }}</p>
-            <div class="mt-3 flex flex-wrap gap-3"><button type="button" class="btn btn-secondary" @click="refreshProvidersJSON">{{ label('refreshProvidersJSON') }}</button><button type="button" class="btn btn-secondary" @click="applyProvidersJSON">{{ label('applyProvidersJSON') }}</button></div>
-          </details>
           <p class="text-sm text-gray-500 dark:text-dark-400">{{ label('probeHint') }}</p>
           <label class="block space-y-2"><span class="text-sm">{{ label('probeInputKind') }}</span><select v-model="probeInputKind" class="input"><option value="text">{{ label('textInput') }}</option><option value="json">{{ label('jsonInput') }}</option></select></label>
           <label v-if="probeInputKind === 'text'" class="block space-y-2"><span class="text-sm">{{ label('probeScenario') }}</span><select v-model="probeScenario" class="input"><option v-for="(sample, index) in probeSamples" :key="sample.id" :value="sample.id">{{ index + 1 }}. {{ sample.text.split('\n')[0] }}</option><option value="custom">{{ label('customInput') }}</option></select></label>
@@ -496,7 +481,23 @@ watch(() => props.refreshKey, () => { void load(true) })
             <fieldset class="space-y-4"><label class="flex items-center gap-2"><input v-model="draft.warning.enabled" type="checkbox" />{{ label('warning') }}</label>
               <div v-if="draft.warning.enabled" class="space-y-3"><div class="grid grid-cols-2 gap-4"><label class="space-y-2"><span class="text-sm">{{ label('warningWindow') }}</span><input v-model.number="draft.warning.window" class="input" type="number" min="1" step="1" required /></label><label class="space-y-2"><span class="text-sm">{{ label('warningLimit') }}</span><input v-model.number="draft.warning.limit" class="input" type="number" min="1" :max="draft.warning.window" step="1" required /></label></div><p class="text-xs text-gray-500 dark:text-dark-400">{{ label('warningWindowHint') }}</p></div>
             </fieldset>
-            <fieldset class="space-y-4"><label class="flex items-center gap-2"><input v-model="draft.disable.enabled" type="checkbox" />{{ label('disable') }}</label><label v-if="draft.disable.enabled" class="block space-y-2"><span class="text-sm">{{ label('disableLimit') }}</span><input v-model.number="draft.disable.limit" class="input" type="number" min="1" step="1" required /></label></fieldset>
+            <fieldset class="space-y-4"><label class="flex items-center gap-2"><input v-model="draft.disable.enabled" type="checkbox" />{{ label('disable') }}</label><label v-if="draft.disable.enabled" class="block space-y-2"><span class="text-sm">{{ label('disableLimit') }}</span><input v-model.number="draft.disable.limit" class="input" type="number" min="1" step="1" required /></label>
+              <p v-if="disableWarning" class="text-xs text-amber-700 dark:text-amber-400" data-test="disable-threshold-warning">{{ disableWarning }}</p>
+            </fieldset>
+            <div class="space-y-3 md:col-span-2" data-test="category-rules">
+              <label class="flex items-center gap-2"><input v-model="draft.escalate_on_warning" type="checkbox" />{{ label('escalateOnWarning') }}</label>
+              <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('escalateOnWarningHint') }}</p>
+              <div class="flex items-center justify-between"><h4 class="font-semibold">{{ label('categoryRules') }}</h4><button type="button" class="btn btn-secondary" data-test="add-category-rule" @click="addCategoryRule">{{ label('addCategoryRule') }}</button></div>
+              <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('categoryRulesHint') }}</p>
+              <div v-for="row in categoryRuleRows" :key="row.code" class="flex flex-wrap items-center gap-3">
+                <input :value="row.code" class="input w-24" maxlength="3" aria-label="R01" @change="updateCategoryCode(row.code, $event)" />
+                <select :value="row.disposition" class="input w-56" @change="updateCategoryDisposition(row.code, $event)">
+                  <option value="immediate_disable">{{ label('dispositionImmediateDisable') }}</option>
+                  <option value="notice_only">{{ label('dispositionNoticeOnly') }}</option>
+                </select>
+                <button type="button" class="btn btn-ghost text-red-600" @click="removeCategoryRule(row.code)">{{ label('removeCategoryRule') }}</button>
+              </div>
+            </div>
           </div><div class="flex flex-wrap items-end gap-3"><label class="min-w-72 flex-1 space-y-2"><span class="text-sm">{{ label('adminEmail') }}</span><input v-model="draft.admin_email" class="input" type="email" /><span class="block text-xs text-gray-500 dark:text-dark-400">{{ label('adminEmailHint') }}</span></label><button type="button" class="btn btn-secondary self-end" data-test="test-admin-email" :disabled="saving || loading || testingAdminEmail || !saved.admin_email || draft.admin_email !== saved.admin_email" @click="testAdminEmail">{{ label(testingAdminEmail ? 'loading' : 'testAdminEmail') }}</button></div><p class="text-xs text-gray-500 dark:text-dark-400">{{ label('testAdminEmailHint') }}</p>
           <div class="border-t border-gray-200 pt-5 dark:border-dark-700">
             <h3 class="font-semibold">{{ label('userRules') }}</h3><p class="mb-4 mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('userRulesHint') }}</p>
@@ -504,27 +505,26 @@ watch(() => props.refreshKey, () => { void load(true) })
             <div class="mt-4 space-y-4">
               <section v-for="rule in draft.user_rules" :key="rule.user_id" class="rounded-xl border border-gray-200 p-4 dark:border-dark-600">
                 <div class="flex flex-wrap items-start justify-between gap-3"><div><strong>{{ auditUser(rule.user_id)?.username || `#${rule.user_id}` }} (#{{ rule.user_id }})</strong><p class="text-xs text-gray-500">{{ auditUser(rule.user_id)?.email }} · {{ userRoleLabel(auditUser(rule.user_id)?.role || '') }}</p></div><button type="button" class="btn btn-ghost text-red-600" @click="removeUserRule(rule.user_id)">{{ label('removeUserRule') }}</button></div>
-                <div class="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-4"><label class="space-y-2"><span class="text-sm">{{ label('userMode') }}</span><select v-model="rule.mode" class="input"><option value="async">{{ label('async') }}</option><option value="blocking">{{ label('blocking') }}</option></select></label><label class="space-y-2"><span class="text-sm">{{ label('reviewThreshold') }} (%)</span><input :value="rule.review_threshold * 100" class="input" type="number" min="0" max="100" step="any" required @input="updateRuleThreshold(rule, 'review_threshold', $event)" /></label><label class="space-y-2"><span class="text-sm">{{ label('blockThreshold') }} (%)</span><input :value="rule.block_threshold * 100" class="input" type="number" min="0" max="100" step="any" required @input="updateRuleThreshold(rule, 'block_threshold', $event)" /></label><label class="space-y-2"><span class="text-sm">{{ label('aggregation') }}</span><select v-model="rule.aggregation" class="input"><option v-for="strategy in ['any_block', 'majority_block', 'all_block']" :key="strategy" :value="strategy">{{ label(strategy) }}</option></select></label></div>
-                <div class="mt-4 grid gap-6 md:grid-cols-2"><fieldset class="space-y-3"><label class="flex items-center gap-2"><input v-model="rule.warning.enabled" type="checkbox" />{{ label('warning') }}</label><div v-if="rule.warning.enabled" class="grid grid-cols-2 gap-3"><label class="space-y-2"><span class="text-sm">{{ label('warningWindow') }}</span><input v-model.number="rule.warning.window" class="input" type="number" min="1" step="1" required /></label><label class="space-y-2"><span class="text-sm">{{ label('warningLimit') }}</span><input v-model.number="rule.warning.limit" class="input" type="number" min="1" :max="rule.warning.window" step="1" required /></label></div></fieldset><fieldset class="space-y-3"><label class="flex items-center gap-2"><input v-model="rule.disable.enabled" type="checkbox" :disabled="auditUser(rule.user_id)?.role !== 'user'" />{{ label('disable') }}</label><label v-if="rule.disable.enabled" class="block space-y-2"><span class="text-sm">{{ label('disableLimit') }}</span><input v-model.number="rule.disable.limit" class="input" type="number" min="1" step="1" required /></label><p v-if="auditUser(rule.user_id)?.role !== 'user'" class="text-xs text-amber-700 dark:text-amber-400">{{ label('adminDisableHint') }}</p></fieldset></div>
+                <div class="mt-4 grid gap-4 md:grid-cols-3"><label class="space-y-2"><span class="text-sm">{{ label('userMode') }}</span><select v-model="rule.mode" class="input"><option value="async">{{ label('async') }}</option><option value="blocking">{{ label('blocking') }}</option></select></label><label class="space-y-2"><span class="text-sm">{{ label('reviewThreshold') }} (%)</span><input :value="rule.review_threshold * 100" class="input" type="number" min="0" max="100" step="any" required @input="updateRuleThreshold(rule, 'review_threshold', $event)" /></label><label class="space-y-2"><span class="text-sm">{{ label('blockThreshold') }} (%)</span><input :value="rule.block_threshold * 100" class="input" type="number" min="0" max="100" step="any" required @input="updateRuleThreshold(rule, 'block_threshold', $event)" /></label></div>
               </section>
             </div>
           </div>
-          <div class="border-t border-gray-200 pt-5 dark:border-dark-700"><h3 class="font-semibold">{{ label('counterManagement') }}</h3><p class="mb-4 mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('counterManagementHint') }}</p><div class="grid gap-4 md:grid-cols-[minmax(0,1fr)_auto]"><label class="space-y-2"><span class="text-sm">{{ label('user') }}</span><select v-model="selectedResetUserID" class="input"><option :value="null">{{ label('chooseUser') }}</option><option v-for="user in resetUsers" :key="user.id" :value="user.id">{{ user.username }} (#{{ user.id }}) · {{ userStatusLabel(user.status) }} · {{ label('disableViolationCount') }} {{ user.disable_violation_count }}</option></select></label><div class="flex flex-wrap items-end gap-2"><button type="button" class="btn btn-secondary" :disabled="!selectedResetUserID || userDataBusy" @click="exportUserData">{{ label('exportUserData') }}</button><button type="button" class="btn btn-secondary" :disabled="!selectedResetUserID || userDataBusy" @click="confirmDeleteUser = selectedResetUserID">{{ label('deleteUserData') }}</button><button type="button" class="btn btn-secondary" :disabled="!selectedResetUserID || resetting || selectedResetUser?.action_pending" @click="resetCounter">{{ label(resetting ? 'loading' : 'enableAndReset') }}</button></div></div><p v-if="selectedResetUser" class="mt-3 text-xs text-gray-500 dark:text-dark-400">{{ selectedResetUser.email }} · {{ userRoleLabel(selectedResetUser.role) }} · {{ userStatusLabel(selectedResetUser.status) }} · {{ label('disableViolationCount') }} {{ selectedResetUser.disable_violation_count }} · {{ label('lastCounterReset') }} {{ formatTime(selectedResetUser.disable_reset_at) }}<span v-if="selectedResetUser.action_pending"> · {{ label('actionPending') }}</span></p></div>
         </section>
       </fieldset>
       <div class="sticky bottom-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-gray-200 bg-white/95 p-4 shadow-lg backdrop-blur dark:border-dark-600 dark:bg-dark-800/95">
         <span class="text-sm">{{ label('revision') }}: {{ saved.revision }} / {{ saved.applied_revision }} · {{ formatTime(saved.updated_at) }} · {{ saved.instance_id }} <span v-if="dirty" class="ml-2 text-amber-700 dark:text-amber-400">{{ label('dirty') }}</span></span>
-        <div class="flex gap-2"><button type="button" class="btn btn-secondary" :disabled="saving || !dirty" @click="restore">{{ label('reset') }}</button><button type="submit" class="btn btn-primary" :disabled="saving || !dirty" data-test="save-config">{{ label(saving ? 'loading' : 'save') }}</button></div>
+        <div class="flex gap-2"><button type="button" class="btn btn-secondary" :disabled="saving || !dirty" @click="restore">{{ label('reset') }}</button><button type="submit" class="btn btn-primary" :disabled="saving || !dirty || parameterInvalid" data-test="save-config">{{ label(saving ? 'loading' : 'save') }}</button></div>
       </div>
     </form>
-    <BaseDialog :show="confirmDeleteUser !== null" :title="label('deleteUserData')" :close-on-click-outside="true" @close="confirmDeleteUser = null">
-      <p class="text-sm text-red-700 dark:text-red-300">{{ label('deleteUserDataHint') }}</p>
-      <p class="mt-2 text-sm text-gray-500 dark:text-dark-400">{{ label('deleteUserDataKeeps') }}</p>
-      <template #footer><div class="flex gap-3"><button class="btn btn-primary" :disabled="userDataBusy" data-test="confirm-delete-user" @click="removeUserData">{{ label('confirmSave') }}</button><button class="btn btn-secondary" @click="confirmDeleteUser = null">{{ label('cancelChanges') }}</button></div></template>
-    </BaseDialog>
     <BaseDialog :show="showDiff" :title="label('confirmChanges')" :close-on-click-outside="true" @close="showDiff = false">
       <p class="mb-3 text-sm text-gray-500 dark:text-dark-400">{{ label('confirmChangesHint') }}</p>
       <ul class="list-disc space-y-1 pl-5 text-sm"><li v-for="item in pendingChanges" :key="item">{{ item }}</li></ul>
+      <p v-if="impactLoading" class="mt-3 text-sm" role="status">{{ label('loading') }}</p>
+      <p v-else-if="impactFailed" class="mt-3 text-sm text-amber-700 dark:text-amber-400" data-test="cache-impact-failed">{{ label('cacheImpactFailed') }}</p>
+      <div v-else-if="impact" class="mt-3 space-y-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 dark:bg-amber-950/30 dark:text-amber-200" data-test="cache-impact">
+        <p v-if="impactMessage" class="font-medium">{{ impactMessage }}</p>
+        <p v-if="impact.user_changed">{{ label('cacheImpactUser') }}</p>
+      </div>
       <label v-if="legacyPolicy" class="mt-3 flex items-start gap-2 text-sm text-amber-800 dark:text-amber-200"><input v-model="legacyConfirmed" type="checkbox" class="mt-1" />{{ label('legacyPolicyConfirm') }}</label>
       <template #footer><div class="flex gap-3"><button class="btn btn-primary" :disabled="saving || (legacyPolicy && !legacyConfirmed)" @click="confirmSave">{{ label('confirmSave') }}</button><button class="btn btn-secondary" @click="showDiff = false">{{ label('cancelChanges') }}</button></div></template>
     </BaseDialog>

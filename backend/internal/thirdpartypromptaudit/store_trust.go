@@ -139,83 +139,6 @@ func (l sqlInstructionLedger) updateBreakerUsers(ctx context.Context, hash strin
 	return err
 }
 
-// drillLedger 是熔断演练用的内存实现：不写库，只复用判定流程。
-type drillLedger struct {
-	users      map[string]int
-	breakers   map[string]string
-	marks      map[string]bool
-	suppressed map[string]bool
-}
-
-func newDrillLedger() *drillLedger {
-	return &drillLedger{users: map[string]int{}, breakers: map[string]string{}, marks: map[string]bool{}, suppressed: map[string]bool{}}
-}
-
-func (l *drillLedger) lockInstruction(context.Context, string) error { return nil }
-
-func (l *drillLedger) breakerStatus(_ context.Context, hash string) (string, bool, error) {
-	status, ok := l.breakers[hash]
-	return status, ok, nil
-}
-
-func (l *drillLedger) markExists(_ context.Context, userID int64, hash string) (bool, error) {
-	return l.marks[itoa(int(userID))+":"+hash], nil
-}
-
-func (l *drillLedger) distinctUsers(_ context.Context, hash string) (int, error) {
-	return l.users[hash], nil
-}
-
-func (l *drillLedger) insertMark(_ context.Context, userID int64, hash string, _ int64, suppressed bool) error {
-	l.marks[itoa(int(userID))+":"+hash] = true
-	l.suppressed[itoa(int(userID))+":"+hash] = suppressed
-	l.users[hash]++
-	return nil
-}
-
-func (l *drillLedger) tripBreaker(_ context.Context, hash string, _ int, _ int64) error {
-	l.breakers[hash] = BreakerTripped
-	return nil
-}
-
-func (l *drillLedger) updateBreakerUsers(context.Context, string, int) error { return nil }
-
-// DrillResult 是熔断演练结果：每一步的用户数与判定，不写任何业务表。
-type DrillResult struct {
-	Hash      string   `json:"hash"`
-	Threshold int      `json:"threshold"`
-	Steps     []string `json:"steps"`
-	Tripped   bool     `json:"tripped"`
-}
-
-// DrillBreaker 用假哈希走一遍“只计一次 + 熔断”判定流程，供管理员验证规则是否符合预期。
-func DrillBreaker(hash string) (DrillResult, error) {
-	ledger := newDrillLedger()
-	result := DrillResult{Hash: hash, Threshold: instructionBreakerUserThreshold}
-	for userID := int64(1); userID <= int64(instructionBreakerUserThreshold)+1; userID++ {
-		outcome, err := applyInstructionViolations(context.Background(), ledger, userID, 0, []string{hash})
-		if err != nil {
-			return result, err
-		}
-		step := "用户" + itoa(int(userID)) + "："
-		switch {
-		case len(outcome.Tripped) > 0:
-			step += "触发熔断（暂停累计与停用）"
-			result.Tripped = true
-		case len(outcome.Countable) > 0:
-			step += "计一次"
-		case len(outcome.Suppressed) > 0:
-			step += "熔断暂停，不计入"
-		case len(outcome.Repeated) > 0:
-			step += "已计过，不重复计数"
-		default:
-			step += "无变化"
-		}
-		result.Steps = append(result.Steps, step)
-	}
-	return result, nil
-}
-
 // RecordNodeAuthNotice 记录一次审核节点凭据失效，每个任务只留一条，只通知管理员。
 func (r *Repository) RecordNodeAuthNotice(ctx context.Context, job *AuditJob, modelName, message string) error {
 	if job == nil {
@@ -367,12 +290,14 @@ func (r *Repository) ListBreakers(ctx context.Context, status, query string, pag
 	}
 	rows, err := r.db.QueryContext(ctx, `SELECT b.hash,COALESCE(left(p.text,500),''),COALESCE(p.bytes,0),b.status,b.distinct_users,b.tripped_at,b.tripped_job_id,b.resolved_by,b.resolved_at,
  COALESCE((SELECT array_agg(m.user_id ORDER BY m.user_id) FROM (SELECT user_id FROM sub2api_enhance.instruction_violation_marks WHERE hash=b.hash ORDER BY user_id LIMIT 20) m),'{}'),
- COALESCE((SELECT count(*) FROM sub2api_enhance.instruction_breakers b2 JOIN sub2api_enhance.prompt_texts p2 ON p2.hash=b2.hash
-   WHERE p.simhash IS NOT NULL AND p2.simhash IS NOT NULL AND b2.hash<>b.hash
-   AND bit_count((p2.simhash # p.simhash)::bit(64))<=3),0)
+ COALESCE((SELECT count(*) FROM sub2api_enhance.prompt_texts p2
+   WHERE p.simhash IS NOT NULL AND p2.simhash IS NOT NULL AND p2.kind='instruction' AND p2.hash<>b.hash
+   AND (EXISTS (SELECT 1 FROM sub2api_enhance.instruction_breakers b2 WHERE b2.hash=p2.hash)
+        OR EXISTS (SELECT 1 FROM sub2api_enhance.prompt_trust pt2 WHERE pt2.hash=p2.hash))
+   AND bit_count((p2.simhash # p.simhash)::bit(64))<=$5),0)
  FROM sub2api_enhance.instruction_breakers b LEFT JOIN sub2api_enhance.prompt_texts p ON p.hash=b.hash
  WHERE ($1='' OR b.status=$1) AND ($4='' OR b.hash LIKE $4||'%' OR COALESCE(p.text,'') ILIKE '%'||$4||'%')
- ORDER BY b.tripped_at DESC,b.hash LIMIT $2 OFFSET $3`, status, size, (page-1)*size, query)
+ ORDER BY b.tripped_at DESC,b.hash LIMIT $2 OFFSET $3`, status, size, (page-1)*size, query, similarSimhashDistance)
 	if err != nil {
 		return nil, err
 	}

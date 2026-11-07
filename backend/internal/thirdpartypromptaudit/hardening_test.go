@@ -1,7 +1,6 @@
 package thirdpartypromptaudit
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -15,18 +14,6 @@ func TestPrivateNodeHostDetectsLoopbackAndLAN(t *testing.T) {
 	for _, raw := range []string{"https://api.commandcode.ai/provider", "https://codeauv.com", "http://93.184.216.34"} {
 		require.False(t, privateNodeHost(raw), raw)
 	}
-}
-
-// 熔断演练按阈值给出可预测结论，且不依赖数据库。
-func TestDrillBreakerReportsThresholdSteps(t *testing.T) {
-	result, err := DrillBreaker(strings.Repeat("a", 64))
-	require.NoError(t, err)
-	require.Equal(t, instructionBreakerUserThreshold, result.Threshold)
-	require.True(t, result.Tripped)
-	require.Len(t, result.Steps, instructionBreakerUserThreshold+1)
-	require.Contains(t, result.Steps[0], "计一次")
-	require.Contains(t, result.Steps[1], "触发熔断")
-	require.Contains(t, result.Steps[2], "熔断暂停")
 }
 
 // 节点凭据被拒绝要能被识别，其它失败不能误判。

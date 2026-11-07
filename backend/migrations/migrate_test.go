@@ -220,18 +220,20 @@ func expectSchemaReady(mock sqlmock.Sqlmock) {
 	mock.ExpectExec(`CREATE SCHEMA IF NOT EXISTS sub2api_enhance; CREATE TABLE IF NOT EXISTS sub2api_enhance.schema_migrations(filename TEXT PRIMARY KEY,checksum TEXT NOT NULL,applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`).WillReturnResult(sqlmock.NewResult(0, 0))
 }
 
-// 空库新安装：001–014 按文件名顺序逐个事务执行，审计 013 在订阅 014 之前。
+// 空库新安装：001–019 按文件名顺序逐个事务执行，审计迁移在订阅迁移之前。
 func TestEmptyDatabaseRunsAuditThenSubscriptionMigrations(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	require.NoError(t, err)
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	names, contents := embeddedMigrations(t)
-	require.Equal(t, "013_prompt_audit_v3.sql", names[len(names)-5])
-	require.Equal(t, "014_subscription_quota_follow.sql", names[len(names)-4])
-	require.Equal(t, "015_prompt_audit_node_auth.sql", names[len(names)-3])
-	require.Equal(t, "016_prompt_audit_optimize.sql", names[len(names)-2])
-	require.Equal(t, "017_prompt_audit_metrics.sql", names[len(names)-1])
+	require.Equal(t, "013_prompt_audit_v3.sql", names[len(names)-7])
+	require.Equal(t, "014_subscription_quota_follow.sql", names[len(names)-6])
+	require.Equal(t, "015_prompt_audit_node_auth.sql", names[len(names)-5])
+	require.Equal(t, "016_prompt_audit_optimize.sql", names[len(names)-4])
+	require.Equal(t, "017_prompt_audit_metrics.sql", names[len(names)-3])
+	require.Equal(t, "018_prompt_audit_reaudit_fresh.sql", names[len(names)-2])
+	require.Equal(t, "019_prompt_audit_categories_samples.sql", names[len(names)-1])
 	expectSchemaReady(mock)
 	for _, name := range names {
 		expectMigrationFile(mock, name, contents[name])
@@ -241,15 +243,15 @@ func TestEmptyDatabaseRunsAuditThenSubscriptionMigrations(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// v0.2.6 已执行 001–012：升级只追加 013 与 014，按文件名顺序执行。
+// 上一版本已执行 001–017：升级只追加 018、019，按文件名顺序执行。
 func TestUpgradeFromV026RunsAuditThenSubscriptionMigrations(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	require.NoError(t, err)
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	names, contents := embeddedMigrations(t)
-	applied, pending := names[:len(names)-5], names[len(names)-5:]
-	require.Equal(t, []string{"013_prompt_audit_v3.sql", "014_subscription_quota_follow.sql", "015_prompt_audit_node_auth.sql", "016_prompt_audit_optimize.sql", "017_prompt_audit_metrics.sql"}, pending)
+	applied, pending := names[:len(names)-2], names[len(names)-2:]
+	require.Equal(t, []string{"018_prompt_audit_reaudit_fresh.sql", "019_prompt_audit_categories_samples.sql"}, pending)
 	expectSchemaReady(mock)
 	for _, name := range applied {
 		checksum := fmt.Sprintf("%x", sha256.Sum256([]byte(contents[name])))
@@ -271,11 +273,11 @@ func TestPromptAuditV3MigrationFailureRollsBackWholeFile(t *testing.T) {
 	db.SetMaxOpenConns(1)
 	names, contents := embeddedMigrations(t)
 	expectSchemaReady(mock)
-	for _, name := range names[:len(names)-5] {
+	for _, name := range names[:len(names)-7] {
 		checksum := fmt.Sprintf("%x", sha256.Sum256([]byte(contents[name])))
 		mock.ExpectQuery("SELECT checksum FROM sub2api_enhance.schema_migrations WHERE filename=$1").WithArgs(name).WillReturnRows(sqlmock.NewRows([]string{"checksum"}).AddRow(checksum))
 	}
-	last := names[len(names)-5]
+	last := names[len(names)-7]
 	// 前置检查发现未完成处置动作时 RAISE EXCEPTION：整个文件回滚，不登记台账。
 	mock.ExpectQuery("SELECT checksum FROM sub2api_enhance.schema_migrations WHERE filename=$1").WithArgs(last).WillReturnRows(sqlmock.NewRows([]string{"checksum"}))
 	mock.ExpectBegin()

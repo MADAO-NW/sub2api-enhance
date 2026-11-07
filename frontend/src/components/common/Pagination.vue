@@ -49,12 +49,12 @@ function changeSize(event: Event) {
       <select v-if="showPageSizeSelector" class="input w-auto min-w-20" :value="pageSize" aria-label="每页数量" @change="changeSize">
         <option v-for="option in pageSizeOptions" :key="option" :value="option">{{ option }}</option>
       </select>
-      <button class="btn btn-secondary" :disabled="page <= 1" aria-label="首页" @click="go(1)">«</button>
-      <button class="btn btn-secondary" :disabled="page <= 1" aria-label="上一页" @click="go(page - 1)">←</button>
+      <button type="button" class="btn btn-secondary" :disabled="page <= 1" aria-label="首页" @click="go(1)">«</button>
+      <button type="button" class="btn btn-secondary" :disabled="page <= 1" aria-label="上一页" @click="go(page - 1)">←</button>
       <input v-model.number="targetPage" class="input w-20" type="number" min="1" :max="pages" aria-label="指定页码" @keyup.enter="go(targetPage)" />
-      <button class="btn btn-secondary" aria-label="跳转" @click="go(targetPage)">跳转</button>
-      <button class="btn btn-secondary" :disabled="page >= pages" aria-label="下一页" @click="go(page + 1)">→</button>
-      <button class="btn btn-secondary" :disabled="page >= pages" aria-label="末页" @click="go(pages)">»</button>
+      <button type="button" class="btn btn-secondary" aria-label="跳转" @click="go(targetPage)">跳转</button>
+      <button type="button" class="btn btn-secondary" :disabled="page >= pages" aria-label="下一页" @click="go(page + 1)">→</button>
+      <button type="button" class="btn btn-secondary" :disabled="page >= pages" aria-label="末页" @click="go(pages)">»</button>
     </div>
   </nav>
 </template>

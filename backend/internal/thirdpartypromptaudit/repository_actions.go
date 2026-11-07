@@ -14,11 +14,14 @@ const actionColumns = `id,user_id,job_id,actor_user_id,action_type,rule_snapshot
 
 type rowScanner interface{ Scan(...any) error }
 
-func scanAction(row rowScanner) (*Action, error) {
+// scanAction 读取一条动作；extra 用于在同一查询里追加展示字段。
+func scanAction(row rowScanner, extra ...any) (*Action, error) {
 	var a Action
 	var rule, business, deliveries, attempts string
 	var cacheError *string
-	err := row.Scan(&a.ID, &a.UserID, &a.JobID, &a.ActorUserID, &a.ActionType, &rule, &business, &a.AppliedAt, &a.NotificationStatus, &deliveries, &a.AuthCacheStatus, &cacheError, &a.NextAttemptAt, &a.ClaimGeneration, &a.LeaseUntil, &a.UpdatedAt, &a.ExecutionStatus, &attempts, &a.RequestedAt, &a.CompletedAt)
+	dest := []any{&a.ID, &a.UserID, &a.JobID, &a.ActorUserID, &a.ActionType, &rule, &business, &a.AppliedAt, &a.NotificationStatus, &deliveries, &a.AuthCacheStatus, &cacheError, &a.NextAttemptAt, &a.ClaimGeneration, &a.LeaseUntil, &a.UpdatedAt, &a.ExecutionStatus, &attempts, &a.RequestedAt, &a.CompletedAt}
+	dest = append(dest, extra...)
+	err := row.Scan(dest...)
 	if err != nil {
 		return nil, err
 	}
@@ -37,6 +40,7 @@ func scanAction(row rowScanner) (*Action, error) {
 	}
 	return &a, nil
 }
+
 func (r *Repository) ClaimAction(ctx context.Context) (*Action, error) {
 	a, err := scanAction(r.db.QueryRowContext(ctx, `WITH candidate AS (
  SELECT id FROM sub2api_enhance.third_party_prompt_audit_enforcement_actions

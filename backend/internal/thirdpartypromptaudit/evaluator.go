@@ -95,16 +95,14 @@ func (e *Evaluator) Review(ctx context.Context, job *AuditJob, target *JobTarget
 	if err != nil {
 		return nil, &AuditError{Code: "evaluation_hash_failed", Stage: "config", Message: err.Error()}
 	}
-	if job.ReuseMode != ReuseModeForce {
-		// 复用读取失败可以回退到真实调用；真实调用仍须先完成调用日志持久化。
-		cached, lookupErr := e.repo.FindReusableReview(ctx, target.Hash, evalHash)
-		if lookupErr == nil && cached != nil {
-			// 复用时按当前任务冻结的阈值和聚合规则重新计算结论。
-			decision, _, aggregateErr := aggregateVotes(votesFrom(cached.Nodes, job.Config.Config), job.Config.Config)
-			if aggregateErr == nil {
-				cached.Decision = decision
-				return &reviewOutcome{review: cached, resolution: ResolutionCache}, nil
-			}
+	// 重新审核只复用发起之后产生的结论；业务请求传 nil，行为不变。
+	cached, lookupErr := e.repo.FindReusableReview(ctx, target.Hash, evalHash, job.ReuseAfter)
+	if lookupErr == nil && cached != nil {
+		// 复用时按当前任务冻结的阈值和聚合规则重新计算结论。
+		decision, _, aggregateErr := aggregateVotes(votesFrom(cached.Nodes, job.Config.Config), job.Config.Config)
+		if aggregateErr == nil {
+			cached.Decision = decision
+			return &reviewOutcome{review: cached, resolution: ResolutionCache}, nil
 		}
 	}
 	models := make([]ModelConfig, 0, len(job.Config.Models))

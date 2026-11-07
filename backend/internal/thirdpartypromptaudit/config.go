@@ -45,8 +45,8 @@ const defaultWarningWindow = 10
 // defaultWarningLimit 是默认统计窗口内触发提醒的违规数量。
 const defaultWarningLimit = 2
 
-// defaultDisableLimit 是默认触发用户自动停用的累计违规数量。
-const defaultDisableLimit = 1
+// defaultDisableLimit 是默认触发用户自动停用的累计违规数量（默认 3，已保存配置继续使用存储值）。
+const defaultDisableLimit = 3
 
 // legacyDefaultPolicySHA256 仅识别已发布的旧内置默认值，不能覆盖管理员自定义政策。
 var legacyDefaultPolicySHA256 = map[string]struct{}{
@@ -80,14 +80,12 @@ type DisableConfig struct {
 	Limit   int64 `json:"limit"`
 }
 
+// UserRuleConfig 只覆盖单个用户的处理方式与两个风险阈值，聚合、提醒和停用一律取全局配置。
 type UserRuleConfig struct {
-	UserID          int64         `json:"user_id"`
-	Mode            string        `json:"mode"`
-	ReviewThreshold float64       `json:"review_threshold"`
-	BlockThreshold  float64       `json:"block_threshold"`
-	Aggregation     string        `json:"aggregation"`
-	Warning         WarningConfig `json:"warning"`
-	Disable         DisableConfig `json:"disable"`
+	UserID          int64   `json:"user_id"`
+	Mode            string  `json:"mode"`
+	ReviewThreshold float64 `json:"review_threshold"`
+	BlockThreshold  float64 `json:"block_threshold"`
 }
 
 type Config struct {
@@ -107,6 +105,10 @@ type Config struct {
 	UserRules       []UserRuleConfig `json:"user_rules"`
 	AdminEmail      string           `json:"admin_email"`
 	RetentionDays   int              `json:"retention_days"`
+	// CategoryRules 是违规类别到处置级别的映射，只存在于全局配置。
+	CategoryRules map[string]string `json:"category_rules,omitempty"`
+	// EscalateOnWarning 打开后，提醒触发时把 async 用户加严为 blocking。
+	EscalateOnWarning bool `json:"escalate_on_warning,omitempty"`
 }
 
 type ConfigSnapshot struct {
@@ -185,8 +187,10 @@ type PublicConfig struct {
 	Revision            int64           `json:"revision"`
 	WarningRuleRevision int64           `json:"warning_rule_revision"`
 	HasAPIKeys          map[string]bool `json:"has_api_keys"`
-	UpdatedBy           int64           `json:"updated_by"`
-	UpdatedAt           time.Time       `json:"updated_at"`
+	// BreakerUserThreshold 是只读的指令块熔断用户数阈值，前端据此提示停用阈值风险。
+	BreakerUserThreshold int64     `json:"breaker_user_threshold"`
+	UpdatedBy            int64     `json:"updated_by"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 type KeyUpdate struct {
@@ -207,7 +211,6 @@ type activeConfig struct {
 	Stored storedConfig
 	Keys   map[string]string
 }
-
 type ConfigManager struct {
 	publicOrigin            string
 	reloadMu                sync.Mutex
@@ -219,6 +222,9 @@ type ConfigManager struct {
 	expectedMode            string
 	expectedRevision        int64
 	loadError               error
+	// escalationMu/escalated 保存已自动加严的用户；只影响后续请求的处理方式。
+	escalationMu sync.RWMutex
+	escalated    map[int64]struct{}
 }
 
 func NewConfigManager(db *sql.DB, encryptor appconfig.SecretEncryptor, cfg *appconfig.Config) *ConfigManager {
@@ -260,7 +266,8 @@ func normalizeModelConcurrency(config *Config) {
 	}
 }
 
-// effectiveConfigForUser 将单个用户覆盖合并到全局默认规则，并移除不再需要的覆盖列表。
+// effectiveConfigForUser 只把单个用户的处理方式与两个阈值合并到全局配置。
+// 聚合、提醒和自动停用一律取全局，避免同一份配置在专属规则里出现两套处置语义。
 func effectiveConfigForUser(config Config, userID int64) Config {
 	globalMode := config.Mode
 	for _, rule := range config.UserRules {
@@ -276,7 +283,7 @@ func effectiveConfigForUser(config Config, userID int64) Config {
 				mode = "async"
 			}
 		}
-		config.Mode, config.Aggregation, config.Warning, config.Disable = mode, rule.Aggregation, rule.Warning, rule.Disable
+		config.Mode = mode
 		break
 	}
 	if globalMode == "off" {
@@ -298,16 +305,8 @@ func normalizeUserRuleModes(config *Config) {
 	}
 }
 
-// warningRuleHash 保留全局规则的历史哈希格式，并让用户覆盖只重置自己的提醒窗口。
-func warningRuleHash(config Config, revision, userID int64) (string, error) {
-	for _, rule := range config.UserRules {
-		if rule.UserID == userID {
-			return fingerprint(struct {
-				Rule   WarningConfig
-				UserID int64
-			}{rule.Warning, userID})
-		}
-	}
+// warningRuleHash 让所有用户共用全局提醒窗口规则哈希，专属规则不再单独重置窗口。
+func warningRuleHash(config Config, revision int64) (string, error) {
 	return fingerprint(struct {
 		Rule     WarningConfig
 		Revision int64
@@ -352,14 +351,14 @@ func validateConfig(config Config, activating bool) error {
 			math.IsNaN(rule.BlockThreshold) || math.IsInf(rule.BlockThreshold, 0) || rule.BlockThreshold < 0 || rule.BlockThreshold > 1 || rule.ReviewThreshold > rule.BlockThreshold {
 			return fmt.Errorf("用户 %d 的风险阈值必须满足 0 ≤ 复核阈值 ≤ 阻断阈值 ≤ 1", rule.UserID)
 		}
-		if !slices.Contains([]string{"any_block", "majority_block", "all_block"}, rule.Aggregation) {
-			return fmt.Errorf("用户 %d 的聚合规则无效", rule.UserID)
+	}
+	// 专属规则只覆盖处理方式与阈值，聚合、提醒与停用统一由全局配置约束。
+	for category, disposition := range config.CategoryRules {
+		if !validCategoryCode(category) {
+			return fmt.Errorf("违规类别编号 %q 无效，必须形如 R01", category)
 		}
-		if rule.Warning.Enabled && (rule.Warning.Window < 1 || rule.Warning.Limit < 1 || rule.Warning.Limit > rule.Warning.Window) {
-			return fmt.Errorf("用户 %d 的提醒规则必须满足 1 ≤ 违规条数 ≤ 成功分类窗口", rule.UserID)
-		}
-		if rule.Disable.Enabled && rule.Disable.Limit < 1 {
-			return fmt.Errorf("用户 %d 的自动停用累计阈值必须大于 0", rule.UserID)
+		if disposition != CategoryDispositionImmediateDisable && disposition != CategoryDispositionNoticeOnly {
+			return fmt.Errorf("违规类别 %s 的处置级别无效", category)
 		}
 	}
 	for _, threshold := range []*float64{config.ReviewThreshold, config.BlockThreshold} {
@@ -646,7 +645,71 @@ func (m *ConfigManager) EffectiveModeForUser(userID int64) string {
 	if slices.Contains(m.active.Stored.ExcludedUserIDs, userID) {
 		return "off"
 	}
+	if effectiveConfigForUser(m.active.Stored.Config, userID).Mode == "async" && m.isEscalated(userID) {
+		// 自动加严只把异步审核提升为同步，不修改配置与修订号。
+		return "blocking"
+	}
 	return effectiveConfigForUser(m.active.Stored.Config, userID).Mode
+}
+
+// PublicOrigin 返回增强服务对外地址，用于管理员通知中的后台直达链接。
+func (m *ConfigManager) PublicOrigin() string {
+	if m == nil {
+		return ""
+	}
+	return m.publicOrigin
+}
+
+// SetEscalation 记录或清除用户的自动加严状态。
+func (m *ConfigManager) SetEscalation(userID int64, escalated bool) {
+	if m == nil || userID <= 0 {
+		return
+	}
+	m.escalationMu.Lock()
+	defer m.escalationMu.Unlock()
+	if escalated {
+		if m.escalated == nil {
+			m.escalated = make(map[int64]struct{})
+		}
+		m.escalated[userID] = struct{}{}
+		return
+	}
+	delete(m.escalated, userID)
+}
+
+// isEscalated 判断用户是否已被自动加严。
+func (m *ConfigManager) isEscalated(userID int64) bool {
+	m.escalationMu.RLock()
+	defer m.escalationMu.RUnlock()
+	_, ok := m.escalated[userID]
+	return ok
+}
+
+// LoadEscalation 在启动时把已加严用户加载到进程内集合。
+func (m *ConfigManager) LoadEscalation(ctx context.Context) error {
+	if m == nil || m.db == nil {
+		return nil
+	}
+	rows, err := m.db.QueryContext(ctx, `SELECT user_id FROM sub2api_enhance.third_party_prompt_audit_enforcement_states WHERE escalated_at IS NOT NULL`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	escalated := make(map[int64]struct{})
+	for rows.Next() {
+		var userID int64
+		if err := rows.Scan(&userID); err != nil {
+			return err
+		}
+		escalated[userID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	m.escalationMu.Lock()
+	m.escalated = escalated
+	m.escalationMu.Unlock()
+	return nil
 }
 
 func (m *ConfigManager) IsExcluded(userID int64) bool {
@@ -726,6 +789,7 @@ func publicConfig(stored storedConfig) PublicConfig {
 	result.RuleDefaults.WarningWindow = defaultWarningWindow
 	result.RuleDefaults.WarningLimit = defaultWarningLimit
 	result.RuleDefaults.DisableLimit = defaultDisableLimit
+	result.BreakerUserThreshold = instructionBreakerUserThreshold
 	return result
 }
 

@@ -5,6 +5,10 @@ export type JobStatus = 'queued' | 'processing' | 'retry' | 'done' | 'failed' | 
 export type AuditMode = 'off' | 'async' | 'blocking'
 export type PromptKind = 'instruction' | 'user'
 export type Resolution = 'model' | 'cache' | 'inflight' | 'trust'
+// ReuseMode 是审核轮次的复用方式；fresh 表示只复用本次重审发起之后产生的结论。
+export type ReuseMode = 'allow' | 'force' | 'fresh'
+export type SampleExpected = 'pass' | 'block'
+export type InboxCategoryKey = 'action_failed' | 'notification_failed' | 'breaker_pending' | 'node_unhealthy' | 'failure_rate'
 
 export interface AuditModel {
   id: string
@@ -19,14 +23,12 @@ export interface AuditModel {
   allow_self_audit?: boolean
 }
 
+// UserRuleConfig 只覆盖处理方式与两个阈值；聚合、提醒和停用一律跟随全局配置。
 export interface UserRuleConfig {
   user_id: number
   mode: 'async' | 'blocking'
   review_threshold: number
   block_threshold: number
-  aggregation: 'any_block' | 'majority_block' | 'all_block'
-  warning: { enabled: boolean; window: number; limit: number }
-  disable: { enabled: boolean; limit: number }
 }
 
 export interface AuditConfig {
@@ -47,6 +49,10 @@ export interface AuditConfig {
   admin_email: string
   // retention_days 是审计记录保留天数，1–365，默认 30。
   retention_days: number
+  // category_rules 是违规类别到处置级别的映射（immediate_disable / notice_only）。
+  category_rules: Record<string, string>
+  // escalate_on_warning 表示提醒触发时把 async 用户加严为 blocking。
+  escalate_on_warning: boolean
 }
 
 export interface SavedConfig extends AuditConfig {
@@ -60,10 +66,21 @@ export interface SavedConfig extends AuditConfig {
   updated_by: number
   updated_at: string
   application_error: string
+  // breaker_user_threshold 是指令块熔断的不同用户数阈值，只读，用于提示停用阈值风险。
+  breaker_user_threshold: number
 }
 
 export interface KeyUpdate { model_id: string; action: 'keep' | 'replace' | 'clear'; api_key?: string }
 export interface ConfigUpdate { expected_revision: number; config: AuditConfig; keys: KeyUpdate[]; legacy_policy_confirmed?: boolean }
+
+// ConfigImpact 是保存前的影响估算：只读，不写库也不调用模型。
+export interface ConfigImpact {
+  instruction_changed: boolean
+  user_changed: boolean
+  changed_parts: ('policy' | 'nodes')[]
+  recent_instruction_blocks: number
+  window_hours: number
+}
 
 export interface TemplateRule {
   client: string
@@ -165,6 +182,9 @@ export interface JobTarget {
   error_message?: string
   resolved_at?: string
   trusted: boolean
+  // sampled 表示该目标已加入误判样本集。
+  sampled?: boolean
+  categories?: string[]
   review?: ReviewView
 }
 
@@ -172,10 +192,11 @@ export interface JobRound {
   round: number
   run_kind: 'request' | 'reaudit'
   requested_by: number | null
-  reuse_mode: 'allow' | 'force'
+  reuse_mode: ReuseMode
   decision: AuditDecision
   trigger_hash?: string
   trigger_kind?: PromptKind
+  trigger_categories?: string[]
   config_revision: number | null
   started_at: string | null
   finished_at: string
@@ -200,6 +221,17 @@ export interface AuditAction {
   deliveries: { recipient: string; kind: string; status: string; last_error: string; attempts: unknown[] }[]
 }
 
+// ActionRecord 是 GET /actions 的一行：动作全字段加用户显示名。
+export interface ActionRecord extends AuditAction { username: string }
+export interface ActionFilter {
+  execution_status?: string
+  notification_status?: string
+  action_type?: string
+  user_id?: number
+  from?: string
+  to?: string
+}
+
 export interface AuditJob {
   id: number
   user_id: number
@@ -221,9 +253,13 @@ export interface AuditJob {
   current_round: number
   current_run_kind: 'request' | 'reaudit'
   current_requested_by: number | null
-  reuse_mode: 'allow' | 'force'
+  reuse_mode: ReuseMode
   trigger_hash?: string
   trigger_kind?: PromptKind
+  // trigger_categories 是触发目标的违规类别；升级前的任务为空。
+  trigger_categories?: string[]
+  // sampled 表示该任务已有目标加入误判样本集。
+  sampled?: boolean
   enforcement_eligible: boolean
   violation_counted: boolean
   disable_counted: boolean
@@ -258,6 +294,8 @@ export interface JobPrompt {
   reason?: string
   score: number | null
   trusted: boolean
+  // sampled 表示该目标已加入误判样本集。
+  sampled?: boolean
 }
 
 export interface JobDetail {
@@ -268,7 +306,6 @@ export interface JobDetail {
   actions: AuditAction[]
 }
 
-// ClientChurn 是某客户端指令块唯一哈希占比，用于判断是否需要补模板规则。
 // MetricsHour 是每小时指标快照。
 export interface MetricsHour { hour: string; jobs: number; blocked: number; failed: number; avg_blocking_ms: number | null }
 
@@ -290,6 +327,17 @@ export interface BreakerEntry {
   similar: number
 }
 
+// SimilarBlock 是与指定指令块相似的候选块；只用于逐块查看差异，不做批量信任。
+export interface SimilarBlock {
+  hash: string
+  preview: string
+  bytes: number
+  distance: number
+  breaker_status: string
+  trusted: boolean
+  distinct_users: number
+}
+
 export interface AuditUser {
   id: number
   username: string
@@ -299,6 +347,135 @@ export interface AuditUser {
   disable_violation_count: number
   disable_reset_at: string | null
   action_pending: boolean
+}
+
+// RiskUser 是用户风险榜的一行；统计范围受保留天数限制。
+export interface RiskUser {
+  user_id: number
+  username: string
+  email: string
+  role: string
+  status: string
+  jobs: number
+  blocks: number
+  reviews: number
+  violations: number
+  last_block_at: string | null
+  disable_violation_count: number
+  disable_reset_at: string | null
+  pending_actions: number
+  escalated: boolean
+  categories: string[]
+}
+
+export type RiskUserSort = 'blocks' | 'violations' | 'last_block_at'
+export interface RiskUserQuery { from: string; to: string; sort: RiskUserSort; keyword?: string }
+
+export interface InboxEntry {
+  category: InboxCategoryKey
+  id?: number
+  action_type?: string
+  user_id?: number
+  username?: string
+  job_id?: number | null
+  status?: string
+  detail?: string
+  hash?: string
+  occurred_at: string
+}
+
+export interface InboxCategory { key: InboxCategoryKey; count: number; items: InboxEntry[] }
+
+export interface FailureRateSnapshot {
+  window_minutes: number
+  jobs: number
+  failed: number
+  rate: number
+  threshold: number
+  min_jobs: number
+  exceeded: boolean
+}
+
+export interface Inbox {
+  total: number
+  action_failed: number
+  notification_failed: number
+  breaker_pending: number
+  node_unhealthy: number
+  failure_rate?: FailureRateSnapshot
+  categories: InboxCategory[]
+}
+
+export interface CostBucket {
+  bucket: string
+  model_id: string
+  // node_name 优先取当前配置名称，配置已删除时回退到调用快照。
+  node_name: string
+  call_kind: 'audit' | 'probe' | 'health_probe'
+  stage: string
+  calls: number
+  succeeded: number
+  input_tokens: number
+  output_tokens: number
+  unknown_usage: number
+  p50_latency_ms: number | null
+}
+
+export interface CostReuse { kind: PromptKind; resolution: Resolution; targets: number }
+
+export interface CostReport {
+  from: string
+  to: string
+  bucket: 'day' | 'hour'
+  timezone: string
+  buckets: CostBucket[]
+  reuse: CostReuse[]
+}
+
+export interface Sample {
+  id: number
+  hash: string
+  kind: PromptKind
+  expected: SampleExpected
+  note: string
+  source_job_id?: number
+  created_by: number
+  created_at: string
+  updated_at: string
+  preview: string
+}
+
+export interface SampleInput { job_id: number; target_order: number; expected: SampleExpected; note?: string }
+
+export interface ReplayNodeResult {
+  model_id: string
+  model_name: string
+  score: number | null
+  decision: string
+  reason: string
+  error?: string
+}
+
+export interface PolicyReplayResult {
+  sample_id: number
+  expected: SampleExpected
+  actual: string
+  score: number | null
+  categories: string[]
+  nodes: ReplayNodeResult[]
+  error?: string
+}
+
+export interface PolicyReplay {
+  id: number
+  status: 'running' | 'done' | 'failed' | 'interrupted'
+  config_snapshot: string
+  sample_ids: number[]
+  results: PolicyReplayResult[]
+  error_message: string
+  created_by: number
+  created_at: string
+  finished_at: string | null
 }
 
 export interface AuditPage<T> { items: T[]; total: number; page: number; page_size: number }
@@ -316,9 +493,11 @@ export interface AuditFilter {
   platform?: string
   request_id?: string
   model?: string
+  // category 按 trigger_categories 过滤，形如 R07。
+  category?: string
 }
-export interface ReauditRequest { reuse_mode?: 'allow' | 'force'; filter: AuditFilter }
-export interface ReauditResult { matched: number; ready: number; items: { job_id: number; status: string; reason: string }[] }
+export interface ReauditRequest { filter: AuditFilter }
+export interface ReauditResult { matched: number; ready: number; estimated_targets: number; items: { job_id: number; status: string; reason: string }[] }
 
 export interface Distribution { count: number; p50_ms: number | null; p95_ms: number | null }
 export interface ClientMissRate { client: string; kind: PromptKind; targets: number; model_calls: number; miss_rate: number }
@@ -336,8 +515,6 @@ export interface RetentionRecord {
   processing_ms: number
   error: string
 }
-
-export interface DrillResult { hash: string; threshold: number; steps: string[]; tripped: boolean }
 
 export interface AuditRuntime {
   warning_enabled: boolean
@@ -397,13 +574,19 @@ export interface AuditStats extends StatsQuery {
   processing_p50_ms: number | null
   processing_p95_ms: number | null
   cache_miss: ClientMissRate[]
+  // category_recognition 按节点模型统计 block/review 目标的类别识别率。
+  category_recognition: CategoryRecognition[]
 }
+
+export interface CategoryRecognition { model_id: string; total: number; recognized: number; rate: number }
 
 const base = '/admin/third-party-prompt-audit'
 
 export const thirdPartyPromptAuditAPI = {
   async getConfig() { return (await apiClient.get<SavedConfig>(`${base}/config`)).data },
   async saveConfig(value: ConfigUpdate) { return (await apiClient.put<SavedConfig>(`${base}/config`, value)).data },
+  // configImpact 只做保存前的影响估算，失败不影响保存。
+  async configImpact(value: AuditConfig) { return (await apiClient.post<ConfigImpact>(`${base}/config/impact`, value)).data },
   async testAdminEmail() { return (await apiClient.post(`${base}/test-email`)).data },
   async getContract() { return (await apiClient.get<Contract>(`${base}/contract`)).data },
   async listModels(value: { model_id: string; base_url: string; timeout_ms: number; key_action: 'keep' | 'replace'; api_key?: string }) {
@@ -416,9 +599,16 @@ export const thirdPartyPromptAuditAPI = {
   async probeDetails(id: number) { return (await apiClient.get<ModelAttempt[]>(`${base}/models/probes/${id}`)).data },
   async groups() { return (await apiClient.get<Record<string, unknown>[]>(`${base}/groups`)).data },
   async users() { return (await apiClient.get<AuditUser[]>(`${base}/users`)).data },
-  async userKeys(id: number) { return (await apiClient.get<{ id: number; name: string }[]>(`${base}/users/${id}/api-keys`)).data },
   async runtime() { return (await apiClient.get<AuditRuntime>(`${base}/runtime`)).data },
   async stats(params: StatsQuery) { return (await apiClient.get<AuditStats>(`${base}/stats`, { params })).data },
+  async cost(params: StatsQuery & { bucket: 'day' | 'hour' }) { return (await apiClient.get<CostReport>(`${base}/stats/cost`, { params })).data },
+  async inbox() { return (await apiClient.get<Inbox>(`${base}/inbox`)).data },
+  async riskUsers(query: RiskUserQuery, page = 1, pageSize = 20) {
+    return (await apiClient.get<AuditPage<RiskUser>>(`${base}/users/risk`, { params: { ...query, page, page_size: pageSize } })).data
+  },
+  async actions(filter: ActionFilter, page = 1, pageSize = 20) {
+    return (await apiClient.get<AuditPage<ActionRecord>>(`${base}/actions`, { params: { ...filter, page, page_size: pageSize } })).data
+  },
   async jobs(filter: AuditFilter, page = 1, pageSize = 20) {
     return (await apiClient.get<AuditPage<AuditJob>>(`${base}/jobs`, { params: { ...filter, ids: filter.ids?.join(','), page, page_size: pageSize } })).data
   },
@@ -439,13 +629,27 @@ export const thirdPartyPromptAuditAPI = {
   async breakerList(status = '', page = 1, pageSize = 20, q = '') {
     return (await apiClient.get<AuditPage<BreakerEntry>>(`${base}/breakers`, { params: { status, page, page_size: pageSize, q } })).data
   },
+  async similarBlocks(hash: string) { return (await apiClient.get<{ items: SimilarBlock[] }>(`${base}/breakers/${hash}/similar`)).data },
   async confirmBreaker(hash: string) { return (await apiClient.post(`${base}/breakers/${hash}/confirm`)).data },
-  async drillBreaker(hash: string) { return (await apiClient.post<DrillResult>(`${base}/breakers/drill`, { hash })).data },
   async trustBatch(hashes: string[], reason = '') { return (await apiClient.post<{ trusted: string[] }>(`${base}/trust/batch`, { hashes, reason })).data },
   async exportJobs(filter: AuditFilter, limit = 1000, offset = 0) {
     const response = await apiClient.get(`${base}/jobs/export`, { params: { ...filter, ids: filter.ids?.join(','), limit, offset }, responseType: 'blob', headers: { 'X-Enhance-Request': '1' } })
     return { blob: response.data as Blob, hasMore: response.headers['x-export-has-more'] === 'true' }
   },
-  async enableAndReset(id: number) { return (await apiClient.post<{ action_id: number; execution_status: string }>(`${base}/users/${id}/enable-and-reset`)).data },
-  async retryAction(id: number) { return (await apiClient.post(`${base}/actions/${id}/retry`)).data }
+  async enableAndReset(id: number) { return (await apiClient.post<{ action_id: number; execution_status: string; escalation_cleared: boolean }>(`${base}/users/${id}/enable-and-reset`)).data },
+  async clearEscalation(id: number) { return (await apiClient.post<{ user_id: number; action_id: number }>(`${base}/users/${id}/clear-escalation`)).data },
+  async retryAction(id: number) { return (await apiClient.post(`${base}/actions/${id}/retry`)).data },
+  async samples(params: { kind?: string; expected?: string }, page = 1, pageSize = 20) {
+    return (await apiClient.get<AuditPage<Sample>>(`${base}/samples`, { params: { ...params, page, page_size: pageSize } })).data
+  },
+  async createSample(value: SampleInput) { return (await apiClient.post<Sample>(`${base}/samples`, value)).data },
+  async updateSample(id: number, value: { expected: SampleExpected; note: string }) {
+    return (await apiClient.patch<{ id: number }>(`${base}/samples/${id}`, value)).data
+  },
+  async deleteSample(id: number) { return (await apiClient.delete<{ id: number }>(`${base}/samples/${id}`)).data },
+  async startReplay(config: AuditConfig, sampleIDs: number[]) {
+    return (await apiClient.post<PolicyReplay>(`${base}/policy/replays`, { config, sample_ids: sampleIDs })).data
+  },
+  async replays(limit = 20) { return (await apiClient.get<{ items: PolicyReplay[] }>(`${base}/policy/replays`, { params: { limit } })).data },
+  async replay(id: number) { return (await apiClient.get<PolicyReplay>(`${base}/policy/replays/${id}`)).data },
 }
