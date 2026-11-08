@@ -13,6 +13,8 @@ export type InboxCategoryKey = 'action_failed' | 'notification_failed' | 'breake
 export interface AuditModel {
   id: string
   name: string
+  // note 是节点备注，不参与调度与健康判断。
+  note?: string
   enabled: boolean
   base_url: string
   model: string

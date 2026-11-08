@@ -30,8 +30,9 @@ const configLockKey int64 = 579147893221901941
 // DefaultNodeTimeoutMS 为新增节点提供默认总审核预算，已有节点必须显式提交超时。
 const DefaultNodeTimeoutMS = 300000
 
-// DefaultNodeMaxConcurrency 保持单个节点相对既有默认 Worker 的安全并发上限。
-const DefaultNodeMaxConcurrency = 4
+// DefaultNodeMaxConcurrency 是新增节点的默认最大并发数：与默认 Worker 数一致，
+// 单节点即可吃满一个审核实例而不至于把上游打满。
+const DefaultNodeMaxConcurrency = 10
 
 // defaultReviewThreshold 是新配置默认触发指令关联裁决和待复核的风险分数。
 const defaultReviewThreshold = 0.5
@@ -59,8 +60,10 @@ var legacyDefaultPolicySHA256 = map[string]struct{}{
 type ModelConfig struct {
 	ID string `json:"id"`
 	// AllowSelfAudit 允许把审核节点指向本机/内网网关；默认拒绝，避免审核模型与被审模型同源。
-	AllowSelfAudit bool           `json:"allow_self_audit,omitempty"`
-	Name           string         `json:"name"`
+	AllowSelfAudit bool   `json:"allow_self_audit,omitempty"`
+	Name           string `json:"name"`
+	// Note 是节点备注，用于区分同一节点的不同用途；不参与调度与健康判断。
+	Note           string         `json:"note,omitempty"`
 	Enabled        bool           `json:"enabled"`
 	BaseURL        string         `json:"base_url"`
 	Model          string         `json:"model"`
@@ -438,6 +441,9 @@ func privateNodeHost(raw string) bool {
 func validateModel(model ModelConfig) error {
 	if model.Model == "" || model.Name == "" {
 		return errors.New("节点名称和模型名不能为空")
+	}
+	if len([]rune(model.Note)) > 200 {
+		return errors.New("节点备注不能超过 200 个字符")
 	}
 	if model.TimeoutMS <= 0 || int64(model.TimeoutMS) > math.MaxInt64/int64(time.Millisecond) {
 		return errors.New("节点超时必须是有效的正毫秒数")

@@ -53,7 +53,9 @@ type AuditJob struct {
 	CurrentRequestedBy *int64   `json:"current_requested_by"`
 	ReuseMode          string   `json:"reuse_mode"`
 	// ReuseAfter 是重新审核的发起时间；fresh 轮次只复用该时间之后产生的结论。
-	ReuseAfter          *time.Time     `json:"reuse_after,omitempty"`
+	ReuseAfter *time.Time `json:"reuse_after,omitempty"`
+	// AutoRetryCount 是已执行的失败自动重试次数；每次重排把 attempts 归零，最多 3 次。
+	AutoRetryCount      int            `json:"auto_retry_count"`
 	TriggerHash         string         `json:"trigger_hash,omitempty"`
 	TriggerKind         string         `json:"trigger_kind,omitempty"`
 	TriggerCategories   []string       `json:"trigger_categories,omitempty"`

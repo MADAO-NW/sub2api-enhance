@@ -42,7 +42,7 @@ func TestNodeDefaultsAndTimeoutRepresentation(t *testing.T) {
 	require.EqualValues(t, instructionBreakerUserThreshold, publicConfig(storedConfig{}).BreakerUserThreshold)
 	model := testConfig().Models[0]
 	require.Equal(t, 300000, publicConfig(storedConfig{}).ModelDefaults.TimeoutMS)
-	require.Equal(t, 4, publicConfig(storedConfig{}).ModelDefaults.MaxConcurrency)
+	require.Equal(t, 10, publicConfig(storedConfig{}).ModelDefaults.MaxConcurrency)
 	oldConfig := Config{Models: []ModelConfig{{ID: "old", Name: "old", Model: "old", BaseURL: "https://example.invalid", TimeoutMS: 1000}}}
 	normalizeModelConcurrency(&oldConfig)
 	require.Equal(t, DefaultNodeMaxConcurrency, oldConfig.Models[0].MaxConcurrency)

@@ -141,7 +141,14 @@ async function submit() {
     const failures = preview.value.items.filter(item => item.status === 'failed').length
     const requeued = preview.value.items.filter(item => item.status === 'requeued').length
     const ids = preview.value.items.flatMap(item => ['requeued', 'already_running'].includes(item.status) ? [item.job_id] : [])
-    if (ids.length) emit('reaudit-created', ids)
+    if (ids.length) {
+      // 复核后这些任务已进入排队/处理中：筛选切换到任务本身并清掉状态条件，
+      // 否则原来的 status=failed 会把刚提交的列表刷空。
+      applied.value = { ids, ...(applied.value.from ? { from: applied.value.from } : {}), ...(applied.value.to ? { to: applied.value.to } : {}) }
+      for (const key of Object.keys(filters)) delete filters[key as keyof AuditFilter]
+      page.value = 1
+      emit('reaudit-created', ids)
+    }
     if (failures) app.showError(`${label('createdJobs')}: ${requeued} · ${label('failed')}: ${failures}`)
     else app.showSuccess(`${label('createdJobs')}: ${requeued}`)
     await load()

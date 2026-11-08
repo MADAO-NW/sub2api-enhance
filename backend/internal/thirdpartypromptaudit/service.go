@@ -718,13 +718,51 @@ func (s *Service) finishFailure(ctx context.Context, job *AuditJob, failure *Aud
 	}
 	retry := (job.Mode == "async" || job.runKind() == RunKindReaudit) && failure.Retryable &&
 		(job.Attempts < job.MaxAttempts || failure.Code == "audit_paused" || failure.Code == "worker_paused")
+	// 自动重试：本轮预算耗尽或不能立即重试时，按 1/5/15 分钟退避重排，最多 3 次。
+	// 没有健康节点时保持失败，等节点恢复后由管理员重新审核。
+	autoRetry := !retry && failure.Retryable && job.AutoRetryCount < autoRetryLimit && s.hasHealthyNode()
 	s.noteError(failure.Code, failure)
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistenceTimeout)
 	defer cancel()
+	if autoRetry {
+		if err := s.repo.AutoRetryAuditJob(persistCtx, job, failure, autoRetryDelay(job.AutoRetryCount)); err != nil {
+			s.noteError("job_auto_retry_failed", err)
+		}
+		return failure
+	}
 	if err := s.repo.FailAuditJob(persistCtx, job, failure, retry); err != nil {
 		s.noteError("job_failure_persist_failed", err)
 	}
 	return failure
+}
+
+// autoRetryLimit 是失败任务自动重试的最大次数；间隔依次为 1、5、15 分钟。
+const autoRetryLimit = 3
+
+// autoRetryDelay 返回第 count 次自动重试前的等待时间（count 从 0 开始）。
+func autoRetryDelay(count int) time.Duration {
+	switch count {
+	case 0:
+		return time.Minute
+	case 1:
+		return 5 * time.Minute
+	default:
+		return 15 * time.Minute
+	}
+}
+
+// hasHealthyNode 判断是否存在可调度的健康节点；没有健康节点时暂停自动重试。
+func (s *Service) hasHealthyNode() bool {
+	snapshot, err := s.config.Active()
+	if err != nil {
+		return false
+	}
+	for _, node := range s.evaluator.nodeScheduler().runtime(snapshot.Models).Nodes {
+		if node.Health == nodeHealthHealthy {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) heartbeat(ctx context.Context, cancel context.CancelCauseFunc, renew func(context.Context) error) <-chan struct{} {

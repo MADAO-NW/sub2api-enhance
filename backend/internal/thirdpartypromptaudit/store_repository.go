@@ -15,7 +15,7 @@ import (
 // auditJobColumns 是任务列表与详情共用的投影；展示用户名优先读取当前用户资料。
 const auditJobColumns = `j.id,j.user_id,j.api_key_id,j.group_id,j.identity_snapshot,j.platform,j.request_id,j.model,j.protocol,j.client_fingerprint,j.mode,
 j.turn_fingerprint,j.orphan_continuation,j.status,COALESCE(j.decision,'') AS decision,j.current_round,j.current_run_kind,j.current_requested_by,j.reuse_mode,
-COALESCE(j.trigger_hash,'') AS trigger_hash,COALESCE(j.trigger_kind,'') AS trigger_kind,COALESCE(j.trigger_categories,'{}') AS trigger_categories,j.reuse_after,j.enforcement_eligible,j.violation_counted,j.disable_counted,
+COALESCE(j.trigger_hash,'') AS trigger_hash,COALESCE(j.trigger_kind,'') AS trigger_kind,COALESCE(j.trigger_categories,'{}') AS trigger_categories,j.reuse_after,j.auto_retry_count,j.enforcement_eligible,j.violation_counted,j.disable_counted,
 j.config_revision,j.config_snapshot,j.attempts,j.max_attempts,j.claim_generation,j.lease_until,j.next_attempt_at,COALESCE(j.failure_stage,'') AS failure_stage,
 COALESCE(j.last_error_code,'') AS last_error_code,COALESCE(j.last_error_message,'') AS last_error_message,j.blocking_wait_ms,
 COALESCE((EXTRACT(EPOCH FROM (j.finished_at-j.created_at))*1000)::bigint,0) AS duration_ms,
@@ -248,6 +248,32 @@ func (r *Repository) FailAuditJob(ctx context.Context, job *AuditJob, failure *A
 	}
 	logger.LegacyPrintf("third_party_prompt_audit", "审核任务本轮处理结束 job_id=%d status=%s failure_stage=%s error_code=%s error=%s", job.ID, status, failure.Stage, failure.Code, failure.Message)
 	return nil
+}
+
+// AutoRetryAuditJob 在失败后按退避计划重排一次执行：状态回 retry、attempts 归零、累计自动重试次数。
+// 仅在失败可重试且存在健康节点时调用；重排后仍保留失败阶段与错误码，便于列表展示最近一次失败。
+func (r *Repository) AutoRetryAuditJob(ctx context.Context, job *AuditJob, failure *AuditError, delay time.Duration) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.model_attempts SET
+ status=CASE WHEN dispatch_started_at IS NULL THEN 'failed' ELSE 'unknown' END,
+ error_code=CASE WHEN dispatch_started_at IS NULL THEN 'not_dispatched' ELSE 'result_unconfirmed' END,
+ error_message=$3,finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE job_id=$1 AND audit_round=$2 AND status IN ('prepared','started')`,
+		job.ID, job.CurrentRound, encodeStoredText(failure.Message)); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE sub2api_enhance.audit_jobs SET status='retry',attempts=0,auto_retry_count=auto_retry_count+1,
+ failure_stage=$3,last_error_code=$4,last_error_message=$5,next_attempt_at=clock_timestamp()+$6::interval,
+ finished_at=NULL,lease_until=NULL,updated_at=clock_timestamp()
+ WHERE id=$1 AND claim_generation=$2 AND status='processing' AND lease_until>clock_timestamp()`,
+		job.ID, job.ClaimGeneration, failure.Stage, failure.Code, encodeStoredText(failure.Message), interval(delay))
+	if err := checkLeaseUpdate(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // DeferAuditJob 在首个模型请求前遇到容量满载或冷却时退回队列，并撤销本次执行计数。

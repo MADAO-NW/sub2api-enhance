@@ -362,3 +362,11 @@ func TestReusableFlightRespectsReuseAfter(t *testing.T) {
 	earlier := started.Add(-time.Second)
 	require.True(t, reusableFlight(&AuditJob{ReuseAfter: &earlier}, flight))
 }
+
+// 自动重试间隔按次数递增：1、5、15 分钟，最多 3 次。
+func TestAutoRetryDelaySequence(t *testing.T) {
+	require.Equal(t, time.Minute, autoRetryDelay(0))
+	require.Equal(t, 5*time.Minute, autoRetryDelay(1))
+	require.Equal(t, 15*time.Minute, autoRetryDelay(2))
+	require.Equal(t, 3, autoRetryLimit)
+}
