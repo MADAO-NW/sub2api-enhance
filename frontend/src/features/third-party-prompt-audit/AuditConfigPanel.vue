@@ -9,7 +9,7 @@ import { getAll } from '@/api/admin/groups'
 import type { AdminGroup } from '@/types'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
-import { configUpdate, editableConfig, formatTime } from './viewModel'
+import { configUpdate, editableConfig, formatTime, parametersText, parseParameters } from './viewModel'
 import { useAuditLabels } from './labels'
 import { categoryOptions, categoryText, loadCategoryNames } from './categories'
 
@@ -40,9 +40,9 @@ const probeProtocol = ref('openai_responses')
 const probeScenario = ref('coercive_adult_fiction')
 const customProbeInput = ref('')
 const structuredProbeInput = ref('')
-// 节点配置整块编辑：每个节点一份 JSON 文本与错误信息，字段与后端 ModelConfig 一致（不含 id 与凭据）。
-const nodeTexts = reactive<Record<string, string>>({})
-const nodeErrors = reactive<Record<string, string>>({})
+// 节点高级参数就地解析：每个节点一份 JSON 文本与错误信息；固定字段仍用上方表单填写。
+const parameterTexts = reactive<Record<string, string>>({})
+const parameterErrors = reactive<Record<string, string>>({})
 const expandedModelIDs = ref<string[]>([])
 const loading = ref(false)
 const saving = ref(false)
@@ -76,7 +76,7 @@ const blockPercent = computed({
   get: () => draft.value?.block_threshold == null ? '' : draft.value.block_threshold * 100,
   set: (value: number | '') => { if (draft.value) draft.value.block_threshold = value === '' ? null : value / 100 }
 })
-const configInvalid = computed(() => Object.keys(nodeErrors).length > 0)
+const parameterInvalid = computed(() => Object.keys(parameterErrors).length > 0)
 // 停用阈值低于指令块熔断阈值时，被误判的共享指令块会先停用第一个用户。
 const disableWarning = computed(() => {
   const threshold = saved.value?.breaker_user_threshold ?? 0
@@ -145,49 +145,59 @@ function restore() {
   for (const id of Object.keys(keys)) delete keys[id]
   for (const id of Object.keys(modelOptions)) delete modelOptions[id]
   for (const id of Object.keys(modelListErrors)) delete modelListErrors[id]
-  for (const id of Object.keys(nodeTexts)) delete nodeTexts[id]
-  for (const id of Object.keys(nodeErrors)) delete nodeErrors[id]
+  for (const id of Object.keys(parameterTexts)) delete parameterTexts[id]
+  for (const id of Object.keys(parameterErrors)) delete parameterErrors[id]
   for (const model of draft.value.models) {
     keys[model.id] = { model_id: model.id, action: 'keep', api_key: '' }
     modelOptions[model.id] = model.model ? [model.model] : []
-    nodeTexts[model.id] = nodeConfigText(model)
+    parameterTexts[model.id] = parametersText(model.parameters)
   }
 }
-// nodeConfigText 把节点配置序列化成可编辑 JSON；id 与凭据单独维护，不放进文本。
-function nodeConfigText(model: AuditModel): string {
-  return JSON.stringify({
-    name: model.name, note: model.note ?? '', enabled: model.enabled, base_url: model.base_url, model: model.model,
-    timeout_ms: model.timeout_ms, max_concurrency: model.max_concurrency, allow_self_audit: model.allow_self_audit === true,
-    parameters: model.parameters ?? {},
-  }, null, 2)
-}
-// updateNodeConfig 就地解析整块节点配置；字段缺失、类型不对或不是 JSON 对象时禁止保存。
-function updateNodeConfig(id: string, text: string) {
-  nodeTexts[id] = text
-  const target = draft.value?.models.find(item => item.id === id)
-  if (!target) return
-  let raw: unknown
-  try { raw = JSON.parse(text) } catch { nodeErrors[id] = label('nodeConfigInvalidJSON'); return }
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) { nodeErrors[id] = label('nodeConfigInvalidJSON'); return }
-  const value = raw as Record<string, unknown>
-  const name = String(value.name ?? '').trim()
-  const model = String(value.model ?? '').trim()
-  const baseURL = String(value.base_url ?? '').trim()
-  const timeout = Number(value.timeout_ms)
-  const concurrency = Number(value.max_concurrency)
-  const parameters = value.parameters
-  if (!name || !model || !baseURL) { nodeErrors[id] = label('nodeConfigRequired'); return }
-  if (!Number.isFinite(timeout) || timeout <= 0 || !Number.isFinite(concurrency) || concurrency <= 0) { nodeErrors[id] = label('nodeConfigNumbers'); return }
-  if (parameters !== undefined && (typeof parameters !== 'object' || parameters === null || Array.isArray(parameters))) {
-    nodeErrors[id] = label('nodeConfigParameters')
+// updateParameters 就地解析节点高级参数；非 JSON 对象或覆盖固定字段时禁止保存。
+function updateParameters(id: string, text: string) {
+  parameterTexts[id] = text
+  const model = draft.value?.models.find(item => item.id === id)
+  if (!model) return
+  const result = parseParameters(text)
+  if (result.error) {
+    parameterErrors[id] = result.field ? `${label(result.error)}: ${result.field}` : label(result.error)
     return
   }
-  delete nodeErrors[id]
-  Object.assign(target, {
-    name, note: String(value.note ?? '').slice(0, 200), enabled: value.enabled !== false, base_url: baseURL, model,
-    timeout_ms: Math.trunc(timeout), max_concurrency: Math.trunc(concurrency), allow_self_audit: value.allow_self_audit === true,
-    parameters: (parameters as Record<string, unknown> | undefined) ?? {},
-  })
+  delete parameterErrors[id]
+  model.parameters = result.value ?? {}
+}
+// importNodeFile 用配置文件做高级设置：对象含固定字段时先填字段，再替换 parameters；
+// 只给参数表时按高级参数处理。文件只读本地选择，不发起请求。
+async function importNodeFile(id: string, event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  const model = draft.value?.models.find(item => item.id === id)
+  if (!model) return
+  let raw: unknown
+  try { raw = JSON.parse(await file.text()) } catch { parameterErrors[id] = label('nodeConfigInvalidJSON'); return }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) { parameterErrors[id] = label('nodeConfigInvalidJSON'); return }
+  const value = raw as Record<string, unknown>
+  const known = ['name', 'note', 'base_url', 'model', 'timeout_ms', 'max_concurrency', 'allow_self_audit', 'parameters']
+  const hasFields = known.some(key => key in value)
+  const parameters = hasFields ? value.parameters : value
+  if (parameters !== undefined && (typeof parameters !== 'object' || parameters === null || Array.isArray(parameters))) {
+    parameterErrors[id] = label('nodeConfigParameters')
+    return
+  }
+  if (hasFields) {
+    if (typeof value.name === 'string' && value.name.trim()) model.name = value.name.trim()
+    if (typeof value.note === 'string') model.note = value.note.slice(0, 200)
+    if (typeof value.base_url === 'string' && value.base_url.trim()) model.base_url = value.base_url.trim()
+    if (typeof value.model === 'string' && value.model.trim()) model.model = value.model.trim()
+    if (Number(value.timeout_ms) > 0) model.timeout_ms = Math.trunc(Number(value.timeout_ms))
+    if (Number(value.max_concurrency) > 0) model.max_concurrency = Math.trunc(Number(value.max_concurrency))
+    if (typeof value.allow_self_audit === 'boolean') model.allow_self_audit = value.allow_self_audit
+  }
+  model.parameters = (parameters as Record<string, unknown> | undefined) ?? {}
+  delete parameterErrors[id]
+  parameterTexts[id] = parametersText(model.parameters)
 }
 // copyModel 复制节点配置（不复制凭据）：新 id、名称加“副本”，紧随原节点插入并展开。
 function copyModel(index: number) {
@@ -201,7 +211,7 @@ function copyModel(index: number) {
   expandedModelIDs.value.push(id)
   keys[id] = { model_id: id, action: 'keep', api_key: '' }
   modelOptions[id] = source.model ? [source.model] : []
-  nodeTexts[id] = nodeConfigText(copy)
+  parameterTexts[id] = parametersText(copy.parameters ?? {})
 }
 function updateKey(modelID: string, value: string) {
   keys[modelID] = { model_id: modelID, action: value ? 'replace' : 'keep', api_key: value }
@@ -235,7 +245,7 @@ function addModel() {
   expandedModelIDs.value.push(id)
   keys[id] = { model_id: id, action: 'keep', api_key: '' }
   modelOptions[id] = []
-  nodeTexts[id] = nodeConfigText(model)
+  parameterTexts[id] = parametersText({})
 }
 function setModelExpanded(id: string, expanded: boolean) {
   expandedModelIDs.value = expanded ? Array.from(new Set([...expandedModelIDs.value, id])) : expandedModelIDs.value.filter(value => value !== id)
@@ -299,8 +309,8 @@ function removeModel(id: string) {
   delete modelOptions[id]
   delete modelListErrors[id]
   delete probes[id]
-  delete nodeTexts[id]
-  delete nodeErrors[id]
+  delete parameterTexts[id]
+  delete parameterErrors[id]
   syncModelNames()
 }
 // 专属规则只覆盖处理方式与两个阈值；聚合、提醒与停用一律跟随全局。
@@ -366,7 +376,7 @@ function describeDiff(): string[] {
 }
 async function save() {
   if (!draft.value || !saved.value) return
-  if (configInvalid.value) { app.showError(Object.values(nodeErrors)[0] ?? label('nodeConfigInvalid')); return }
+  if (parameterInvalid.value) { app.showError(Object.values(parameterErrors)[0] ?? label('nodeParametersInvalid')); return }
   pendingChanges.value = describeDiff()
   if (pendingChanges.value.length === 0) return
   legacyConfirmed.value = false
@@ -466,12 +476,29 @@ watch(() => props.refreshKey, () => { void load(true) })
 		  <details v-for="(model, index) in draft.models" :key="model.id" class="rounded-xl border border-gray-200 p-4 dark:border-dark-600" data-test="model-card" :open="expandedModelIDs.includes(model.id)" @toggle="setModelExpanded(model.id, ($event.target as HTMLDetailsElement).open)">
 			<summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3"><label class="flex items-center gap-2" @click.stop><input v-model="model.enabled" type="checkbox" :data-model-id="model.id" />#{{ index + 1 }} · {{ label('enabled') }}</label><div class="min-w-0 flex-1"><strong class="block truncate">{{ model.name || label('chooseModel') }}</strong><span class="block truncate text-xs text-gray-500"><template v-if="model.note">{{ model.note }} · </template>{{ model.base_url || '—' }} · {{ label(saved.has_api_keys[model.id] ? 'keyPresent' : 'keyAbsent') }}</span></div><div class="flex gap-2" @click.stop><button type="button" class="btn btn-ghost" data-test="copy-model" @click="copyModel(index)">{{ label('copyNode') }}</button><button type="button" class="btn btn-ghost" :disabled="index === 0" @click="moveModel(index, -1)">{{ label('moveUp') }}</button><button type="button" class="btn btn-ghost" :disabled="index === draft.models.length - 1" @click="moveModel(index, 1)">{{ label('moveDown') }}</button><button type="button" class="btn btn-ghost text-red-600" @click="removeModel(model.id)">{{ label('remove') }}</button></div></summary>
 			<div class="mt-4 space-y-4">
-            <label class="block space-y-2"><span class="text-sm">{{ label('nodeConfig') }}</span>
-              <textarea :value="nodeTexts[model.id] ?? ''" class="input min-h-48 font-mono text-xs" spellcheck="false" data-test="node-config"
-                @input="updateNodeConfig(model.id, ($event.target as HTMLTextAreaElement).value)" />
-              <span class="block text-xs text-gray-500 dark:text-dark-400">{{ label('nodeConfigHint') }}</span>
+            <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+              <label class="space-y-2"><span class="text-sm">{{ label('name') }}</span><input v-model="model.name" class="input" required /></label>
+              <label class="space-y-2"><span class="text-sm">{{ label('note') }}</span><input v-model="model.note" class="input" maxlength="200" data-test="model-note" /></label>
+              <label class="space-y-2"><span class="text-sm">{{ label('baseURL') }}</span><input v-model="model.base_url" class="input" type="url" required /></label>
+              <label class="space-y-2"><span class="text-sm">{{ label('model') }}</span><input v-model="model.model" class="input" required :list="`audit-models-${model.id}`" :placeholder="label('chooseOrInputModel')" data-test="model-input" /><datalist :id="`audit-models-${model.id}`"><option v-for="option in modelOptions[model.id] ?? []" :key="option" :value="option" /></datalist></label>
+              <label class="space-y-2"><span class="text-sm">{{ label('timeout') }}</span><input v-model.number="model.timeout_ms" class="input" type="number" min="1" step="1" required /></label>
+              <label class="space-y-2"><span class="text-sm">{{ label('nodeMaxConcurrency') }}</span><input v-model.number="model.max_concurrency" class="input" type="number" min="1" step="1" required /></label>
+              <label class="flex items-center gap-2 self-end pb-3 text-sm"><input v-model="model.allow_self_audit" type="checkbox" />{{ label('allowSelfAudit') }}</label>
+            </div>
+            <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('timeoutHint') }}</p>
+            <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('nodeConcurrencyHint') }}</p>
+            <label class="block space-y-2"><span class="text-sm">{{ label('nodeParameters') }}</span>
+              <textarea :value="parameterTexts[model.id] ?? ''" class="input min-h-24 font-mono text-xs" spellcheck="false" data-test="node-parameters"
+                @input="updateParameters(model.id, ($event.target as HTMLTextAreaElement).value)" />
+              <span class="block text-xs text-gray-500 dark:text-dark-400">{{ label('nodeParametersHint') }}</span>
             </label>
-            <p v-if="nodeErrors[model.id]" class="text-sm text-red-600 dark:text-red-400" role="alert" data-test="node-config-error">{{ nodeErrors[model.id] }}</p>
+            <div class="flex flex-wrap items-center gap-3 text-sm">
+              <label class="btn btn-secondary btn-sm cursor-pointer">{{ label('importNodeFile') }}
+                <input type="file" accept="application/json,.json" class="hidden" data-test="node-config-file" @change="importNodeFile(model.id, $event)" />
+              </label>
+              <span class="text-xs text-gray-500 dark:text-dark-400">{{ label('importNodeFileHint') }}</span>
+            </div>
+            <p v-if="parameterErrors[model.id]" class="text-sm text-red-600 dark:text-red-400" role="alert" data-test="node-parameters-error">{{ parameterErrors[model.id] }}</p>
             <label v-if="keys[model.id]" class="block space-y-2"><span class="text-sm">{{ label('credential') }} · {{ label(saved.has_api_keys[model.id] ? 'keyPresent' : 'keyAbsent') }}</span><input :value="keys[model.id]?.api_key" class="input" type="password" autocomplete="new-password" :placeholder="label(saved.has_api_keys[model.id] ? 'keyKeepHint' : 'keyInputHint')" @input="updateKey(model.id, ($event.target as HTMLInputElement).value)" /></label>
             <p class="text-xs text-gray-500 dark:text-dark-400">{{ label('keyHint') }} · {{ label('modelID') }}: {{ model.id }}</p>
             <div class="flex flex-wrap gap-3"><button type="button" class="btn btn-secondary" :disabled="!model.base_url || listingModels.includes(model.id)" @click="listModels(model)">{{ label(listingModels.includes(model.id) ? 'loading' : 'loadModels') }}</button><button type="button" class="btn btn-secondary" :disabled="!model.model || probing.includes(model.id)" @click="probe(model)">{{ label(probing.includes(model.id) ? 'loading' : 'probe') }}</button></div>
@@ -551,7 +578,7 @@ watch(() => props.refreshKey, () => { void load(true) })
       </fieldset>
       <div class="sticky bottom-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-gray-200 bg-white/95 p-4 shadow-lg backdrop-blur dark:border-dark-600 dark:bg-dark-800/95">
         <span class="text-sm">{{ label('revision') }}: {{ saved.revision }} / {{ saved.applied_revision }} · {{ formatTime(saved.updated_at) }} · {{ saved.instance_id }} <span v-if="dirty" class="ml-2 text-amber-700 dark:text-amber-400">{{ label('dirty') }}</span></span>
-        <div class="flex gap-2"><button type="button" class="btn btn-secondary" :disabled="saving || !dirty" @click="restore">{{ label('reset') }}</button><button type="submit" class="btn btn-primary" :disabled="saving || !dirty || configInvalid" data-test="save-config">{{ label(saving ? 'loading' : 'save') }}</button></div>
+        <div class="flex gap-2"><button type="button" class="btn btn-secondary" :disabled="saving || !dirty" @click="restore">{{ label('reset') }}</button><button type="submit" class="btn btn-primary" :disabled="saving || !dirty || parameterInvalid" data-test="save-config">{{ label(saving ? 'loading' : 'save') }}</button></div>
       </div>
     </form>
     <BaseDialog :show="showDiff" :title="label('confirmChanges')" :close-on-click-outside="true" @close="showDiff = false">
