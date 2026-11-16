@@ -70,30 +70,43 @@ func TestAccountQuotaUsesDedicatedReadEndpoint(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "12.123456789", q.Windows.Primary.UsedPercent.String())
 }
-func TestDiscoveryUsesActiveSubscriptionsAndPreservesDecimalSnapshots(t *testing.T) {
+func TestValidSubscriptionsPreservesDecimalSnapshots(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
 	now := time.Now()
 	mock.ExpectBegin()
-	mock.ExpectQuery("SELECT name .*subscription_type='subscription'").WithArgs(int64(7)).WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("OpenAI"))
-	mock.ExpectQuery("SELECT a.id,a.name,a.type,a.parent_account_id").WillReturnRows(sqlmock.NewRows([]string{"id", "name", "type", "parent"}).AddRow(1, "account", "oauth", nil))
 	mock.ExpectQuery("SELECT .* FROM public.user_subscriptions .*s.expires_at>clock_timestamp.*u.role='user'.*subscription_type='subscription'").WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "group_id", "username", "daily", "weekly", "monthly", "daily_start", "weekly_start", "monthly_start", "expires_at", "observed_at"}).AddRow(99, 8, 7, "User", "0.0000000001", "123456.1234567890", "3", now, now, now, now.Add(time.Hour), now))
 	mock.ExpectCommit()
-	d, err := NewQuotaData(db).DiscoverSubscriptions(context.Background(), 7)
+	subscriptions, err := NewQuotaData(db).ValidSubscriptions(context.Background())
 	require.NoError(t, err)
-	require.Len(t, d.Subscriptions, 1)
-	require.Equal(t, int64(99), d.Subscriptions[0].ID)
-	require.Equal(t, "123456.1234567890", d.Subscriptions[0].WeeklyUsage)
+	require.Len(t, subscriptions, 1)
+	require.Equal(t, int64(99), subscriptions[0].ID)
+	require.Equal(t, "123456.1234567890", subscriptions[0].WeeklyUsage)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
-func TestSubscriptionBatchRefusesMonthlyOrOversizedRequestsBeforeNetwork(t *testing.T) {
+
+func TestMonitorCandidatesReadEligibilityFields(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	mock.ExpectQuery("SELECT a.id,a.name,a.platform,a.type,a.parent_account_id,a.status,a.schedulable").WillReturnRows(sqlmock.NewRows([]string{"id", "name", "platform", "type", "parent", "status", "schedulable", "deleted", "groups"}).AddRow(7, "monitor", "openai", "oauth", nil, "active", false, false, 0))
+	candidates, err := NewQuotaData(db).MonitorCandidates(context.Background())
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	require.Equal(t, int64(7), candidates[0].ID)
+	require.False(t, candidates[0].Schedulable)
+	require.Zero(t, candidates[0].GroupCount)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestSubscriptionBatchAcceptsMonthlyWindowsAndRejectsOversizedRequests(t *testing.T) {
 	c := NewClient(&config.Config{OfficialURL: "http://127.0.0.1:1", AdminKey: "unit-test"})
-	req := SubscriptionResetRequest{IDs: []int64{1}, Action: "reset_quota", Monthly: true, Weekly: true}
+	req := SubscriptionResetRequest{IDs: []int64{1}, Action: "reset_quota", Daily: true, Weekly: true, Monthly: true}
 	raw, _ := json.Marshal(req)
 	reply := c.ResetSubscriptions(context.Background(), raw, "key")
-	require.ErrorContains(t, reply.Error, "参数无效")
-	req.Monthly = false
+	require.Error(t, reply.Error)
+	require.NotContains(t, reply.Error.Error(), "参数无效")
 	for i := 2; i <= 101; i++ {
 		req.IDs = append(req.IDs, int64(i))
 	}

@@ -38,13 +38,13 @@ func (h *Handler) SaveConfig(c *gin.Context) {
 		response.BadRequest(c, "配置参数无效")
 		return
 	}
-	if err := input.Config.Validate(); err != nil {
+	if err := (Config{Enabled: input.Enabled, MonitorAccountID: input.MonitorAccountID}).Validate(); err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	for _, g := range input.Config.Groups {
-		if _, err := h.service.source.DiscoverSubscriptions(c.Request.Context(), g.GroupID); err != nil {
-			response.BadRequest(c, err.Error())
+	if input.Enabled {
+		if err := h.service.ValidateMonitor(c.Request.Context(), input.MonitorAccountID); err != nil {
+			respondError(c, err)
 			return
 		}
 	}
@@ -69,14 +69,9 @@ func (h *Handler) Runtime(c *gin.Context) {
 	response.Success(c, v)
 }
 func (h *Handler) Discovery(c *gin.Context) {
-	id, err := strconv.ParseInt(c.Query("group_id"), 10, 64)
-	if err != nil || id <= 0 {
-		response.BadRequest(c, "分组 ID 必须为正整数")
-		return
-	}
-	v, err := h.service.source.DiscoverSubscriptions(c.Request.Context(), id)
+	v, err := h.service.Discovery(c.Request.Context())
 	if err != nil {
-		response.BadRequest(c, err.Error())
+		respondError(c, err)
 		return
 	}
 	response.Success(c, v)
@@ -93,7 +88,7 @@ func (h *Handler) ImmediateReset(c *gin.Context) {
 		return
 	}
 	actor, _ := middleware.GetAuthSubjectFromContext(c)
-	middleware.SetAuditExtra(c, map[string]any{"actor_user_id": actor.UserID, "group_id": input.GroupID, "event_id": v.EventID, "result": "已提交订阅重置任务"})
+	middleware.SetAuditExtra(c, map[string]any{"actor_user_id": actor.UserID, "event_id": v.EventID, "result": "已提交全部有效订阅的立即重置任务"})
 	response.Accepted(c, v)
 }
 func pagination(c *gin.Context) (int, int, error) {
@@ -137,7 +132,7 @@ func (h *Handler) Records(c *gin.Context) {
 		response.BadRequest(c, "开始时间必须早于结束时间")
 		return
 	}
-	if f.Window != "" && f.Window != "daily" && f.Window != "weekly" {
+	if f.Window != "" && f.Window != "daily" && f.Window != "weekly" && f.Window != "monthly" {
 		response.BadRequest(c, "窗口无效")
 		return
 	}

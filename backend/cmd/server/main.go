@@ -113,13 +113,13 @@ func run(info systemupdate.BuildInfo) error {
 	if err != nil {
 		return err
 	}
-	// 三个调度的会话锁独占连接池，避免小后台池被锁连接占满后自锁。
+	// 检测与交付两个调度的会话锁独占连接池，避免小后台池被锁连接占满后自锁。
 	quotaLocks, err := sql.Open("postgres", cfg.DatabaseURL)
 	if err != nil {
 		return err
 	}
 	defer quotaLocks.Close()
-	quotaLocks.SetMaxOpenConns(3)
+	quotaLocks.SetMaxOpenConns(2)
 	quotaRepo := quotafollow.NewRepository(db)
 	quotaService := quotafollow.NewService(quotaRepo, sub2api.NewQuotaData(db), client, quotaLocks)
 	quotaHandler := quotafollow.NewHandler(quotaService, quotaRepo)

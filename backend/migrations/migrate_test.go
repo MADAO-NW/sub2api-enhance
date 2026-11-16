@@ -220,22 +220,23 @@ func expectSchemaReady(mock sqlmock.Sqlmock) {
 	mock.ExpectExec(`CREATE SCHEMA IF NOT EXISTS sub2api_enhance; CREATE TABLE IF NOT EXISTS sub2api_enhance.schema_migrations(filename TEXT PRIMARY KEY,checksum TEXT NOT NULL,applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`).WillReturnResult(sqlmock.NewResult(0, 0))
 }
 
-// 空库新安装：001–020 按文件名顺序逐个事务执行，审计迁移在订阅迁移之前。
+// 空库新安装：001–022 按文件名顺序逐个事务执行，审计迁移在订阅迁移之前。
 func TestEmptyDatabaseRunsAuditThenSubscriptionMigrations(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	require.NoError(t, err)
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	names, contents := embeddedMigrations(t)
-	require.Equal(t, "013_prompt_audit_v3.sql", names[len(names)-9])
-	require.Equal(t, "014_subscription_quota_follow.sql", names[len(names)-8])
-	require.Equal(t, "015_prompt_audit_node_auth.sql", names[len(names)-7])
-	require.Equal(t, "016_prompt_audit_optimize.sql", names[len(names)-6])
-	require.Equal(t, "017_prompt_audit_metrics.sql", names[len(names)-5])
-	require.Equal(t, "018_prompt_audit_reaudit_fresh.sql", names[len(names)-4])
-	require.Equal(t, "019_prompt_audit_categories_samples.sql", names[len(names)-3])
-	require.Equal(t, "020_prompt_audit_inbox_indexes.sql", names[len(names)-2])
-	require.Equal(t, "021_prompt_audit_auto_retry.sql", names[len(names)-1])
+	require.Equal(t, "013_prompt_audit_v3.sql", names[len(names)-10])
+	require.Equal(t, "014_subscription_quota_follow.sql", names[len(names)-9])
+	require.Equal(t, "015_prompt_audit_node_auth.sql", names[len(names)-8])
+	require.Equal(t, "016_prompt_audit_optimize.sql", names[len(names)-7])
+	require.Equal(t, "017_prompt_audit_metrics.sql", names[len(names)-6])
+	require.Equal(t, "018_prompt_audit_reaudit_fresh.sql", names[len(names)-5])
+	require.Equal(t, "019_prompt_audit_categories_samples.sql", names[len(names)-4])
+	require.Equal(t, "020_prompt_audit_inbox_indexes.sql", names[len(names)-3])
+	require.Equal(t, "021_prompt_audit_auto_retry.sql", names[len(names)-2])
+	require.Equal(t, "022_quota_follow_monitor.sql", names[len(names)-1])
 	expectSchemaReady(mock)
 	for _, name := range names {
 		expectMigrationFile(mock, name, contents[name])
@@ -245,7 +246,7 @@ func TestEmptyDatabaseRunsAuditThenSubscriptionMigrations(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// 上一版本（v0.5.8）已执行 001–019：升级只追加 020。
+// 上一版本已执行 001–021：升级只追加 022。
 func TestUpgradeFromV026RunsAuditThenSubscriptionMigrations(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	require.NoError(t, err)
@@ -253,7 +254,7 @@ func TestUpgradeFromV026RunsAuditThenSubscriptionMigrations(t *testing.T) {
 	db.SetMaxOpenConns(1)
 	names, contents := embeddedMigrations(t)
 	applied, pending := names[:len(names)-1], names[len(names)-1:]
-	require.Equal(t, []string{"021_prompt_audit_auto_retry.sql"}, pending)
+	require.Equal(t, []string{"022_quota_follow_monitor.sql"}, pending)
 	expectSchemaReady(mock)
 	for _, name := range applied {
 		checksum := fmt.Sprintf("%x", sha256.Sum256([]byte(contents[name])))
@@ -275,11 +276,11 @@ func TestPromptAuditV3MigrationFailureRollsBackWholeFile(t *testing.T) {
 	db.SetMaxOpenConns(1)
 	names, contents := embeddedMigrations(t)
 	expectSchemaReady(mock)
-	for _, name := range names[:len(names)-9] {
+	for _, name := range names[:len(names)-10] {
 		checksum := fmt.Sprintf("%x", sha256.Sum256([]byte(contents[name])))
 		mock.ExpectQuery("SELECT checksum FROM sub2api_enhance.schema_migrations WHERE filename=$1").WithArgs(name).WillReturnRows(sqlmock.NewRows([]string{"checksum"}).AddRow(checksum))
 	}
-	last := names[len(names)-9]
+	last := names[len(names)-10]
 	// 前置检查发现未完成处置动作时 RAISE EXCEPTION：整个文件回滚，不登记台账。
 	mock.ExpectQuery("SELECT checksum FROM sub2api_enhance.schema_migrations WHERE filename=$1").WithArgs(last).WillReturnRows(sqlmock.NewRows([]string{"checksum"}))
 	mock.ExpectBegin()
@@ -366,6 +367,32 @@ func TestInboxIndexMigrationOnlyAddsPartialIndexes(t *testing.T) {
 	}
 	upper := strings.ToUpper(sql)
 	for _, forbidden := range []string{"ALTER TABLE", "DROP ", "DELETE FROM", "UPDATE ", "INSERT INTO", "CONCURRENTLY"} {
+		require.NotContains(t, upper, forbidden)
+	}
+}
+
+// 022 只新增单行运行状态并对旧分组数据收尾：保留历史表，不重发已发出的批次。
+func TestMonitorMigrationReplacesGroupRuntimeWithoutDroppingHistory(t *testing.T) {
+	raw, err := files.ReadFile("022_quota_follow_monitor.sql")
+	require.NoError(t, err)
+	sql := string(raw)
+	order := []string{
+		"CREATE TABLE sub2api_enhance.quota_follow_monitor_runtime",
+		"ALTER TABLE sub2api_enhance.quota_follow_subscription_batches ALTER COLUMN group_id DROP NOT NULL",
+		"DROP INDEX sub2api_enhance.quota_follow_subscription_batches_group_open_idx",
+		"CREATE INDEX quota_follow_subscription_batches_open_idx",
+		`CHECK("window" IN ('daily','weekly','monthly'))`,
+		"SET status='skipped'",
+		"SET status='uncertain'",
+	}
+	position := -1
+	for _, fragment := range order {
+		index := strings.Index(sql, fragment)
+		require.Greater(t, index, position, fragment)
+		position = index
+	}
+	upper := strings.ToUpper(sql)
+	for _, forbidden := range []string{"DROP TABLE", "DELETE FROM", "DROP COLUMN"} {
 		require.NotContains(t, upper, forbidden)
 	}
 }

@@ -7,31 +7,33 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
-	"math/rand/v2"
+	"strings"
+	infra "sub2api-enhance/internal/pkg/errors"
 	"sub2api-enhance/internal/sub2api"
 	"sync"
 	"time"
 )
 
-// 后台检测、交付和审计采集各自使用增强锁，不占用提示词审核槽位。
+// 检测与交付各自使用增强锁，不占用提示词审核槽位。
 const (
-	detectLock    int64 = 748239516309712
-	deliveryLock  int64 = 748239516309713
-	collectorLock int64 = 748239516309714
+	detectLock   int64 = 748239516309712
+	deliveryLock int64 = 748239516309713
 )
-
-// quotaQueryConcurrency 限制原版配额查询的同时调用数，跨分组账号在同一轮复用结果。
-const quotaQueryConcurrency = 4
 
 type QuotaAPI interface {
 	Configured() bool
 	AccountQuota(context.Context, int64) (sub2api.AccountQuota, error)
 	ResetSubscriptions(context.Context, []byte, string) sub2api.SubscriptionResetReply
 }
+
 type QuotaSource interface {
-	DiscoverSubscriptions(context.Context, int64) (sub2api.SubscriptionDiscovery, error)
-	SubscriptionSnapshots(context.Context, int64, []int64) (map[int64]sub2api.SubscriptionSnapshot, error)
+	MonitorAccount(context.Context, int64) (sub2api.MonitorAccount, error)
+	MonitorCandidates(context.Context) ([]sub2api.MonitorAccount, error)
+	ValidSubscriptions(context.Context) ([]sub2api.SubscriptionSnapshot, error)
+	ValidSubscriptionGroups(context.Context) ([]sub2api.SubscriptionGroupCount, error)
+	SubscriptionSnapshots(context.Context, []int64) (map[int64]sub2api.SubscriptionSnapshot, error)
 }
+
 type Service struct {
 	lockDB *sql.DB
 	repo   *Repository
@@ -40,11 +42,16 @@ type Service struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	mu     sync.Mutex
+
+	// backoffMu 保护检测失败后的进程内退避，避免无法提交时每秒调用上游额度接口。
+	backoffMu sync.Mutex
+	retryAt   time.Time
 }
 
 func NewService(repo *Repository, source *sub2api.QuotaData, api *sub2api.Client, lockDB *sql.DB) *Service {
 	return &Service{lockDB: lockDB, repo: repo, source: source, api: api}
 }
+
 func (s *Service) Start(parent context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -57,7 +64,7 @@ func (s *Service) Start(parent context.Context) {
 		lock     int64
 		interval time.Duration
 		run      func(context.Context) error
-	}{{detectLock, time.Second, s.detect}, {deliveryLock, time.Second, s.deliver}, {collectorLock, time.Minute, s.collect}} {
+	}{{detectLock, time.Second, s.detectWithBackoff}, {deliveryLock, time.Second, s.deliver}} {
 		s.wg.Add(1)
 		go func(lock int64, interval time.Duration, run func(context.Context) error) {
 			defer s.wg.Done()
@@ -76,6 +83,26 @@ func (s *Service) Start(parent context.Context) {
 		}(task.lock, task.interval, task.run)
 	}
 }
+
+// detectWithBackoff 在检测无法提交时保留进程内退避，避免每秒重复调用上游额度接口。
+func (s *Service) detectWithBackoff(ctx context.Context) error {
+	s.backoffMu.Lock()
+	waiting := time.Now().Before(s.retryAt)
+	s.backoffMu.Unlock()
+	if waiting {
+		return nil
+	}
+	err := s.detect(ctx)
+	s.backoffMu.Lock()
+	if err != nil {
+		s.retryAt = time.Now().Add(detectionRetryInterval)
+	} else {
+		s.retryAt = time.Time{}
+	}
+	s.backoffMu.Unlock()
+	return err
+}
+
 func (s *Service) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	if s.cancel != nil {
@@ -91,6 +118,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+
 func (s *Service) locked(ctx context.Context, key int64, run func(context.Context) error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -117,36 +145,8 @@ func (s *Service) locked(ctx context.Context, key int64, run func(context.Contex
 	}()
 	return run(ctx)
 }
-func nextDetection(now time.Time, cfg Config, states []AccountState, failed bool) time.Time {
-	if failed {
-		return now.Add(time.Duration(cfg.MaxInterval) * time.Minute)
-	}
-	minimum := time.Duration(cfg.MinInterval) * time.Minute
-	span := time.Duration(cfg.MaxInterval-cfg.MinInterval) * time.Minute
-	next := now.Add(minimum + time.Duration(rand.Int64N(int64(span)+1)))
-	for _, s := range states {
-		if s.NextResetAt != nil && s.NextResetAt.After(now) {
-			edge := s.NextResetAt.Add(time.Second)
-			if edge.Before(next) {
-				next = edge
-			}
-		}
-	}
-	return next
-}
 
-type quotaSample struct {
-	value sub2api.AccountQuota
-	err   error
-	at    time.Time
-}
-type groupDetection struct {
-	rule      GroupRule
-	before    Runtime
-	discovery sub2api.SubscriptionDiscovery
-	err       error
-}
-
+// detect 每次只采样一个监控账号；判定成立时在提交事务内冻结全部有效订阅。
 func (s *Service) detect(ctx context.Context) error {
 	cfg, err := s.repo.Config(ctx)
 	if err != nil {
@@ -155,190 +155,187 @@ func (s *Service) detect(ctx context.Context) error {
 	if !cfg.Enabled {
 		return nil
 	}
-	if err = cfg.Validate(); err != nil {
+	if err = cfg.Config.Validate(); err != nil {
 		return err
 	}
-	now := time.Now().UTC()
-	due := []groupDetection{}
-	ids := map[int64]bool{}
-	for _, g := range cfg.Groups {
-		if !g.Enabled {
-			continue
+	previous, err := s.repo.Runtime(ctx)
+	if err != nil {
+		return err
+	}
+	if previous.Epoch == cfg.Epoch {
+		if previous.PausedRevision != nil && *previous.PausedRevision == cfg.Revision {
+			return nil
 		}
-		previous, readErr := s.repo.Runtime(ctx, g.GroupID)
-		if readErr != nil {
-			return readErr
-		}
-		if previous.Epoch == g.Epoch && ((previous.PausedRevision == nil && previous.NextCheckAt != nil && previous.NextCheckAt.After(now)) || (previous.PausedRevision != nil && *previous.PausedRevision == cfg.Revision)) {
-			continue
-		}
-		d, discoverErr := s.source.DiscoverSubscriptions(ctx, g.GroupID)
-		due = append(due, groupDetection{g, previous, d, discoverErr})
-		if discoverErr == nil {
-			for _, a := range d.Accounts {
-				if a.Type != "oauth" {
-					continue
-				}
-				id := a.ID
-				if a.IsShadow && a.ParentID != nil {
-					id = *a.ParentID
-				}
-				ids[id] = true
-			}
+		if previous.NextCheckAt != nil && previous.NextCheckAt.After(time.Now().UTC()) {
+			return nil
 		}
 	}
-	if len(due) == 0 {
-		return nil
+	// 监控账号校验只读原版数据库；不满足时立即显示原因，也不再消耗 OpenAI 请求。
+	account, err := s.source.MonitorAccount(ctx, cfg.MonitorAccountID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return s.saveFailure(ctx, cfg, previous, sub2api.MonitorAccount{}, "监控账号不存在或已删除", false, time.Now().UTC())
 	}
-	samples := s.sampleAccounts(ctx, ids)
-	var failures []error
-	for _, d := range due {
-		next := d.before
-		next.GroupID = d.rule.GroupID
-		next.GroupName = d.discovery.GroupName
-		next.Epoch = d.rule.Epoch
-		next.LastCheckedAt = &now
-		next.LastError = ""
-		next.PausedRevision = nil
-		if d.err != nil {
-			if d.before.Epoch != d.rule.Epoch {
-				next.AccountSetHash = ""
-				next.States = []AccountState{}
-				next.LastEventAt = nil
-				next.BaselineAt = &now
-			}
-			next.LastError = d.err.Error()
-			next.NextCheckAt = timePointer(nextDetection(time.Now().UTC(), cfg.Config, nil, true))
-			if err = s.repo.SaveObservation(ctx, cfg, d.rule, d.discovery, next, d.before, nil); err != nil {
-				failures = append(failures, err)
-			}
-			continue
-		}
-		next.SubscriptionCount = len(d.discovery.Subscriptions)
-		hash := accountSetHash(d.discovery.Accounts)
-		changed := d.before.Epoch != d.rule.Epoch || d.before.AccountSetHash != hash
-		previous := map[int64]AccountState{}
-		if changed {
-			next.LastEventAt = nil
-			next.BaselineAt = &now
-		} else {
-			for _, state := range d.before.States {
-				previous[state.Account.ID] = state
-			}
-		}
-		if next.BaselineAt == nil {
-			next.BaselineAt = &now
-		}
-		next.AccountSetHash = hash
-		next.States = []AccountState{}
-		for _, a := range d.discovery.Accounts {
-			id := a.ID
-			if a.IsShadow && a.ParentID != nil {
-				id = *a.ParentID
-			}
-			sample, ok := samples[id]
-			if !ok {
-				sample = quotaSample{err: errors.New("账号类型不支持官方周窗口查询"), at: time.Now().UTC()}
-			}
-			state := observe(previous[a.ID], a, sample.value, sample.err, sample.at, *next.BaselineAt)
-			var apiErr *sub2api.APIError
-			if errors.As(sample.err, &apiErr) && (apiErr.Status == 401 || apiErr.Status == 403) {
-				revision := cfg.Revision
-				next.PausedRevision = &revision
-			}
-			next.States = append(next.States, state)
-		}
-		if !changed {
-			if err = s.repo.ApplyAccountResetSignals(ctx, next.States, previous, *next.BaselineAt); err != nil {
-				next.LastError = "账号重置审计读取失败：" + err.Error()
-			}
-		}
-		boundary, consensusErr := consensus(next.States)
-		if consensusErr != nil {
-			next.LastError = joinMessage(next.LastError, consensusErr.Error())
-		}
-		if changed || next.LastError != "" {
-			boundary = nil
-		}
-		if boundary != nil {
-			// 模型外配额查询可能耗时较长；事件成立时重新冻结订阅名单及账号关系。
-			fresh, readErr := s.source.DiscoverSubscriptions(ctx, d.rule.GroupID)
-			if readErr != nil {
-				next.LastError = "事件目标读取失败：" + readErr.Error()
-				boundary = nil
-			} else if accountSetHash(fresh.Accounts) != hash {
-				next.LastError = "检测期间账号集合发生变化，等待重建本组基线"
-				boundary = nil
-			} else {
-				d.discovery = fresh
-				next.SubscriptionCount = len(fresh.Subscriptions)
-			}
-		}
-		next.NextCheckAt = timePointer(nextDetection(time.Now().UTC(), cfg.Config, next.States, next.LastError != ""))
-		if err = s.repo.SaveObservation(ctx, cfg, d.rule, d.discovery, next, d.before, boundary); err != nil {
-			failures = append(failures, err)
-			continue
-		}
-		evidence, _ := json.Marshal(map[string]any{"before": d.before, "after": next, "reset_at": boundary})
-		log.Printf("订阅跟随账号检测完成 group_id=%d evidence=%s", d.rule.GroupID, evidence)
+	if err != nil {
+		return err
 	}
-	return errors.Join(failures...)
-}
-func timePointer(t time.Time) *time.Time { return &t }
+	if problems := monitorProblems(account); len(problems) > 0 {
+		return s.saveFailure(ctx, cfg, previous, account, "监控账号不可用："+strings.Join(problems, "；"), false, time.Now().UTC())
+	}
+	if !s.api.Configured() {
+		return s.saveFailure(ctx, cfg, previous, account, "原版管理员 API Key 未配置", false, time.Now().UTC())
+	}
 
-// sampleAccounts 使用固定数量查询协程，每个真实账号只查询一次，不调用强制模型探测。
-func (s *Service) sampleAccounts(ctx context.Context, ids map[int64]bool) map[int64]quotaSample {
-	results := map[int64]quotaSample{}
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	jobs := make(chan int64)
-	for i := 0; i < min(quotaQueryConcurrency, len(ids)); i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for id := range jobs {
-				var q sub2api.AccountQuota
-				var err error
-				if !s.api.Configured() {
-					err = errors.New("原版管理员 API Key 未配置")
-				} else {
-					q, err = s.api.AccountQuota(ctx, id)
-				}
-				sample := quotaSample{q, err, time.Now().UTC()}
-				mu.Lock()
-				results[id] = sample
-				mu.Unlock()
-			}
-		}()
+	quota, queryErr := s.api.AccountQuota(ctx, cfg.MonitorAccountID)
+	now := time.Now().UTC()
+	if queryErr != nil {
+		message := queryErr.Error()
+		paused := false
+		if pause := pauseMessage(queryErr); pause != "" {
+			message, paused = pause, true
+		}
+		return s.saveFailure(ctx, cfg, previous, account, message, paused, now)
 	}
-	for id := range ids {
-		jobs <- id
+
+	next, signal := evaluate(previous, cfg, account, quota, now)
+	next.NextCheckAt = timePointer(nextCheck(now, next.BaselineResetAt, next.LastError != ""))
+	if signal == nil {
+		saved, saveErr := s.repo.SaveObservation(ctx, cfg, previous, next, nil)
+		if saveErr == nil {
+			s.logDetection(previous, saved, quota, false)
+		}
+		return saveErr
 	}
-	close(jobs)
-	wg.Wait()
-	return results
+
+	// 模型外查询可能耗时较长；事件成立时重新冻结全部有效订阅。
+	subscriptions, readErr := s.source.ValidSubscriptions(ctx)
+	if readErr != nil {
+		next.LastError = "事件目标读取失败：" + readErr.Error()
+		next.NextCheckAt = timePointer(nextCheck(now, previous.BaselineResetAt, true))
+		// 名单读取失败时不推进基线，下一轮重新判定同一窗口。
+		next.BaselineResetAt = previous.BaselineResetAt
+		next.AwaitingWindow = previous.AwaitingWindow
+		next.UsedPercent = previous.UsedPercent
+		next.FetchedAt = previous.FetchedAt
+		saved, saveErr := s.repo.SaveObservation(ctx, cfg, previous, next, nil)
+		if saveErr == nil {
+			s.logDetection(previous, saved, quota, false)
+		}
+		return saveErr
+	}
+	evidence, _ := json.Marshal(map[string]any{
+		"trigger": signal.Trigger,
+		"account": map[string]any{
+			"id": account.ID, "name": account.Name, "upstream_account_id": quota.AccountID,
+			"plan_type": quota.PlanType, "used_percent": quota.Windows, "fetched_at": quota.FetchedAt,
+		},
+		"baseline_reset_at": previous.BaselineResetAt,
+	})
+	event := &pendingEvent{Key: signal.Key, Trigger: signal.Trigger, ResetAt: signal.ResetAt, Evidence: evidence, Subscriptions: subscriptions}
+	saved, saveErr := s.repo.SaveObservation(ctx, cfg, previous, next, event)
+	if saveErr == nil {
+		s.logDetection(previous, saved, quota, true)
+	}
+	return saveErr
 }
-func (s *Service) Runtime(ctx context.Context) ([]Runtime, error) {
+
+// saveFailure 记录一次未产生事件的检测；暂停时保留基线并把修订号写进运行状态。
+func (s *Service) saveFailure(ctx context.Context, cfg SavedConfig, previous Runtime, account sub2api.MonitorAccount, message string, paused bool, now time.Time) error {
+	next := previous
+	if previous.Epoch != cfg.Epoch {
+		next = Runtime{LastResetAt: previous.LastResetAt, LastEventID: previous.LastEventID}
+	}
+	next.Epoch = cfg.Epoch
+	next.MonitorAccountID = cfg.MonitorAccountID
+	if account.Name != "" {
+		next.AccountName = account.Name
+	}
+	next.LastCheckedAt = &now
+	next.LastError = message
+	next.NextCheckAt = nil
+	if paused {
+		revision := cfg.Revision
+		next.PausedRevision = &revision
+	} else {
+		next.PausedRevision = nil
+		next.NextCheckAt = timePointer(nextCheck(now, previous.BaselineResetAt, true))
+	}
+	saved, err := s.repo.SaveObservation(ctx, cfg, previous, next, nil)
+	if err != nil {
+		return err
+	}
+	before, _ := json.Marshal(previous)
+	after, _ := json.Marshal(saved)
+	log.Printf("订阅跟随检测未完成 paused=%t error=%s before=%s after=%s", paused, message, before, after)
+	return nil
+}
+
+func (s *Service) logDetection(previous, next Runtime, quota sub2api.AccountQuota, triggered bool) {
+	before, _ := json.Marshal(previous)
+	after, _ := json.Marshal(next)
+	sampled, _ := json.Marshal(map[string]any{"account_id": quota.AccountID, "plan_type": quota.PlanType, "fetched_at": quota.FetchedAt, "windows": quota.Windows})
+	log.Printf("订阅跟随检测完成 triggered=%t before=%s after=%s sample=%s", triggered, before, after, sampled)
+}
+
+// pauseMessage 按响应原因区分监控账号授权失效与原版管理员凭据失效。
+func pauseMessage(err error) string {
+	var apiErr *sub2api.APIError
+	if !errors.As(err, &apiErr) || (apiErr.Status != 401 && apiErr.Status != 403) {
+		return ""
+	}
+	if apiErr.Reason() == "OPENAI_QUOTA_UPSTREAM_ERROR" {
+		return "监控账号授权失效，请在 sub2api 重新授权后重新保存配置"
+	}
+	return "原版管理员 API Key 无效"
+}
+
+// Runtime 返回单行运行状态；不可查询时清空下次检测时间。
+func (s *Service) Runtime(ctx context.Context) (Runtime, error) {
 	cfg, err := s.repo.Config(ctx)
 	if err != nil {
-		return nil, err
+		return Runtime{}, err
 	}
-	out := []Runtime{}
-	for _, g := range cfg.Groups {
-		v, err := s.repo.Runtime(ctx, g.GroupID)
-		if err != nil {
-			return nil, err
-		}
-		if !cfg.Enabled || !g.Enabled || v.Epoch != g.Epoch || (v.PausedRevision != nil && *v.PausedRevision == cfg.Revision) {
-			v.NextCheckAt = nil
-		}
-		out = append(out, v)
+	v, err := s.repo.Runtime(ctx)
+	if err != nil {
+		return Runtime{}, err
+	}
+	if !cfg.Enabled || v.Epoch != cfg.Epoch || (v.PausedRevision != nil && *v.PausedRevision == cfg.Revision) {
+		v.NextCheckAt = nil
+	}
+	return v, nil
+}
+
+// Discovery 提供监控账号候选与有效订阅分布，供页面在确认前只读预览。
+func (s *Service) Discovery(ctx context.Context) (Discovery, error) {
+	accounts, err := s.source.MonitorCandidates(ctx)
+	if err != nil {
+		return Discovery{}, err
+	}
+	groups, err := s.source.ValidSubscriptionGroups(ctx)
+	if err != nil {
+		return Discovery{}, err
+	}
+	out := Discovery{MonitorAccounts: []MonitorCandidate{}, GroupCounts: groups}
+	for _, a := range accounts {
+		problems := monitorProblems(a)
+		out.MonitorAccounts = append(out.MonitorAccounts, MonitorCandidate{MonitorAccount: a, Problems: problems, Valid: len(problems) == 0})
+	}
+	for _, g := range groups {
+		out.SubscriptionCount += g.Count
 	}
 	return out, nil
 }
-func joinMessage(a, b string) string {
-	if a == "" {
-		return b
+
+// ValidateMonitor 在启用前同步校验监控账号，避免保存后才发现不可用。
+func (s *Service) ValidateMonitor(ctx context.Context, id int64) error {
+	account, err := s.source.MonitorAccount(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return infra.BadRequest("quota_follow_monitor_missing", "监控账号不存在或已删除")
 	}
-	return a + "；" + b
+	if err != nil {
+		return err
+	}
+	if problems := monitorProblems(account); len(problems) > 0 {
+		return infra.BadRequest("quota_follow_monitor_invalid", "监控账号不可用："+strings.Join(problems, "；"))
+	}
+	return nil
 }

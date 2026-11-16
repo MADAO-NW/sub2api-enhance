@@ -1,116 +1,131 @@
 package quotafollow
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
-	"sort"
+	"math/rand/v2"
 	"sub2api-enhance/internal/sub2api"
 	"time"
 )
 
-// settingKey 延用既有额度配置入口，迁移负责单分组到多分组的转换。
-const settingKey = "quota_follow_config"
+// settingKey 是新的单监控账号配置键；旧 quota_follow_config 保留在库中但不再读取。
+const settingKey = "quota_follow_monitor_config"
 
-// weeklyPeriod 是上游周窗口的已知时长，不将短窗口当作日窗口。
-const weeklyPeriod = 7 * 24 * time.Hour
+// 固定规则用常量表达，不进入配置；只有业务范围本身才值得让管理员调整。
+const (
+	// weeklyWindowSeconds 是上游周窗口的固定时长，用于在不假设窗口位置时识别它。
+	weeklyWindowSeconds = 604800
+	// resetAdvanceThreshold 远大于同一窗口内约 27 秒的重置时间抖动。
+	resetAdvanceThreshold = time.Hour
+	// sampleClockTolerance 覆盖额度查询耗时，过旧或明显超前的采样不能作证据。
+	sampleClockTolerance = time.Minute
+	// 检测间隔 10–15 分钟随机；失败后固定 15 分钟重试。
+	detectionMinInterval   = 10 * time.Minute
+	detectionMaxInterval   = 15 * time.Minute
+	detectionRetryInterval = 15 * time.Minute
+	// weeklyPeriod 是上游周窗口长度，用于自然重置的事件时间。
+	weeklyPeriod = 7 * 24 * time.Hour
+)
 
-// quotaSampleClockTolerance 覆盖管理 API 查询耗时及秒级时钟误差，过旧或明显超前的采样不能作证据。
-const quotaSampleClockTolerance = time.Minute
+// resetWindows 是跟随固定重置的三个窗口，正文顺序固定为日、周、月。
+var resetWindows = []string{"daily", "weekly", "monthly"}
 
-type GroupRule struct {
-	GroupID     int64      `json:"group_id"`
-	Enabled     bool       `json:"enabled"`
-	ObserveOnly bool       `json:"observe_only"`
-	ResetDaily  bool       `json:"reset_daily_enabled"`
-	ResetWeekly bool       `json:"reset_weekly_enabled"`
-	Epoch       string     `json:"epoch"`
-	EnabledAt   *time.Time `json:"enabled_at"`
-}
 type Config struct {
-	Enabled     bool        `json:"enabled"`
-	MinInterval int         `json:"min_interval_minutes"`
-	MaxInterval int         `json:"max_interval_minutes"`
-	Groups      []GroupRule `json:"groups"`
+	Enabled          bool  `json:"enabled"`
+	MonitorAccountID int64 `json:"monitor_account_id"`
 }
+
+// SavedConfig 中的 epoch、enabled_at、revision 由服务端维护，客户端不能指定。
 type SavedConfig struct {
 	Config
-	Revision  int64     `json:"revision"`
-	UpdatedBy int64     `json:"updated_by"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
-type ConfigUpdate struct {
-	ExpectedRevision int64  `json:"expected_revision" binding:"required,min=1"`
-	Config           Config `json:"config"`
+	Epoch     string     `json:"epoch"`
+	EnabledAt *time.Time `json:"enabled_at"`
+	Revision  int64      `json:"revision"`
+	UpdatedBy int64      `json:"updated_by"`
+	UpdatedAt time.Time  `json:"updated_at"`
 }
 
-func DefaultConfig() SavedConfig {
-	return SavedConfig{Config: Config{MinInterval: 10, MaxInterval: 15, Groups: []GroupRule{}}, Revision: 1}
+// ConfigUpdate 使用 expected_revision 防止覆盖其他管理员的保存。
+type ConfigUpdate struct {
+	Enabled          bool  `json:"enabled"`
+	MonitorAccountID int64 `json:"monitor_account_id"`
+	ExpectedRevision int64 `json:"expected_revision" binding:"required,min=1"`
 }
+
+// DefaultConfig 表示从未保存过的配置：关闭、修订号 1、没有启用周期。
+func DefaultConfig() SavedConfig { return SavedConfig{Revision: 1} }
+
 func (c Config) Validate() error {
-	if c.Groups == nil {
-		return errors.New("分组规则必须提供数组，可为空")
+	if c.MonitorAccountID < 0 {
+		return errors.New("监控账号 ID 无效")
 	}
-	if c.MinInterval <= 0 || c.MaxInterval < c.MinInterval || int64(c.MaxInterval) > int64((1<<63-1)/time.Minute) {
-		return errors.New("检测间隔必须为有效正分钟数，且上限不小于下限")
-	}
-	seen := map[int64]bool{}
-	for _, g := range c.Groups {
-		if g.GroupID <= 0 || seen[g.GroupID] {
-			return errors.New("分组 ID 必须有效且不能重复")
-		}
-		seen[g.GroupID] = true
-		if g.Enabled && !g.ResetDaily && !g.ResetWeekly {
-			return errors.New("启用分组前至少选择一个订阅重置窗口")
-		}
-	}
-	if c.Enabled && len(c.Groups) == 0 {
-		return errors.New("启用前至少添加一个分组")
+	if c.Enabled && c.MonitorAccountID <= 0 {
+		return errors.New("启用前必须选择监控账号")
 	}
 	return nil
 }
-func (c Config) Group(id int64) (GroupRule, bool) {
-	for _, g := range c.Groups {
-		if g.GroupID == id {
-			return g, true
-		}
-	}
-	return GroupRule{}, false
-}
-func newEpochRequired(a, b GroupRule) bool {
-	return a.GroupID != b.GroupID || a.Enabled != b.Enabled || a.ObserveOnly != b.ObserveOnly || a.ResetDaily != b.ResetDaily || a.ResetWeekly != b.ResetWeekly
+
+// Runtime 是单行运行状态；baseline_reset_at 即判定规则中的 B。
+type Runtime struct {
+	Epoch             string       `json:"epoch"`
+	MonitorAccountID  int64        `json:"monitor_account_id"`
+	AccountName       string       `json:"account_name"`
+	UpstreamAccountID string       `json:"upstream_account_id"`
+	PlanType          string       `json:"plan_type"`
+	BaselineResetAt   *time.Time   `json:"baseline_reset_at"`
+	AwaitingWindow    bool         `json:"awaiting_window"`
+	UsedPercent       *json.Number `json:"used_percent"`
+	FetchedAt         *time.Time   `json:"fetched_at"`
+	LastCheckedAt     *time.Time   `json:"last_checked_at"`
+	NextCheckAt       *time.Time   `json:"next_check_at"`
+	LastResetAt       *time.Time   `json:"last_reset_at"`
+	LastEventID       *int64       `json:"last_event_id"`
+	LastError         string       `json:"last_error"`
+	PausedRevision    *int64       `json:"paused_revision"`
 }
 
-type AccountState struct {
-	Account            sub2api.SubscriptionAccount `json:"account"`
-	Utilization        *json.Number                `json:"utilization"`
-	NextResetAt        *time.Time                  `json:"next_reset_at"`
-	CandidateResetAt   *time.Time                  `json:"candidate_reset_at"`
-	ConsumedResetAt    *time.Time                  `json:"consumed_reset_at"`
-	BaselineRebased    bool                        `json:"baseline_rebased"`
-	ObservedAt         *time.Time                  `json:"observed_at"`
-	FetchedAt          *time.Time                  `json:"fetched_at"`
-	ConsumedObservedAt *time.Time                  `json:"consumed_observed_at"`
-	LastAuditID        int64                       `json:"last_audit_id"`
-	SuspectedDrop      bool                        `json:"suspected_drop"`
-	Error              string                      `json:"error"`
+// monitorProblems 按原版账号表字段判断监控账号是否可用，不消耗 OpenAI 请求。
+func monitorProblems(a sub2api.MonitorAccount) []string {
+	problems := []string{}
+	if a.Platform != "openai" {
+		problems = append(problems, "账号平台不是 openai")
+	}
+	if a.Type != "oauth" {
+		problems = append(problems, "账号类型不是 oauth")
+	}
+	if a.ParentID != nil {
+		problems = append(problems, "影子账号不能作为监控账号")
+	}
+	if a.Deleted {
+		problems = append(problems, "账号已删除")
+	}
+	if a.Status != "active" {
+		problems = append(problems, "账号状态不是 active")
+	}
+	if a.Schedulable {
+		problems = append(problems, "账号仍在调度中，请先在原版关闭调度")
+	}
+	if a.GroupCount > 0 {
+		problems = append(problems, "账号已绑定分组，请先解绑")
+	}
+	return problems
 }
-type Runtime struct {
-	GroupID           int64          `json:"group_id"`
-	GroupName         string         `json:"group_name"`
-	Epoch             string         `json:"epoch"`
-	AccountSetHash    string         `json:"account_set_hash"`
-	States            []AccountState `json:"account_states"`
-	SubscriptionCount int            `json:"subscription_count"`
-	LastEventAt       *time.Time     `json:"last_event_at"`
-	LastCheckedAt     *time.Time     `json:"last_checked_at"`
-	NextCheckAt       *time.Time     `json:"next_check_at"`
-	LastError         string         `json:"last_error"`
-	PausedRevision    *int64         `json:"paused_revision"`
-	BaselineAt        *time.Time     `json:"baseline_at"`
+
+type MonitorCandidate struct {
+	sub2api.MonitorAccount
+	Problems []string `json:"problems"`
+	Valid    bool     `json:"valid"`
 }
+
+// Discovery 是页面确认前的只读预览：监控账号候选与有效订阅分布。
+type Discovery struct {
+	MonitorAccounts   []MonitorCandidate               `json:"monitor_accounts"`
+	SubscriptionCount int                              `json:"subscription_count"`
+	GroupCounts       []sub2api.SubscriptionGroupCount `json:"group_counts"`
+}
+
 type Filter struct {
 	From, To                                *time.Time
 	Source, Detail, Window, Status, Keyword string
@@ -124,21 +139,19 @@ type Page[T any] struct {
 	PageSize int   `json:"page_size"`
 }
 type Batch struct {
-	ID             int64       `json:"id"`
-	EventID        int64       `json:"event_id"`
-	GroupID        int64       `json:"group_id"`
-	RequestID      string      `json:"request_id"`
-	Body           string      `json:"request_body"`
-	Status         string      `json:"status"`
-	Response       string      `json:"response_body"`
-	Error          string      `json:"error_message"`
-	HTTPStatus     *int        `json:"http_status"`
-	StartedAt      *time.Time  `json:"started_at"`
-	CompletedAt    *time.Time  `json:"completed_at"`
-	Rule           GroupRule   `json:"config_snapshot"`
-	AccountSetHash string      `json:"account_set_hash"`
-	Trigger        string      `json:"trigger_type"`
-	Items          []BatchItem `json:"items"`
+	ID          int64       `json:"id"`
+	EventID     int64       `json:"event_id"`
+	RequestID   string      `json:"request_id"`
+	Body        string      `json:"request_body"`
+	Status      string      `json:"status"`
+	Response    string      `json:"response_body"`
+	Error       string      `json:"error_message"`
+	HTTPStatus  *int        `json:"http_status"`
+	StartedAt   *time.Time  `json:"started_at"`
+	CompletedAt *time.Time  `json:"completed_at"`
+	Trigger     string      `json:"trigger_type"`
+	Epoch       string      `json:"epoch"`
+	Items       []BatchItem `json:"items"`
 }
 type BatchItem struct {
 	ID             int64                         `json:"id"`
@@ -152,121 +165,201 @@ type BatchItem struct {
 	After          *sub2api.SubscriptionSnapshot `json:"after_snapshot"`
 }
 
-func accountSetHash(accounts []sub2api.SubscriptionAccount) string {
-	identities := append([]sub2api.SubscriptionAccount{}, accounts...)
-	sort.Slice(identities, func(i, j int) bool { return identities[i].ID < identities[j].ID })
-	for i := range identities {
-		identities[i].Name = ""
-	}
-	raw, _ := json.Marshal(identities)
-	hash := sha256.Sum256(raw)
-	return hex.EncodeToString(hash[:])
+// sample 是一次通过时效校验的采样：R 保留原始秒值，0 表示上游未返回绝对重置时间。
+type sample struct {
+	ResetAtUnix int64
+	FetchedAt   time.Time
+	UsedPercent json.Number
 }
 
-// observe 仅接受本轮真实配额采样；自然重置要求旧边界已跨过且新窗口确实进入未来。
-func observe(previous AccountState, account sub2api.SubscriptionAccount, quota sub2api.AccountQuota, queryErr error, now, baseline time.Time) AccountState {
+// eventSignal 表示本轮判定成立、需要在同一事务内冻结名单并建批次。
+type eventSignal struct {
+	Key     string
+	ResetAt time.Time
+	Trigger string
+}
+
+// pendingEvent 是检测与人工触发共用的建事件输入。
+type pendingEvent struct {
+	Key           string
+	Trigger       string
+	ResetAt       time.Time
+	Evidence      json.RawMessage
+	Subscriptions []sub2api.SubscriptionSnapshot
+}
+
+// evaluate 实现技术方案第 5.3 节的判定顺序；返回的 Runtime 带下次检测前的完整状态。
+func evaluate(previous Runtime, cfg SavedConfig, account sub2api.MonitorAccount, quota sub2api.AccountQuota, now time.Time) (Runtime, *eventSignal) {
 	next := previous
-	next.Account = account
-	next.Error = ""
-	next.SuspectedDrop = false
-	if queryErr != nil {
-		next.Error = queryErr.Error()
-		return next
+	if previous.Epoch != cfg.Epoch {
+		// 启用周期变化时丢弃旧周期基线，只保留展示用的账号名与最近事件。
+		next = Runtime{LastResetAt: previous.LastResetAt, LastEventID: previous.LastEventID}
 	}
-	if account.Type != "oauth" {
-		next.Error = "该账号类型不支持官方周窗口查询"
-		return next
+	next.Epoch = cfg.Epoch
+	next.MonitorAccountID = cfg.MonitorAccountID
+	next.AccountName = account.Name
+	next.LastCheckedAt = &now
+	next.LastError = ""
+	// 能进入评估说明本轮未被暂停；恢复后必须清掉旧修订号，页面才不会继续显示暂停。
+	next.PausedRevision = nil
+
+	weekly, err := weeklyWindow(quota)
+	if err != nil {
+		next.LastError = err.Error()
+		return next, nil
 	}
-	windows := quota.Windows
-	if account.IsShadow {
-		windows = nil
-		for _, v := range quota.Additional {
-			if v.Feature == "codex_bengalfox" {
-				windows = v.Windows
-				break
+	current, err := trustedSample(weekly, quota, next.FetchedAt, now)
+	if err != nil {
+		next.LastError = err.Error()
+		return next, nil
+	}
+
+	identityChanged := (quota.AccountID != "" && next.UpstreamAccountID != "" && quota.AccountID != next.UpstreamAccountID) ||
+		(quota.PlanType != "" && next.PlanType != "" && quota.PlanType != next.PlanType)
+	if quota.AccountID != "" {
+		next.UpstreamAccountID = quota.AccountID
+	}
+	if quota.PlanType != "" {
+		next.PlanType = quota.PlanType
+	}
+	// 规则 2：本周期还没有基线、或上游账号与套餐发生变化时只重建基线。
+	rebase := identityChanged || next.BaselineResetAt == nil
+	if rebase {
+		next.BaselineResetAt = nil
+		next.AwaitingWindow = false
+	}
+
+	var signal *eventSignal
+	baseline := next.BaselineResetAt
+	switch {
+	case current.ResetAtUnix > now.Unix():
+		resetAt := time.Unix(current.ResetAtUnix, 0).UTC()
+		switch {
+		case rebase:
+			next.BaselineResetAt = timePointer(resetAt)
+		case next.AwaitingWindow:
+			// 规则 3：兜底触发后第一次拿到有效 R 只建立基线。
+			next.BaselineResetAt = timePointer(resetAt)
+			next.AwaitingWindow = false
+		case resetAt.Sub(*baseline) > resetAdvanceThreshold && !now.Before(*baseline):
+			// 规则 4：已跨过旧边界且新窗口确实进入未来，属于自然重置。
+			eventAt := *baseline
+			if edge := resetAt.Add(-weeklyPeriod); edge.After(eventAt) {
+				eventAt = edge
 			}
+			signal = &eventSignal{Key: automaticEventKey(cfg.Epoch, *baseline), ResetAt: eventAt, Trigger: "automatic"}
+			next.BaselineResetAt = timePointer(resetAt)
+		case resetAt.Sub(*baseline) > resetAdvanceThreshold && usedPercentAboveZero(next.UsedPercent):
+			// 规则 5：尚未到旧边界但重置时间前进一周以上且本窗口用过，属于提前重置。
+			signal = &eventSignal{Key: automaticEventKey(cfg.Epoch, *baseline), ResetAt: current.FetchedAt, Trigger: "automatic"}
+			next.BaselineResetAt = timePointer(resetAt)
+		case resetAt.Sub(*baseline) > resetAdvanceThreshold:
+			// 规则 6：本窗口从未使用（上次用量为 0）时的浮动漂移不是重置。
+			next.BaselineResetAt = timePointer(resetAt)
+		case resetAt.Before(baseline.Add(-resetAdvanceThreshold)):
+			// 规则 8：重置时间回退说明证据不可信，重建基线但不触发。
+			next.BaselineResetAt = timePointer(resetAt)
+			next.LastError = "监控账号周窗口重置时间回退，已重建基线"
+		default:
+			// 规则 7：同一窗口内的秒级抖动，只跟随最新值。
+			next.BaselineResetAt = timePointer(resetAt)
+		}
+	case current.ResetAtUnix > 0:
+		// 规则 9：上游还没切到新窗口，不触发也不改动基线。
+		if rebase {
+			next.LastError = "监控账号周窗口重置时间不在未来，等待有效采样"
+		}
+	case rebase:
+		// 规则 2 的无效分支：没有基线时不能凭缺失的重置时间建立基线。
+		next.LastError = "监控账号未返回绝对重置时间"
+	case !next.AwaitingWindow && !now.Before(*baseline) && isZeroPercent(current.UsedPercent):
+		// 规则 10：旧边界已过、上游不返回重置时间且用量为 0，旧窗口已结束而新窗口还没开始。
+		signal = &eventSignal{Key: automaticEventKey(cfg.Epoch, *baseline), ResetAt: *baseline, Trigger: "automatic"}
+		next.AwaitingWindow = true
+	default:
+		// 规则 11：缺少绝对重置时间，基线不变。
+		next.LastError = "监控账号未返回绝对重置时间"
+	}
+
+	used := current.UsedPercent
+	next.UsedPercent = &used
+	next.FetchedAt = &current.FetchedAt
+	return next, signal
+}
+
+// weeklyWindow 按 limit_window_seconds 识别唯一的周窗口，不假设它在 primary 还是 secondary。
+func weeklyWindow(quota sub2api.AccountQuota) (*sub2api.QuotaWindow, error) {
+	if quota.Windows == nil {
+		return nil, errors.New("监控账号未返回额度窗口")
+	}
+	var found *sub2api.QuotaWindow
+	for _, w := range []*sub2api.QuotaWindow{quota.Windows.Primary, quota.Windows.Secondary} {
+		if w == nil || w.Seconds != weeklyWindowSeconds {
+			continue
+		}
+		if found != nil {
+			return nil, errors.New("监控账号返回多个周窗口，不能确定监控目标")
+		}
+		found = w
+	}
+	if found == nil {
+		return nil, errors.New("监控账号未返回周窗口")
+	}
+	return found, nil
+}
+
+// trustedSample 校验采样时效与单调性；上游不返回 used_percent 时按 0 处理。
+func trustedSample(weekly *sub2api.QuotaWindow, quota sub2api.AccountQuota, previous *time.Time, now time.Time) (sample, error) {
+	used := json.Number("0")
+	if weekly.UsedPercent != nil {
+		used = *weekly.UsedPercent
+	}
+	if value, ok := new(big.Rat).SetString(used.String()); !ok || value.Sign() < 0 {
+		return sample{}, errors.New("监控账号周利用率无效")
+	}
+	if quota.FetchedAt <= 0 {
+		return sample{}, errors.New("监控账号未返回采样时间")
+	}
+	fetched := time.Unix(quota.FetchedAt, 0).UTC()
+	if fetched.After(now.Add(sampleClockTolerance)) || now.Sub(fetched) > sampleClockTolerance {
+		return sample{}, errors.New("采样时间与本次查询相差超过 1 分钟")
+	}
+	if previous != nil && !fetched.After(*previous) {
+		return sample{}, errors.New("采样时间没有前进")
+	}
+	return sample{ResetAtUnix: weekly.ResetAt, FetchedAt: fetched, UsedPercent: used}, nil
+}
+
+func usedPercentAboveZero(value *json.Number) bool {
+	if value == nil {
+		return false
+	}
+	rat, ok := new(big.Rat).SetString(value.String())
+	return ok && rat.Sign() > 0
+}
+
+func isZeroPercent(value json.Number) bool {
+	rat, ok := new(big.Rat).SetString(value.String())
+	return ok && rat.Sign() == 0
+}
+
+// automaticEventKey 固定为“被重置掉的旧窗口”，同一窗口只会触发一次。
+func automaticEventKey(epoch string, baseline time.Time) string {
+	return fmt.Sprintf("automatic:%s:%d", epoch, baseline.Unix())
+}
+
+// nextCheck 取“当前时间 + 10–15 分钟随机值”，但边界后 1 秒更早就优先边界。
+func nextCheck(now time.Time, baseline *time.Time, failed bool) time.Time {
+	if failed {
+		return now.Add(detectionRetryInterval)
+	}
+	next := now.Add(detectionMinInterval + time.Duration(rand.Int64N(int64(detectionMaxInterval-detectionMinInterval)+1)))
+	if baseline != nil && baseline.After(now) {
+		if edge := baseline.Add(time.Second); edge.Before(next) {
+			next = edge
 		}
 	}
-	if windows == nil {
-		next.Error = "账号缺少对应的官方配额窗口"
-		return next
-	}
-	var weekly *sub2api.QuotaWindow
-	for _, w := range []*sub2api.QuotaWindow{windows.Primary, windows.Secondary} {
-		if w != nil && w.Seconds == int64(weeklyPeriod/time.Second) {
-			if weekly != nil {
-				next.Error = "账号返回多个周窗口，不能确定监控目标"
-				return next
-			}
-			weekly = w
-		}
-	}
-	if weekly == nil || weekly.UsedPercent == nil || weekly.ResetAt <= 0 || quota.FetchedAt <= 0 {
-		next.Error = "账号缺少完整周窗口或绝对重置时间"
-		return next
-	}
-	value, ok := new(big.Rat).SetString(weekly.UsedPercent.String())
-	if !ok || value.Sign() < 0 {
-		next.Error = "账号周利用率无效"
-		return next
-	}
-	sampled := time.Unix(quota.FetchedAt, 0).UTC()
-	boundary := time.Unix(weekly.ResetAt, 0).UTC()
-	if sampled.After(now.Add(quotaSampleClockTolerance)) || now.Sub(sampled) > quotaSampleClockTolerance || (previous.FetchedAt != nil && !sampled.After(*previous.FetchedAt)) {
-		next.Error = "账号采样时间无效或没有更新"
-		return next
-	}
-	if previous.Utilization != nil {
-		if old, ok := new(big.Rat).SetString(previous.Utilization.String()); ok && value.Cmp(old) < 0 {
-			next.SuspectedDrop = true
-		}
-	}
-	if previous.NextResetAt != nil {
-		if boundary.Before(*previous.NextResetAt) {
-			next.CandidateResetAt = nil
-			next.BaselineRebased = true
-		} else if previous.BaselineRebased {
-			next.CandidateResetAt = nil
-			next.BaselineRebased = !boundary.After(sampled)
-		} else if !sampled.Before(*previous.NextResetAt) && boundary.After(sampled) && boundary.Sub(*previous.NextResetAt) > weeklyPeriod/2 && !previous.NextResetAt.Before(baseline) {
-			// 忽略秒级边界抖动；跨越多个周窗口仅记最新一轮，不补发停机期间额度。
-			reset := *previous.NextResetAt
-			if boundary.Sub(reset) > weeklyPeriod {
-				reset = boundary.Add(-weeklyPeriod)
-			}
-			if previous.ConsumedResetAt == nil || reset.After(*previous.ConsumedResetAt) {
-				next.CandidateResetAt = &reset
-			}
-		}
-	}
-	next.Utilization = weekly.UsedPercent
-	next.NextResetAt = &boundary
-	next.FetchedAt = &sampled
-	next.ObservedAt = &now
 	return next
 }
-func consensus(states []AccountState) (*time.Time, error) {
-	if len(states) == 0 {
-		return nil, errors.New("分组内没有有效 OpenAI 账号")
-	}
-	var last time.Time
-	for _, s := range states {
-		if s.Error != "" || s.BaselineRebased {
-			return nil, errors.New("部分账号证据不可用，等待本组全部账号确认")
-		}
-		if s.CandidateResetAt == nil || (s.ConsumedResetAt != nil && !s.CandidateResetAt.After(*s.ConsumedResetAt)) {
-			return nil, nil
-		}
-		if s.CandidateResetAt.After(last) {
-			last = *s.CandidateResetAt
-		}
-	}
-	return &last, nil
-}
-func consume(states []AccountState) {
-	for i := range states {
-		states[i].ConsumedResetAt = states[i].CandidateResetAt
-		states[i].ConsumedObservedAt = states[i].FetchedAt
-		states[i].CandidateResetAt = nil
-	}
-}
+
+func timePointer(t time.Time) *time.Time { return &t }

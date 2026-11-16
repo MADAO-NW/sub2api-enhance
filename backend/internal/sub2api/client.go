@@ -32,6 +32,17 @@ type APIError struct {
 }
 
 func (e *APIError) Error() string { return fmt.Sprintf("原版 API 返回 HTTP %d", e.Status) }
+
+// Reason 解析原版错误响应中的机器可读原因，用于区分上游授权失效与管理员凭据失效。
+func (e *APIError) Reason() string {
+	var payload struct {
+		Reason string `json:"reason"`
+	}
+	if json.Unmarshal([]byte(e.Body), &payload) != nil {
+		return ""
+	}
+	return payload.Reason
+}
 func NewClient(c *config.Config) *Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil

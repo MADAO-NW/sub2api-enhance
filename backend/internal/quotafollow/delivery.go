@@ -28,6 +28,7 @@ func (s *Service) deliver(ctx context.Context) error {
 	}
 	return errors.Join(failures...)
 }
+
 func (s *Service) deliverBatch(ctx context.Context, id int64) error {
 	b, err := s.repo.Batch(ctx, id)
 	if err != nil {
@@ -40,89 +41,92 @@ func (s *Service) deliverBatch(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	rule, exists := cfg.Group(b.GroupID)
+	// 自动事件受总开关约束：关闭时暂缓发送，而不丢弃已冻结的名单。
+	if b.Trigger == "automatic" && !cfg.Enabled {
+		return nil
+	}
 	reason := ""
-	if !exists || rule.Epoch != b.Rule.Epoch {
-		reason = "分组配置或启用周期已经改变"
+	if b.Trigger == "automatic" && b.Epoch != cfg.Epoch {
+		reason = "监控账号或启用周期已经改变"
 	}
-	if reason == "" && b.Trigger == "automatic" && (!cfg.Enabled || !rule.Enabled || rule.ObserveOnly) {
-		return nil
-	}
-	// 未解决的旧批次可能已经清零，不再对同组发送更新批次，防止不确定结果被后续动作掩盖。
-	var blocked bool
-	if err = s.repo.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sub2api_enhance.quota_follow_subscription_batches WHERE group_id=$1 AND id<$2 AND status IN ('inflight','uncertain'))`, b.GroupID, b.ID).Scan(&blocked); err != nil {
-		return err
-	}
-	if blocked {
-		return nil
-	}
-	if !s.api.Configured() {
+	if reason == "" && !s.api.Configured() {
 		return errors.New("原版管理员 API Key 未配置")
 	}
-	var discovery sub2api.SubscriptionDiscovery
+	// 发送前复核资格：失效或归属变化的订阅只跳过对应项，不重组已冻结的其余项。
 	if reason == "" {
-		discovery, err = s.source.DiscoverSubscriptions(ctx, b.GroupID)
-		if err != nil {
-			return err
+		ids := []int64{}
+		for _, v := range b.Items {
+			if v.Status == "pending" {
+				ids = append(ids, v.SubscriptionID)
+			}
 		}
-		if b.Trigger == "automatic" && accountSetHash(discovery.Accounts) != b.AccountSetHash {
-			reason = "原事件的监控账号集合已经变化"
+		current, readErr := s.source.SubscriptionSnapshots(ctx, ids)
+		if readErr != nil {
+			return readErr
 		}
-	}
-	eligible := map[int64]sub2api.SubscriptionSnapshot{}
-	for _, v := range discovery.Subscriptions {
-		eligible[v.ID] = v
-	}
-	for i := range b.Items {
-		v := &b.Items[i]
-		if reason != "" {
-			v.Status = "skipped"
-			v.Error = reason
-			continue
-		}
-		snapshot, ok := eligible[v.SubscriptionID]
-		if !ok || snapshot.UserID != v.UserID || snapshot.GroupID != b.GroupID {
-			v.Status = "skipped"
-			v.Error = "订阅已失效、过期或不再属于目标用户及分组"
-		} else {
+		for i := range b.Items {
+			v := &b.Items[i]
+			if v.Status != "pending" {
+				continue
+			}
+			snapshot, ok := current[v.SubscriptionID]
+			if !ok || snapshot.UserID != v.UserID || snapshot.GroupID != v.GroupID {
+				v.Status = "skipped"
+				v.Error = "订阅已失效、过期或不再属于目标用户及分组"
+				continue
+			}
 			v.Before = &snapshot
 		}
+	} else {
+		for i := range b.Items {
+			if b.Items[i].Status == "pending" {
+				b.Items[i].Status = "skipped"
+				b.Items[i].Error = reason
+			}
+		}
 	}
-	sent, err := s.repo.ClaimBatch(ctx, b, cfg.Revision)
+	sent, err := s.repo.ClaimBatch(ctx, b)
 	if err != nil {
 		return err
 	}
 	if !sent {
-		if b.Status == "skipped" {
-			return s.repo.FinishBatch(ctx, b)
-		}
 		return nil
 	}
-	log.Printf("开始批量重置订阅 event_id=%d group_id=%d batch_id=%d request_id=%s request=%s", b.EventID, b.GroupID, b.ID, b.RequestID, b.Body)
+	log.Printf("开始批量重置订阅 event_id=%d batch_id=%d request_id=%s request=%s", b.EventID, b.ID, b.RequestID, b.Body)
 	reply := s.api.ResetSubscriptions(ctx, []byte(b.Body), b.RequestID)
 	applyReply(b, reply)
-	save, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
+	// 先提交逐项结果：快照只是只读观测，不能因为读取慢或失败而丢失已确认的调用结果。
+	finish, cancelFinish := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancelFinish()
+	if err = s.repo.FinishBatch(finish, b); err != nil {
+		log.Printf("订阅批量重置结果保存失败 batch_id=%d status=%s error=%v", b.ID, b.Status, err)
+		return err
+	}
+	log.Printf("订阅批量重置返回 batch_id=%d status=%s response=%s error=%v", b.ID, b.Status, b.Response, reply.Error)
+	observe, cancelObserve := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancelObserve()
 	sentIDs := []int64{}
 	for _, v := range b.Items {
 		if v.Status != "skipped" {
 			sentIDs = append(sentIDs, v.SubscriptionID)
 		}
 	}
-	after, readErr := s.source.SubscriptionSnapshots(save, b.GroupID, sentIDs)
+	after, readErr := s.source.SubscriptionSnapshots(observe, sentIDs)
+	if readErr != nil {
+		log.Printf("订阅批量重置后快照读取失败 batch_id=%d error=%v", b.ID, readErr)
+		return nil
+	}
 	for i := range b.Items {
-		v := &b.Items[i]
-		if snapshot, ok := after[v.SubscriptionID]; ok {
-			v.After = &snapshot
-		}
-		if readErr != nil && v.Status != "skipped" {
-			v.Error = joinMessage(v.Error, "重置后快照读取失败："+readErr.Error())
+		if snapshot, ok := after[b.Items[i].SubscriptionID]; ok {
+			b.Items[i].After = &snapshot
 		}
 	}
-	err = s.repo.FinishBatch(save, b)
-	log.Printf("订阅批量重置返回 group_id=%d batch_id=%d status=%s response=%s error=%v", b.GroupID, b.ID, b.Status, b.Response, reply.Error)
-	return err
+	if err = s.repo.SaveAfterSnapshots(observe, b.Items); err != nil {
+		log.Printf("订阅批量重置后快照保存失败 batch_id=%d error=%v", b.ID, err)
+	}
+	return nil
 }
+
 func applyReply(b *Batch, reply sub2api.SubscriptionResetReply) {
 	b.Response = reply.Raw
 	b.Error = ""
@@ -187,7 +191,7 @@ func (s *Service) Reconcile(ctx context.Context, id int64) (*Batch, error) {
 	for _, v := range b.Items {
 		ids = append(ids, v.SubscriptionID)
 	}
-	snapshots, err := s.source.SubscriptionSnapshots(ctx, b.GroupID, ids)
+	snapshots, err := s.source.SubscriptionSnapshots(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
