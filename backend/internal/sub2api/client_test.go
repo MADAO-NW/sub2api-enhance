@@ -49,3 +49,22 @@ func TestAccountUpdateDoesNotFollowRedirectOrSendOtherFields(t *testing.T) {
 	require.Error(t, err)
 	require.False(t, leaked)
 }
+
+func TestAPIErrorDescribesEndpointAndUpstreamMessage(t *testing.T) {
+	err := &APIError{Status: 404, Body: `{"code":404,"message":"账户不存在"}`, Method: "GET", Path: "/api/v1/admin/openai/accounts/2/quota"}
+	require.Equal(t, "原版 API 返回 HTTP 404（GET /api/v1/admin/openai/accounts/2/quota）：账户不存在", err.Error())
+	require.Equal(t, "账户不存在", err.Detail())
+	require.Empty(t, err.Reason())
+
+	plain := &APIError{Status: 500, Body: "not json", Method: "POST", Path: "/api/v1/admin/subscriptions/bulk-action"}
+	require.Equal(t, "原版 API 返回 HTTP 500（POST /api/v1/admin/subscriptions/bulk-action）", plain.Error())
+	require.Empty(t, plain.Detail())
+
+	reasoned := &APIError{Status: 502, Body: `{"message":"上游失败","reason":"OPENAI_QUOTA_UPSTREAM_ERROR"}`}
+	require.Equal(t, "OPENAI_QUOTA_UPSTREAM_ERROR", reasoned.Reason())
+	require.Equal(t, "上游失败 / OPENAI_QUOTA_UPSTREAM_ERROR", reasoned.Detail())
+
+	truncated := &APIError{Status: 400, Body: `{"message":"` + strings.Repeat("长", 300) + `"}`}
+	require.LessOrEqual(t, len([]rune(truncated.Detail())), 201)
+	require.True(t, strings.HasSuffix(truncated.Detail(), "…"))
+}

@@ -29,9 +29,43 @@ type Client struct {
 type APIError struct {
 	Status int
 	Body   string
+	Method string
+	Path   string
 }
 
-func (e *APIError) Error() string { return fmt.Sprintf("原版 API 返回 HTTP %d", e.Status) }
+// Error 把状态、端点与原版错误信息一起输出，页面才能区分限流、权限和路由问题。
+func (e *APIError) Error() string {
+	endpoint := ""
+	if e.Method != "" || e.Path != "" {
+		endpoint = fmt.Sprintf("（%s %s）", e.Method, e.Path)
+	}
+	if detail := e.Detail(); detail != "" {
+		return fmt.Sprintf("原版 API 返回 HTTP %d%s：%s", e.Status, endpoint, detail)
+	}
+	return fmt.Sprintf("原版 API 返回 HTTP %d%s", e.Status, endpoint)
+}
+
+// Detail 提取原版错误响应的 message/reason，并对未知长度的正文做截断。
+func (e *APIError) Detail() string {
+	var payload struct {
+		Message string `json:"message"`
+		Reason  string `json:"reason"`
+	}
+	if json.Unmarshal([]byte(e.Body), &payload) != nil {
+		return ""
+	}
+	parts := []string{}
+	for _, value := range []string{payload.Message, payload.Reason} {
+		if value = strings.TrimSpace(value); value != "" {
+			parts = append(parts, value)
+		}
+	}
+	detail := []rune(strings.Join(parts, " / "))
+	if len(detail) > 200 {
+		return string(detail[:200]) + "…"
+	}
+	return string(detail)
+}
 
 // Reason 解析原版错误响应中的机器可读原因，用于区分上游授权失效与管理员凭据失效。
 func (e *APIError) Reason() string {
@@ -80,7 +114,7 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte, 
 		return nil, string(raw), errors.New("原版 API 响应读取未完成")
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, string(raw), &APIError{Status: res.StatusCode, Body: string(raw)}
+		return nil, string(raw), &APIError{Status: res.StatusCode, Body: string(raw), Method: method, Path: path}
 	}
 	var envelope struct {
 		Code int             `json:"code"`

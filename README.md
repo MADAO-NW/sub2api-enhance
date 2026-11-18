@@ -62,10 +62,10 @@ sudoedit /etc/sub2api-enhance/sub2api-enhance.env
 | `ENHANCE_DATABASE_URL` | 原版数据库连接，使用为增强服务准备的账号 |
 | `SUB2API_INTERNAL_URL` | 直达原版的内部地址，例如 `http://127.0.0.1:18080`；不要填写经过增强代理的公网地址 |
 | `ENHANCE_PUBLIC_ORIGIN` | 原版后台的 HTTPS Origin，例如 `https://gateway.example.com`，不带路径 |
-| `SUB2API_ADMIN_API_KEY` | 原版管理员 API Key，用于菜单配置、账号动作和额度操作 |
+| `SUB2API_ADMIN_API_KEY` | 原版管理员 API Key（**需完整权限**，不能使用自定义管理密钥），用于菜单配置、账号动作和额度操作 |
 | `ENHANCE_ENCRYPTION_KEY` | 独立的 32 字节随机密钥，经 Base64 编码，用于保存审核节点凭据 |
 | `ENHANCE_TRUSTED_PROXIES` | 实际反向代理的地址段；同机 Nginx 可使用 `127.0.0.1/32,::1/128` |
-| `ENHANCE_DB_CONNECTIONS` / `ENHANCE_INGRESS_CONNECTIONS` | 后台与入口连接池大小，示例各为 `8`；额度模块另占最多三条锁连接 |
+| `ENHANCE_DB_CONNECTIONS` / `ENHANCE_INGRESS_CONNECTIONS` | 后台与入口连接池大小，示例各为 `8`；额度模块另占最多两条锁连接 |
 | `ENHANCE_READONLY_TOKEN` | 可选。为监控系统提供只读通道 `/enhance/api/v1/admin/third-party-prompt-audit/readonly/{stats,runtime,jobs,trust,breakers}` 与 `/enhance/api/v1/metrics`，请求头 `X-Enhance-Readonly-Token`，每分钟 60 次；为空时只读通道关闭，指标仅允许本机抓取 |
 | `ENHANCE_REDIS_URL` | 审计回合键与 `previous_response_id` 映射使用的 Redis 连接。ACL 只需 `~sub2api_enhance:tppa:v1:*` 与 `+get +set`（服务用带 TTL 的 SET 续期，不依赖 `EXPIRE`）；启动时会自检这两个权限，失败原因显示在运行概览。有效期固定 30 分钟 |
 
@@ -215,6 +215,8 @@ v0.3.0 起不再保存请求原文：服务只保存去重后的稳定指令块�
 5. 事件成立时冻结全部有效订阅（订阅有效、未过期，用户与分组有效，分组为 OpenAI 订阅分组），每批最多 100 条，正文固定重置日、周、月三个窗口。每次跟随都会把月窗口起点改为当前时间，月额度效果等同于周额度。
 6. 自动事件与“立即重置”共用后台批量交付；立即重置不依赖总开关和监控账号配置，用 UUID 请求键保证重复提交返回同一事件。明确失败项可提交一次补充重置；成功项和不确定项不重发。
 7. 请求超时、断连、5xx、冲突或响应不完整会保留不确定结果，并在人工核对前阻塞全局后续批次。管理员填写说明确认后解除阻塞，原结果仍保持不确定，不宣称成功。
+
+增强服务用 `SUB2API_ADMIN_API_KEY` 调用上面两个接口，它必须是原版「系统设置 → 安全 → 管理员 API Key」生成的**完整管理员密钥**。自定义管理密钥（`adm_sc_…`）即使勾选 `openai.quota.read`，规则里的账户类型为空时额度接口也会返回 404「账户不存在」；`POST /api/v1/admin/subscriptions/bulk-action` 不在其授权路由内，会返回 403「管理密钥未获此操作权限」。增强页面会把状态码、端点与原版响应直接写进运行状态，便于对照。
 
 订阅仍遵循原版自然日、滚动 7 天与 30 天规则。跟随属于额外重置，不能取消自然重置，也不能把订阅窗口起点回填为 OpenAI 的历史重置时刻。用量前后快照是观测值，可能包含并发计费，不能仅凭当前用量为零确认调用成功。
 

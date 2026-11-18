@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	infra "sub2api-enhance/internal/pkg/errors"
@@ -188,11 +189,7 @@ func (s *Service) detect(ctx context.Context) error {
 	quota, queryErr := s.api.AccountQuota(ctx, cfg.MonitorAccountID)
 	now := time.Now().UTC()
 	if queryErr != nil {
-		message := queryErr.Error()
-		paused := false
-		if pause := pauseMessage(queryErr); pause != "" {
-			message, paused = pause, true
-		}
+		message, paused := quotaQueryFailure(queryErr, cfg.MonitorAccountID)
 		return s.saveFailure(ctx, cfg, previous, account, message, paused, now)
 	}
 
@@ -276,16 +273,27 @@ func (s *Service) logDetection(previous, next Runtime, quota sub2api.AccountQuot
 	log.Printf("订阅跟随检测完成 triggered=%t before=%s after=%s sample=%s", triggered, before, after, sampled)
 }
 
-// pauseMessage 按响应原因区分监控账号授权失效与原版管理员凭据失效。
-func pauseMessage(err error) string {
+// quotaQueryFailure 把原版额度查询失败转换成可操作的页面提示；只有凭据失效才暂停。
+func quotaQueryFailure(err error, accountID int64) (string, bool) {
 	var apiErr *sub2api.APIError
-	if !errors.As(err, &apiErr) || (apiErr.Status != 401 && apiErr.Status != 403) {
-		return ""
+	if !errors.As(err, &apiErr) {
+		return err.Error(), false
 	}
-	if apiErr.Reason() == "OPENAI_QUOTA_UPSTREAM_ERROR" {
-		return "监控账号授权失效，请在 sub2api 重新授权后重新保存配置"
+	switch apiErr.Status {
+	case 401, 403:
+		if apiErr.Reason() == "OPENAI_QUOTA_UPSTREAM_ERROR" {
+			return "监控账号授权失效，请在 sub2api 重新授权后重新保存配置", true
+		}
+		return "原版管理员 API Key 无效", true
+	case 404:
+		// 监控账号此前已通过数据库校验，404 只可能来自原版对管理密钥的账号范围限制。
+		message := fmt.Sprintf("原版额度接口返回 404：监控账号 #%d 已通过数据库校验，通常是 SUB2API_ADMIN_API_KEY 的权限范围未包含它；请改用原版「系统设置 → 安全 → 管理员 API Key」生成的完整密钥（自定义管理密钥即使勾选额度权限也会被账号范围拒绝，批量重置接口同样不在其授权路由内）", accountID)
+		if detail := apiErr.Detail(); detail != "" {
+			message += "；原版响应：" + detail
+		}
+		return message, false
 	}
-	return "原版管理员 API Key 无效"
+	return err.Error(), false
 }
 
 // Runtime 返回单行运行状态；不可查询时清空下次检测时间。

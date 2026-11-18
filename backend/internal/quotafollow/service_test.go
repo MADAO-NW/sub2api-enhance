@@ -177,11 +177,29 @@ func TestValidateMonitorRejectsIneligibleAccount(t *testing.T) {
 	require.NoError(t, (&Service{source: source}).ValidateMonitor(context.Background(), 7))
 }
 
-func TestPauseMessageDistinguishesCredentialSources(t *testing.T) {
-	require.Equal(t, "监控账号授权失效，请在 sub2api 重新授权后重新保存配置", pauseMessage(&sub2api.APIError{Status: 403, Body: `{"reason":"OPENAI_QUOTA_UPSTREAM_ERROR"}`}))
-	require.Equal(t, "原版管理员 API Key 无效", pauseMessage(&sub2api.APIError{Status: 401, Body: `{"reason":"UNAUTHORIZED"}`}))
-	require.Empty(t, pauseMessage(&sub2api.APIError{Status: 502, Body: `{"reason":"OPENAI_QUOTA_UPSTREAM_ERROR"}`}))
-	require.Empty(t, pauseMessage(context.Canceled))
+func TestQuotaFailureMessagesDistinguishCredentialProblems(t *testing.T) {
+	message, paused := quotaQueryFailure(&sub2api.APIError{Status: 403, Body: `{"reason":"OPENAI_QUOTA_UPSTREAM_ERROR"}`}, 2)
+	require.True(t, paused)
+	require.Equal(t, "监控账号授权失效，请在 sub2api 重新授权后重新保存配置", message)
+
+	message, paused = quotaQueryFailure(&sub2api.APIError{Status: 401, Body: `{"reason":"UNAUTHORIZED","message":"Invalid admin API key"}`}, 2)
+	require.True(t, paused)
+	require.Equal(t, "原版管理员 API Key 无效", message)
+
+	// 账号已通过数据库校验时，原版 404 只可能来自管理密钥的账号范围。
+	message, paused = quotaQueryFailure(&sub2api.APIError{Status: 404, Body: `{"code":404,"message":"账户不存在"}`, Method: "GET", Path: "/api/v1/admin/openai/accounts/2/quota"}, 2)
+	require.False(t, paused)
+	require.Contains(t, message, "#2")
+	require.Contains(t, message, "管理员 API Key")
+	require.Contains(t, message, "账户不存在")
+
+	message, paused = quotaQueryFailure(&sub2api.APIError{Status: 502, Body: `{"reason":"OPENAI_QUOTA_UPSTREAM_ERROR"}`}, 2)
+	require.False(t, paused)
+	require.Contains(t, message, "HTTP 502")
+
+	message, paused = quotaQueryFailure(context.Canceled, 2)
+	require.False(t, paused)
+	require.Equal(t, "context canceled", message)
 }
 
 func TestDetectionBacksOffWhenItCannotPersist(t *testing.T) {

@@ -293,7 +293,7 @@ func (c *Client) adminRequest(ctx context.Context, method, path string, body []b
 		return nil, meta, errors.New("原版订阅响应未完整读取")
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, meta, &APIError{Status: res.StatusCode, Body: string(raw)}
+		return nil, meta, &APIError{Status: res.StatusCode, Body: string(raw), Method: method, Path: path}
 	}
 	var env struct {
 		Code *int            `json:"code"`
