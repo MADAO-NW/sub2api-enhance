@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -149,7 +148,7 @@ func changedNodeIDs(before, after []ModelConfig, keys []KeyUpdate) map[string]bo
 			continue
 		}
 		if old.BaseURL != model.BaseURL || old.Model != model.Model || old.TimeoutMS != model.TimeoutMS ||
-			old.Enabled != model.Enabled || !reflect.DeepEqual(old.Parameters, model.Parameters) {
+			old.Enabled != model.Enabled || normalizeNodeAPIFormat(old.APIFormat) != normalizeNodeAPIFormat(model.APIFormat) {
 			changed[model.ID] = true
 		}
 	}

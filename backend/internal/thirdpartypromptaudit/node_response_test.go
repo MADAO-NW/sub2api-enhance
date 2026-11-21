@@ -2,6 +2,7 @@ package thirdpartypromptaudit
 
 import (
 	"context"
+	"encoding/json"
 	"github.com/stretchr/testify/require"
 	"net/http"
 	"net/http/httptest"
@@ -81,4 +82,27 @@ func TestOnlyScoreFormatFailureIsRepaired(t *testing.T) {
 	require.Equal(t, 0.9, score.Confidence)
 	require.Equal(t, 2, calls)
 	require.Equal(t, store.attempts[0].ID, *store.attempts[1].RepairOfAttemptID)
+}
+
+func TestResponsesEventStreamIsAggregatedBeforeScoring(t *testing.T) {
+	var requestBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/responses", r.URL.Path)
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&requestBody))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"{\\\"confidence\\\":0.91,\"}\n\n"))
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"\\\"reason\\\":\\\"sse\\\"}\"}\n\n"))
+		_, _ = w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"))
+	}))
+	defer server.Close()
+	store := &memoryAuditStore{}
+	model := ModelConfig{BaseURL: server.URL, Model: "gpt", TimeoutMS: 1000, APIFormat: NodeAPIFormatOpenAIResponses}
+	client, url, err := nodeHTTPClient(model)
+	require.NoError(t, err)
+	defer client.CloseIdleConnections()
+	score, _, failure := (&ModelClient{attempts: store}).EvaluateTarget(context.Background(), nil, model, "key", ConfigSnapshot{}, client, url, "probe", `{"text":"test"}`, "", nil)
+	require.Nil(t, failure)
+	require.Equal(t, 0.91, score.Confidence)
+	require.NotContains(t, requestBody, "stream")
+	require.Contains(t, *store.attempts[0].RawResponse, "response.output_text.delta")
 }

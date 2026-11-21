@@ -62,14 +62,15 @@ type ModelConfig struct {
 	// AllowSelfAudit 允许把审核节点指向本机/内网网关；默认拒绝，避免审核模型与被审模型同源。
 	AllowSelfAudit bool   `json:"allow_self_audit,omitempty"`
 	Name           string `json:"name"`
+	// APIFormat 是节点接口格式，空值按 OpenAI Chat Completions 处理，兼容升级前的节点。
+	APIFormat string `json:"api_format,omitempty"`
 	// Note 是节点备注，用于区分同一节点的不同用途；不参与调度与健康判断。
-	Note           string         `json:"note,omitempty"`
-	Enabled        bool           `json:"enabled"`
-	BaseURL        string         `json:"base_url"`
-	Model          string         `json:"model"`
-	TimeoutMS      int            `json:"timeout_ms"`
-	MaxConcurrency int            `json:"max_concurrency,omitempty"`
-	Parameters     map[string]any `json:"parameters,omitempty"`
+	Note           string `json:"note,omitempty"`
+	Enabled        bool   `json:"enabled"`
+	BaseURL        string `json:"base_url"`
+	Model          string `json:"model"`
+	TimeoutMS      int    `json:"timeout_ms"`
+	MaxConcurrency int    `json:"max_concurrency,omitempty"`
 }
 
 type WarningConfig struct {
@@ -269,6 +270,16 @@ func normalizeModelConcurrency(config *Config) {
 	}
 }
 
+// normalizeModelAPIFormats 为旧配置和旧任务快照补齐节点接口格式。
+func normalizeModelAPIFormats(config *Config) {
+	if config == nil {
+		return
+	}
+	for i := range config.Models {
+		config.Models[i].APIFormat = normalizeNodeAPIFormat(config.Models[i].APIFormat)
+	}
+}
+
 // effectiveConfigForUser 只把单个用户的处理方式与两个阈值合并到全局配置。
 // 聚合、提醒和自动停用一律取全局，避免同一份配置在专属规则里出现两套处置语义。
 func effectiveConfigForUser(config Config, userID int64) Config {
@@ -451,13 +462,12 @@ func validateModel(model ModelConfig) error {
 	if model.MaxConcurrency < 1 {
 		return errors.New("节点最大并发数必须大于 0")
 	}
-	if _, err := chatCompletionsURL(model.BaseURL); err != nil {
-		return err
+	if !slices.Contains([]string{NodeAPIFormatOpenAIChat, NodeAPIFormatOpenAIResponses,
+		NodeAPIFormatAnthropicMessages, NodeAPIFormatGoogleGenerativeAI}, normalizeNodeAPIFormat(model.APIFormat)) {
+		return errors.New("节点接口格式无效")
 	}
-	for _, reserved := range []string{"model", "messages", "stream"} {
-		if _, exists := model.Parameters[reserved]; exists {
-			return fmt.Errorf("节点高级参数不能覆盖 %s", reserved)
-		}
+	if _, err := nodeRequestURL(model); err != nil {
+		return err
 	}
 	return nil
 }
@@ -525,6 +535,7 @@ func (m *ConfigManager) Reload(ctx context.Context) (loadErr error) {
 	// 节点名称是模型选择的派生展示值，旧配置加载后也立即使用统一规则。
 	normalizeModelNames(&stored.Config)
 	normalizeModelConcurrency(&stored.Config)
+	normalizeModelAPIFormats(&stored.Config)
 	normalizeUserRuleModes(&stored.Config)
 	normalizeRetention(&stored.Config)
 	m.mu.Lock()
@@ -789,6 +800,7 @@ func publicConfig(stored storedConfig) PublicConfig {
 	display.Models = append([]ModelConfig(nil), stored.Models...)
 	normalizeModelNames(&display)
 	normalizeModelConcurrency(&display)
+	normalizeModelAPIFormats(&display)
 	normalizeUserRuleModes(&display)
 	result := PublicConfig{Config: display, Revision: stored.Revision,
 		WarningRuleRevision: stored.WarningRuleRevision, HasAPIKeys: keys,
@@ -806,6 +818,7 @@ func publicConfig(stored storedConfig) PublicConfig {
 
 func (m *ConfigManager) Save(ctx context.Context, input ConfigUpdate, actorID int64) (PublicConfig, error) {
 	normalizeModelNames(&input.Config)
+	normalizeModelAPIFormats(&input.Config)
 	normalizeRetention(&input.Config)
 	normalizeUserRuleModes(&input.Config)
 	// 审核节点指向本机/内网属于“自审”，会与被审模型同源，必须显式确认。

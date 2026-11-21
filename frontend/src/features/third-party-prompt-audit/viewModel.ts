@@ -33,20 +33,41 @@ export function formatMS(value: number | null | undefined): string {
   return value == null ? '—' : `${Math.round(value).toLocaleString()} ms`
 }
 
-// parametersText 把节点高级参数渲染成缩进 JSON 文本，供节点卡片就地编辑。
-export function parametersText(parameters?: Record<string, unknown>): string {
-  return JSON.stringify(parameters ?? {}, null, 2)
+// nodeAPIFormat 把历史空值规范为默认接口格式。
+export function nodeAPIFormat(value?: string): string {
+  return value || 'openai_chat_completions'
 }
 
-// parseParameters 就地校验高级参数：必须是 JSON 对象，且不能覆盖固定请求字段。
-export function parseParameters(text: string): { value?: Record<string, unknown>; error?: string; field?: string } {
-  if (!text.trim()) return { value: {} }
-  let parsed: unknown
-  try { parsed = JSON.parse(text) } catch { return { error: 'nodeParametersInvalid' } }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { error: 'nodeParametersInvalid' }
-  const value = parsed as Record<string, unknown>
-  for (const reserved of ['model', 'messages', 'stream']) if (reserved in value) return { error: 'nodeParametersReserved', field: reserved }
-  return { value }
+// nodeAPIFormatOptions 是界面可选接口格式及展示名称。
+export const nodeAPIFormatOptions = [
+  { value: 'openai_chat_completions', label: 'OpenAI Chat Completions' },
+  { value: 'openai_responses', label: 'OpenAI Responses' },
+  { value: 'anthropic_messages', label: 'Anthropic Messages' },
+  { value: 'google_generative_ai', label: 'Google Generative AI' },
+]
+
+// nodeAPIFormatLabel 返回接口格式展示名称，未知值原样返回。
+export function nodeAPIFormatLabel(value?: string): string {
+  const current = nodeAPIFormat(value)
+  return nodeAPIFormatOptions.find(item => item.value === current)?.label ?? current
+}
+
+// nodeInitial 取节点展示名的首字符，用于列表头像。
+export function nodeInitial(model: { name?: string; model?: string }): string {
+  const value = (model.name || model.model || '?').trim()
+  return value ? Array.from(value)[0]!.toUpperCase() : '?'
+}
+
+// nodeHost 从接口地址提取主机名，地址无效时原样截断展示。
+export function nodeHost(value: string): string {
+  const text = (value || '').trim()
+  if (!text) return '—'
+  try {
+    const parsed = new URL(text.includes('://') ? text : `https://${text}`)
+    return parsed.host || text
+  } catch {
+    return text
+  }
 }
 
 // jobQueryFilter 把“任务 ID / 请求 ID”输入框拆成列表筛选：#开头按任务 ID，其余按请求 ID。

@@ -9,10 +9,13 @@ export type Resolution = 'model' | 'cache' | 'inflight' | 'trust'
 export type ReuseMode = 'allow' | 'force' | 'fresh'
 export type SampleExpected = 'pass' | 'block'
 export type InboxCategoryKey = 'action_failed' | 'notification_failed' | 'breaker_pending' | 'node_unhealthy' | 'failure_rate'
+// NodeAPIFormat 是审核节点的接口格式；空值按 OpenAI Chat Completions 处理。
+export type NodeAPIFormat = 'openai_chat_completions' | 'openai_responses' | 'anthropic_messages' | 'google_generative_ai'
 
 export interface AuditModel {
   id: string
   name: string
+  api_format?: NodeAPIFormat
   // note 是节点备注，不参与调度与健康判断。
   note?: string
   enabled: boolean
@@ -20,7 +23,6 @@ export interface AuditModel {
   model: string
   timeout_ms: number
   max_concurrency: number
-  parameters?: Record<string, unknown>
   // allow_self_audit 允许把节点指向本机/内网网关（自审）。
   allow_self_audit?: boolean
 }
@@ -617,7 +619,7 @@ export const thirdPartyPromptAuditAPI = {
   async configImpact(value: AuditConfig) { return (await apiClient.post<ConfigImpact>(`${base}/config/impact`, value)).data },
   async testAdminEmail() { return (await apiClient.post(`${base}/test-email`)).data },
   async getContract() { return (await apiClient.get<Contract>(`${base}/contract`)).data },
-  async listModels(value: { model_id: string; base_url: string; timeout_ms: number; key_action: 'keep' | 'replace'; api_key?: string }) {
+  async listModels(value: { model_id: string; base_url: string; timeout_ms: number; api_format?: NodeAPIFormat; key_action: 'keep' | 'replace'; api_key?: string }) {
     return (await apiClient.post<{ models: string[] }>(`${base}/models/list`, value)).data
   },
   async probe(value: { model: AuditModel; key_action: KeyUpdate['action']; api_key?: string; audit_prompt: string; input?: string; input_kind: 'text' | 'json' }) {

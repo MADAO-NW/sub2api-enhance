@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  categoryFilter, categoryList, collapseDiff, configUpdate, costSummary, editableConfig, jobQueryFilter, lineDiff, parseParameters, timeRange,
+  categoryFilter, categoryList, collapseDiff, configUpdate, costSummary, editableConfig, jobQueryFilter, lineDiff, nodeAPIFormat, nodeAPIFormatLabel, nodeHost, nodeInitial, timeRange,
 } from '../viewModel'
 import type { CostReport, SavedConfig } from '@/api/admin/third-party-prompt-audit'
 
@@ -47,18 +47,31 @@ describe('third-party audit configuration contract', () => {
   })
 })
 
-describe('node advanced parameters', () => {
-  it('accepts an empty box and a plain JSON object', () => {
-    expect(parseParameters('')).toEqual({ value: {} })
-    expect(parseParameters('  ')).toEqual({ value: {} })
-    expect(parseParameters('{"temperature":0.2}')).toEqual({ value: { temperature: 0.2 } })
+describe('node display helpers', () => {
+  it('defaults a missing API format to OpenAI Chat Completions', () => {
+    expect(nodeAPIFormat(undefined)).toBe('openai_chat_completions')
+    expect(nodeAPIFormat('')).toBe('openai_chat_completions')
+    expect(nodeAPIFormat('anthropic_messages')).toBe('anthropic_messages')
   })
-  it('rejects non-object JSON and fixed request fields', () => {
-    expect(parseParameters('[1,2]').error).toBe('nodeParametersInvalid')
-    expect(parseParameters('not json').error).toBe('nodeParametersInvalid')
-    expect(parseParameters('{"stream":true}')).toEqual({ error: 'nodeParametersReserved', field: 'stream' })
-    expect(parseParameters('{"messages":[]}').field).toBe('messages')
-    expect(parseParameters('{"model":"x"}').error).toBe('nodeParametersReserved')
+  it('labels every supported API format', () => {
+    expect(nodeAPIFormatLabel('openai_responses')).toBe('OpenAI Responses')
+    expect(nodeAPIFormatLabel('anthropic_messages')).toBe('Anthropic Messages')
+    expect(nodeAPIFormatLabel('google_generative_ai')).toBe('Google Generative AI')
+    expect(nodeAPIFormatLabel('unknown_format')).toBe('unknown_format')
+  })
+  it('derives the avatar letter and host from the node', () => {
+    expect(nodeInitial({ name: 'glm-5.3' })).toBe('G')
+    expect(nodeInitial({ model: 'deepseek-v4' })).toBe('D')
+    expect(nodeInitial({})).toBe('?')
+    expect(nodeHost('https://workbuddy.example.com/v1')).toBe('workbuddy.example.com')
+    expect(nodeHost('')).toBe('—')
+  })
+  it('keeps api_format in the saved node payload', () => {
+    const draft = editableConfig(savedConfig())
+    draft.models[0]!.api_format = 'google_generative_ai'
+    const request = configUpdate(draft, 4, {})
+    expect(request.config.models[0]?.api_format).toBe('google_generative_ai')
+    expect(request.config.models[0]).not.toHaveProperty('parameters')
   })
 })
 

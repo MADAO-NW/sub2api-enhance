@@ -48,13 +48,9 @@ func (e *Evaluator) updateNodeLimits(models []ModelConfig) { e.node.updateLimits
 
 // nodeSemantics 是进入缓存键的节点语义，不包含凭据。
 func nodeSemantics(model ModelConfig) any {
-	parameters, err := json.Marshal(model.Parameters)
-	if err != nil {
-		parameters = []byte("{}")
-	}
 	return struct {
-		ID, BaseURL, Model, Parameters, TimeoutMS string
-	}{model.ID, model.BaseURL, model.Model, string(parameters), itoa(model.TimeoutMS)}
+		ID, BaseURL, Model, APIFormat, TimeoutMS string
+	}{model.ID, model.BaseURL, model.Model, normalizeNodeAPIFormat(model.APIFormat), itoa(model.TimeoutMS)}
 }
 
 func itoa(value int) string {

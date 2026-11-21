@@ -139,7 +139,7 @@ func TestEvaluationBindingUsesLatestNodeGeneration(t *testing.T) {
 	oldConfig := testConfig()
 	manager := &ConfigManager{active: &activeConfig{Stored: storedConfig{Config: oldConfig, Revision: 3}, Keys: map[string]string{"test-node": "old-key"}}}
 	newConfig := testConfig()
-	newConfig.Models = []ModelConfig{{ID: "replacement", Name: "replacement-model", Model: "replacement-model", BaseURL: "https://replacement.example.invalid", TimeoutMS: 2000, Enabled: true, Parameters: map[string]any{"reasoning_effort": "none"}}}
+	newConfig.Models = []ModelConfig{{ID: "replacement", Name: "replacement-model", Model: "replacement-model", BaseURL: "https://replacement.example.invalid", TimeoutMS: 2000, Enabled: true, APIFormat: NodeAPIFormatOpenAIResponses}}
 	manager.active = &activeConfig{Stored: storedConfig{Config: newConfig, Revision: 4}, Keys: map[string]string{"replacement": "new-key"}}
 	snapshot, keys, err := manager.EvaluationBinding(8)
 	require.NoError(t, err)
@@ -181,14 +181,25 @@ func TestEmbeddedDefaultPolicyUsesDocumentBodyWithoutCodeFence(t *testing.T) {
 	require.Contains(t, DefaultPolicy, `{"confidence":0.08,"reason":`)
 }
 
-func TestAdvancedParametersCannotOverrideFixedRequestFields(t *testing.T) {
+func TestNodeAPIFormatValidation(t *testing.T) {
 	model := testConfig().Models[0]
-	model.Parameters = map[string]any{"temperature": 0, "reasoning_effort": "none"}
+	model.APIFormat = ""
 	require.NoError(t, validateModel(model))
-	for _, field := range []string{"model", "messages", "stream"} {
-		model.Parameters = map[string]any{field: "override"}
-		require.ErrorContains(t, validateModel(model), field)
+	for _, format := range []string{NodeAPIFormatOpenAIChat, NodeAPIFormatOpenAIResponses, NodeAPIFormatAnthropicMessages, NodeAPIFormatGoogleGenerativeAI} {
+		model.APIFormat = format
+		require.NoError(t, validateModel(model))
 	}
+	model.APIFormat = "unsupported"
+	require.ErrorContains(t, validateModel(model), "接口格式")
+}
+
+func TestLegacyParametersAreIgnoredAndAPIFormatDefaults(t *testing.T) {
+	var stored storedConfig
+	raw := `{"revision":1,"models":[{"id":"old","name":"old","enabled":true,"base_url":"https://example.invalid","model":"old-model","timeout_ms":1000,"parameters":{"reasoning_effort":"none"}}]}`
+	require.NoError(t, json.Unmarshal([]byte(raw), &stored))
+	display := publicConfig(stored)
+	require.Len(t, display.Models, 1)
+	require.Equal(t, NodeAPIFormatOpenAIChat, display.Models[0].APIFormat)
 }
 
 func TestModelNamesFollowSelectedModelAndUseStableDuplicateSuffixes(t *testing.T) {

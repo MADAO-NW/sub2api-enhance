@@ -202,7 +202,7 @@ func TestEvaluationHashIgnoresRequestProtocol(t *testing.T) {
 	users, err := evaluationHash(snapshot, PromptKindUser)
 	require.NoError(t, err)
 	require.NotEqual(t, instructions, users)
-	snapshot.Models[0].Parameters = map[string]any{"temperature": 0.2}
+	snapshot.Models[0].APIFormat = NodeAPIFormatAnthropicMessages
 	changed, err := evaluationHash(snapshot, PromptKindUser)
 	require.NoError(t, err)
 	require.NotEqual(t, users, changed)

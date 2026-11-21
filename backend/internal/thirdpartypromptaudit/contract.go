@@ -15,7 +15,7 @@ import (
 )
 
 // ContractVersion 标识固定审核目标、审核阶段和模型返回格式，不承载管理员政策版本。
-const ContractVersion = "third-party-json-v6-instruction-user"
+const ContractVersion = "third-party-json-v7-multi-protocol"
 
 // DefaultPolicy 提供管理员可以编辑的初始业务审核政策。
 //

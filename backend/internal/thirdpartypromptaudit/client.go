@@ -63,7 +63,7 @@ func nodeHTTPClient(model ModelConfig) (*http.Client, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	url, err := chatCompletionsURL(model.BaseURL)
+	url, err := nodeRequestURL(model)
 	if err != nil {
 		client.CloseIdleConnections()
 		return nil, "", err
@@ -113,23 +113,13 @@ func (c *ModelClient) call(ctx context.Context, job *AuditJob, model ModelConfig
 			return nil, 0, persistenceFailure(err, "user_excluded")
 		}
 	}
-	envelope, err := json.Marshal(auditEnvelope{TargetKind: kind, Target: text})
-	if err != nil {
-		return nil, 0, &AuditError{Code: "input_encode_failed", Stage: "input_parse", Message: err.Error()}
-	}
-	request := make(map[string]any, len(model.Parameters)+3)
-	for name, value := range model.Parameters {
-		request[name] = value
-	}
-	request["model"] = model.Model
-	request["stream"] = false
-	request["messages"] = []chatMessage{{Role: "system", Content: systemPromptSnapshot(snapshot, kind, correction)}, {Role: "user", Content: string(envelope)}}
-	body, err := json.Marshal(request)
+	request, err := buildNodeRequest(model, snapshot, kind, correction, text)
 	if err != nil {
 		return nil, 0, &AuditError{Code: "request_encode_failed", Stage: "model_request", Message: err.Error()}
 	}
+	applyNodeHeaders(request, model.APIFormat, key)
 	metadata := map[string]any{"target_kind": kind, "target_order": order, "target_hash": targetHash, "repair_of_attempt_id": repairOf,
-		"model": model, "contract_version": snapshot.ContractVersion, "request_body": request}
+		"model": model, "contract_version": snapshot.ContractVersion, "request_body": json.RawMessage(request.Body)}
 	attempt := &ModelAttempt{ModelID: model.ID, ModelSnapshot: model, Stage: callStage, RepairOfAttemptID: repairOf, Status: "prepared", TargetHash: targetHash}
 	if job == nil {
 		attempt.CallKind = "probe"
@@ -157,14 +147,12 @@ func (c *ModelClient) call(ctx context.Context, job *AuditJob, model ModelConfig
 			return nil, attempt.ID, persistenceFailure(err, "user_excluded")
 		}
 	}
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(request.Body))
 	if err != nil {
 		return nil, attempt.ID, &AuditError{Code: "request_invalid", Stage: "model_request", Message: err.Error()}
 	}
-	httpRequest.Header.Set("Content-Type", "application/json")
-	httpRequest.Header.Set("Accept", "application/json")
-	if key != "" {
-		httpRequest.Header.Set("Authorization", "Bearer "+key)
+	for name, value := range request.Headers {
+		httpRequest.Header.Set(name, value)
 	}
 	if err := c.attempts.StartModelAttempt(ctx, job, attempt); err != nil {
 		return nil, attempt.ID, persistenceFailure(err, "attempt_start_failed")
@@ -184,6 +172,19 @@ func (c *ModelClient) call(ctx context.Context, job *AuditJob, model ModelConfig
 		closeErr := response.Body.Close()
 		value := string(raw)
 		attempt.RawResponse = &value
+		parsed := raw
+		var streamFailure *AuditError
+		// OpenAI Responses 默认流式返回；兼容网关也常强制 SSE，此时先把事件聚合成最终响应。
+		if readErr == nil && response.StatusCode >= 200 && response.StatusCode < 300 &&
+			normalizeNodeAPIFormat(model.APIFormat) == NodeAPIFormatOpenAIResponses &&
+			(isEventStream(response.Header.Get("Content-Type")) || looksLikeEventStream(raw)) {
+			aggregated, aggregateErr := aggregateResponsesEvents(raw)
+			if aggregateErr != nil {
+				streamFailure = &AuditError{Code: "upstream_protocol_error", Stage: "response_parse", Message: aggregateErr.Error()}
+			} else {
+				parsed = aggregated
+			}
+		}
 		if readErr != nil {
 			failure = requestFailure(readErr)
 		} else if closeErr != nil {
@@ -204,8 +205,10 @@ func (c *ModelClient) call(ctx context.Context, job *AuditJob, model ModelConfig
 			} else if retryAt, err := http.ParseTime(response.Header.Get("Retry-After")); err == nil && retryAt.After(time.Now()) {
 				failure.RetryAfter = time.Until(retryAt)
 			}
+		} else if streamFailure != nil {
+			failure = streamFailure
 		} else {
-			result, failure = parseNodeResponse(raw, attempt)
+			result, failure = parseNodeResponse(parsed, attempt, model.APIFormat)
 		}
 	}
 	latency := time.Since(started).Milliseconds()
